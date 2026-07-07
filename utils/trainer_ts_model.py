@@ -19,6 +19,8 @@ def structure_loss(logits, mask):
     """
     # Filter out all-zero masks
     non_zero_mask = mask.sum(dim=(1, 2, 3)) > 0
+    if not torch.any(non_zero_mask):
+        return logits.sum() * 0.0
     logits = logits[non_zero_mask]
     mask = mask[non_zero_mask]
 
@@ -83,6 +85,8 @@ class Trainer():
              colorEnhance=True,
              rPeper=False
         )
+        if len(self.labeled_train_set) == 0:
+             raise ValueError('>>> Labeled training set is empty.')
 
         self.unlabeled_train_set = UnlabeledTrainDataset(
              u_image_root=cfg.train_imgs,
@@ -90,13 +94,16 @@ class Trainer():
              sampled_txt=cfg.train_sample_txt,
              u_train_size=cfg.u_train_size
         )
+        if len(self.unlabeled_train_set) == 0:
+             raise ValueError('>>> Unlabeled training set is empty.')
         
         self.labeled_train_dl = DataLoader(
              self.labeled_train_set,
              batch_size=cfg.l_batch_size,
              shuffle=True,
              num_workers=cfg.num_workers,
-             pin_memory=True,
+             pin_memory=cfg.CUDA,
+             persistent_workers=cfg.num_workers > 0,
              drop_last=False
         )
 
@@ -105,7 +112,8 @@ class Trainer():
              batch_size=cfg.u_batch_size,
              shuffle=True,
              num_workers=cfg.num_workers,
-             pin_memory=True,
+             pin_memory=cfg.CUDA,
+             persistent_workers=cfg.num_workers > 0,
              drop_last=False
         )
 
@@ -114,31 +122,28 @@ class Trainer():
         # create save directory
         os.makedirs(cfg.save_dir, exist_ok=True)
 
+    def _cycle_loader(self, loader):
+        while True:
+            for batch in loader:
+                yield batch
 
     def train_epoch(self):
         self.model.train()
+        labeled_iter = self._cycle_loader(self.labeled_train_dl)
+        epoch_loss = 0.0
+        epoch_loss_l = 0.0
+        epoch_loss_u_s = 0.0
+        epoch_loss_u_h = 0.0
 
-        for itr_idx in tqdm(range(len(self.unlabeled_train_dl))):
-            self.optimizer.zero_grad()
+        for itr_idx, (u_imgs, u_gt) in enumerate(tqdm(self.unlabeled_train_dl), start=1):
+            self.optimizer.zero_grad(set_to_none=True)
 
-            # load unlabeled data
-            try:
-                 u_imgs, u_gt = next(iter(self.unlabeled_train_dl))
-            except StopIteration:
-                 self.unlabeled_train_dl = iter(self.unlabeled_train_dl)
-                 u_imgs, u_gt = next(iter(self.unlabeled_train_dl))
+            _, l_imgs, l_gt = next(labeled_iter)
 
-            # load labeled data
-            try:
-                 _, l_imgs, l_gt = next(iter(self.labeled_train_dl))
-            except StopIteration:
-                 self.labeled_train_dl = iter(self.labeled_train_dl)
-                 _, l_imgs, l_gt = next(iter(self.labeled_train_dl))
-
-            l_imgs = l_imgs.to('cuda')
-            l_gt = l_gt.to('cuda')
-            u_imgs = u_imgs.to('cuda')
-            u_gt = u_gt.to('cuda')
+            l_imgs = l_imgs.to(self.cfg.device, non_blocking=self.cfg.CUDA)
+            l_gt = l_gt.to(self.cfg.device, non_blocking=self.cfg.CUDA)
+            u_imgs = u_imgs.to(self.cfg.device, non_blocking=self.cfg.CUDA)
+            u_gt = u_gt.to(self.cfg.device, non_blocking=self.cfg.CUDA)
 
             l_segs, u_segs, teacher_label = self.model(l_x=l_imgs, u_x=u_imgs)
             
@@ -169,6 +174,10 @@ class Trainer():
 
             lamda = 2.0
             loss = loss_l_seg + loss_u_seg_s + loss_u_seg_h * lamda
+            epoch_loss += loss.item()
+            epoch_loss_l += loss_l_seg.item()
+            epoch_loss_u_s += loss_u_seg_s.item()
+            epoch_loss_u_h += loss_u_seg_h.item()
 
             # backward
             loss.backward()
@@ -176,9 +185,20 @@ class Trainer():
 
             self.model.EMA()  # batch EMA
 
-            if (itr_idx + 1) % self.cfg.log_interval == 0:
-                print(f'[Train] Epoch: {self.current_epoch}, Iterate: {itr_idx + 1}, Loss: {loss.item()}')
+            if itr_idx % self.cfg.log_interval == 0:
+                print(f'[Train] Epoch: {self.current_epoch}, Iterate: {itr_idx}, Loss: {loss.item()}')
                 print(f'Loss_labeled: {loss_l_seg.item()}, Loss_unlabeled_soft: {loss_u_seg_s.item()}, Loss_unlabled_hard: {loss_u_seg_h.item()}')
+
+        num_iters = len(self.unlabeled_train_dl)
+        lr = self.scheduler.get_lr() if self.scheduler is not None else self.optimizer.param_groups[0]['lr']
+        print(
+            f'[Epoch] Epoch: {self.current_epoch}, '
+            f'Avg Loss: {epoch_loss / num_iters}, '
+            f'Avg Labeled: {epoch_loss_l / num_iters}, '
+            f'Avg Unlabeled Soft: {epoch_loss_u_s / num_iters}, '
+            f'Avg Unlabeled Hard: {epoch_loss_u_h / num_iters}, '
+            f'LR: {lr}'
+        )
         
         if self.current_epoch > self.cfg.epochs - 5:
              self.model.save_student(os.path.join(self.cfg.save_dir, f'student_epoch_{self.current_epoch}.pth'))
