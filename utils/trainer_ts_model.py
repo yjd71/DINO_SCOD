@@ -1,0 +1,196 @@
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from utils.dataloader import LabeledTrainDataset, UnlabeledTrainDataset
+import math
+import os
+import logging
+from tqdm import tqdm
+import torch.nn.functional as F
+import numpy as np
+
+
+def structure_loss(logits, mask):
+    """
+    loss function (ref: F3Net-AAAI-2020)
+
+    pred: logits without activation
+    mask: binary mask {0, 1}
+    """
+    # Filter out all-zero masks
+    non_zero_mask = mask.sum(dim=(1, 2, 3)) > 0
+    logits = logits[non_zero_mask]
+    mask = mask[non_zero_mask]
+
+    weit = 1 + 5 * torch.abs(F.avg_pool2d(mask, kernel_size=31, stride=1, padding=15) - mask)
+    wbce = F.binary_cross_entropy_with_logits(logits, mask, reduction='none')
+    wbce = (weit * wbce).sum(dim=(2, 3)) / weit.sum(dim=(2, 3))
+
+    pred = torch.sigmoid(logits)
+    inter = ((pred * mask) * weit).sum(dim=(2, 3))
+    union = ((pred + mask) * weit).sum(dim=(2, 3))
+    wiou = 1 - (inter + 1) / (union - inter + 1)
+    return (wbce + wiou).mean()
+
+
+class CosineDecay:
+	def __init__(self,
+	             optimizer,
+	             max_lr,
+	             min_lr,
+	             max_epoch,
+	             test_mode=False):
+		self.optimizer = optimizer
+		self.max_lr = max_lr
+		self.min_lr = min_lr
+		self.max_epoch = max_epoch
+		self.test_mode = test_mode
+
+		self.current_lr = max_lr
+		self.cnt = 0
+		if self.max_epoch > 1:
+			self.scale = (max_lr - min_lr) / 2
+			self.shift = (max_lr + min_lr) / 2
+			self.alpha = math.pi / (max_epoch - 1)
+
+	def step(self):
+		self.cnt += 1
+		self.current_lr = self.scale * math.cos(self.alpha * self.cnt) + self.shift
+
+		if not self.test_mode:
+			for param_group in self.optimizer.param_groups:
+				param_group['lr'] = self.current_lr
+
+	def get_lr(self):
+		return self.current_lr
+
+
+class Trainer():
+    def __init__(self, model, cfg, scheduler=None):
+        self.model = model
+        self.cfg = cfg
+        self.optimizer = optim.Adam(model.parameters(), lr=cfg.learning_rate)
+        self.scheduler = CosineDecay(self.optimizer, max_lr=cfg.learning_rate, min_lr=cfg.min_lr, max_epoch=cfg.epochs) if scheduler is None else scheduler
+
+        self.labeled_train_set = LabeledTrainDataset(
+             l_image_root=cfg.train_imgs,
+             l_gt_root=cfg.train_masks,
+             l_txt_root=cfg.train_sample_txt,
+             l_train_size=cfg.l_train_size,
+             rVFlip=True,
+             rCrop=True,
+             rRotate=False,
+             colorEnhance=True,
+             rPeper=False
+        )
+
+        self.unlabeled_train_set = UnlabeledTrainDataset(
+             u_image_root=cfg.train_imgs,
+             u_gt_root=cfg.sam_labels,
+             sampled_txt=cfg.train_sample_txt,
+             u_train_size=cfg.u_train_size
+        )
+        
+        self.labeled_train_dl = DataLoader(
+             self.labeled_train_set,
+             batch_size=cfg.l_batch_size,
+             shuffle=True,
+             num_workers=cfg.num_workers,
+             pin_memory=True,
+             drop_last=False
+        )
+
+        self.unlabeled_train_dl = DataLoader(
+             self.unlabeled_train_set,
+             batch_size=cfg.u_batch_size,
+             shuffle=True,
+             num_workers=cfg.num_workers,
+             pin_memory=True,
+             drop_last=False
+        )
+
+        self.current_epoch = 1
+
+        # create save directory
+        os.makedirs(cfg.save_dir, exist_ok=True)
+
+
+    def train_epoch(self):
+        self.model.train()
+
+        for itr_idx in tqdm(range(len(self.unlabeled_train_dl))):
+            self.optimizer.zero_grad()
+
+            # load unlabeled data
+            try:
+                 u_imgs, u_gt = next(iter(self.unlabeled_train_dl))
+            except StopIteration:
+                 self.unlabeled_train_dl = iter(self.unlabeled_train_dl)
+                 u_imgs, u_gt = next(iter(self.unlabeled_train_dl))
+
+            # load labeled data
+            try:
+                 _, l_imgs, l_gt = next(iter(self.labeled_train_dl))
+            except StopIteration:
+                 self.labeled_train_dl = iter(self.labeled_train_dl)
+                 _, l_imgs, l_gt = next(iter(self.labeled_train_dl))
+
+            l_imgs = l_imgs.to('cuda')
+            l_gt = l_gt.to('cuda')
+            u_imgs = u_imgs.to('cuda')
+            u_gt = u_gt.to('cuda')
+
+            l_segs, u_segs, teacher_label = self.model(l_x=l_imgs, u_x=u_imgs)
+            
+            l_seg_4, l_seg_3, l_seg_2, l_seg_1, l_seg_g = l_segs
+            u_seg_4, u_seg_3, u_seg_2, u_seg_1, u_seg_g = u_segs
+
+            t_gt = F.interpolate(teacher_label, size=u_gt.shape[2:], mode='bilinear', align_corners=False)
+            t_gt_b = torch.where(t_gt > 0.5, torch.ones_like(t_gt), torch.zeros_like(t_gt))
+            
+            l_seg_1 = F.interpolate(l_seg_1, size=l_gt.shape[2:], mode='bilinear', align_corners=False)
+            l_seg_2 = F.interpolate(l_seg_2, size=l_gt.shape[2:], mode='bilinear', align_corners=False)
+            l_seg_3 = F.interpolate(l_seg_3, size=l_gt.shape[2:], mode='bilinear', align_corners=False)
+            l_seg_4 = F.interpolate(l_seg_4, size=l_gt.shape[2:], mode='bilinear', align_corners=False)
+            l_seg_g = F.interpolate(l_seg_g, size=l_gt.shape[2:], mode='bilinear', align_corners=False)
+            u_seg_1 = F.interpolate(u_seg_1, size=u_gt.shape[2:], mode='bilinear', align_corners=False)
+            u_seg_2 = F.interpolate(u_seg_2, size=u_gt.shape[2:], mode='bilinear', align_corners=False)
+            u_seg_3 = F.interpolate(u_seg_3, size=u_gt.shape[2:], mode='bilinear', align_corners=False)
+            u_seg_4 = F.interpolate(u_seg_4, size=u_gt.shape[2:], mode='bilinear', align_corners=False)
+            u_seg_g = F.interpolate(u_seg_g, size=u_gt.shape[2:], mode='bilinear', align_corners=False)
+            
+            
+            loss_l_seg = structure_loss(l_seg_1, l_gt) + structure_loss(l_seg_2, l_gt) + structure_loss(l_seg_3, l_gt) + \
+                         structure_loss(l_seg_4, l_gt) + structure_loss(l_seg_g, l_gt)
+            loss_u_seg_s = structure_loss(u_seg_1, t_gt) + structure_loss(u_seg_2, t_gt) + structure_loss(u_seg_3, t_gt) + \
+                           structure_loss(u_seg_4, t_gt) + structure_loss(u_seg_g, t_gt)
+            loss_u_seg_h = structure_loss(u_seg_1, u_gt*t_gt_b) + structure_loss(u_seg_2, u_gt*t_gt_b) + structure_loss(u_seg_3, u_gt*t_gt_b) + \
+                           structure_loss(u_seg_4, u_gt*t_gt_b) + structure_loss(u_seg_g, u_gt*t_gt_b)
+
+            lamda = 2.0
+            loss = loss_l_seg + loss_u_seg_s + loss_u_seg_h * lamda
+
+            # backward
+            loss.backward()
+            self.optimizer.step()
+
+            self.model.EMA()  # batch EMA
+
+            if (itr_idx + 1) % self.cfg.log_interval == 0:
+                print(f'[Train] Epoch: {self.current_epoch}, Iterate: {itr_idx + 1}, Loss: {loss.item()}')
+                print(f'Loss_labeled: {loss_l_seg.item()}, Loss_unlabeled_soft: {loss_u_seg_s.item()}, Loss_unlabled_hard: {loss_u_seg_h.item()}')
+        
+        if self.current_epoch > self.cfg.epochs - 5:
+             self.model.save_student(os.path.join(self.cfg.save_dir, f'student_epoch_{self.current_epoch}.pth'))
+        
+        self.current_epoch += 1
+        
+        if self.scheduler is not None:
+            self.scheduler.step()
+
+    def train(self):
+        print(f'<<< Start Training.')
+        print(f'<<< Labeled Data Num: {len(self.labeled_train_set)}.')
+        for epoch in range(self.cfg.epochs):
+            self.train_epoch()
+        print(f'<<< Training Finished.')
