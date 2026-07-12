@@ -1,7 +1,8 @@
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 from utils.dataloader import LabeledTrainDataset
+from utils.distributed import is_main_process, reduce_mean, synchronize, unwrap_model
 import math
 import os
 from tqdm import tqdm
@@ -69,6 +70,7 @@ class Trainer():
     def __init__(self, model, cfg, scheduler=None):
         self.model = model
         self.cfg = cfg
+        self.distributed = getattr(cfg, 'distributed', False)
         self.optimizer = optim.Adam(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
         self.scheduler = CosineDecay(self.optimizer, max_lr=cfg.learning_rate, min_lr=cfg.min_lr, max_epoch=cfg.epochs) if scheduler is None else scheduler
 
@@ -87,10 +89,22 @@ class Trainer():
         if len(self.labeled_train_set) == 0:
              raise ValueError('>>> Labeled training set is empty.')
         
+        self.labeled_sampler = (
+             DistributedSampler(
+                  self.labeled_train_set,
+                  num_replicas=cfg.world_size,
+                  rank=cfg.rank,
+                  shuffle=True,
+                  seed=cfg.seed,
+             )
+             if self.distributed
+             else None
+        )
         self.labeled_train_dl = DataLoader(
              self.labeled_train_set,
              batch_size=cfg.batch_size,
-             shuffle=True,
+             shuffle=self.labeled_sampler is None,
+             sampler=self.labeled_sampler,
              num_workers=cfg.num_workers,
              pin_memory=cfg.CUDA,
              persistent_workers=cfg.num_workers > 0,
@@ -101,13 +115,17 @@ class Trainer():
         self.current_epoch = 1
 
         # create save directory
-        os.makedirs(cfg.save_dir, exist_ok=True)
+        if is_main_process():
+             os.makedirs(cfg.save_dir, exist_ok=True)
+        synchronize()
 
     def train_epoch(self):
         self.model.train()
         epoch_loss = 0.0
 
-        for itr_idx, (_, l_imgs, l_gt) in enumerate(tqdm(self.labeled_train_dl), start=1):
+        for itr_idx, (_, l_imgs, l_gt) in enumerate(
+             tqdm(self.labeled_train_dl, disable=not is_main_process()), start=1
+        ):
             self.optimizer.zero_grad(set_to_none=True)
 
             l_imgs = l_imgs.to(self.cfg.device, non_blocking=self.cfg.CUDA)
@@ -129,15 +147,19 @@ class Trainer():
             loss.backward()
             self.optimizer.step()
 
-            if itr_idx % self.cfg.log_interval == 0:
+            if is_main_process() and itr_idx % self.cfg.log_interval == 0:
                   print(f'[Train] Epoch: {self.current_epoch}, Iterate: {itr_idx}, Loss: {loss.item()}')
 
-        avg_loss = epoch_loss / len(self.labeled_train_dl)
+        avg_loss = reduce_mean(epoch_loss / len(self.labeled_train_dl), self.cfg.device)
         lr = self.scheduler.get_lr() if self.scheduler is not None else self.optimizer.param_groups[0]['lr']
-        print(f'[Epoch] Epoch: {self.current_epoch}, Avg Loss: {avg_loss}, LR: {lr}')
+        if is_main_process():
+             print(f'[Epoch] Epoch: {self.current_epoch}, Avg Loss: {avg_loss}, LR: {lr}')
 
-        if self.current_epoch > self.cfg.epochs - 5:
-              self.model.save_decoder_checkpoint(os.path.join(self.cfg.save_dir, f'base_model_epoch_{self.current_epoch}.pth'))
+        if is_main_process() and self.current_epoch > self.cfg.epochs - 5:
+              unwrap_model(self.model).save_decoder_checkpoint(
+                   os.path.join(self.cfg.save_dir, f'base_model_epoch_{self.current_epoch}.pth')
+              )
+        synchronize()
         
         self.current_epoch += 1
         
@@ -145,10 +167,15 @@ class Trainer():
               self.scheduler.step()
 
     def train(self):
-        print(f'<<< Start Training.')
-        print(f'<<< Labeled Data Num: {len(self.labeled_train_set)}.')
+        if is_main_process():
+              print(f'<<< Start Training.')
+              print(f'<<< Labeled Data Num: {len(self.labeled_train_set)}.')
         for epoch in range(self.cfg.epochs):
-              print(f'{current_time()} >>> Epoch: {self.current_epoch}/{self.cfg.epochs}')
+              if self.labeled_sampler is not None:
+                    self.labeled_sampler.set_epoch(epoch)
+              if is_main_process():
+                    print(f'{current_time()} >>> Epoch: {self.current_epoch}/{self.cfg.epochs}')
               self.train_epoch()
-        print(f'<<< Training Finished.')
+        if is_main_process():
+              print(f'<<< Training Finished.')
         

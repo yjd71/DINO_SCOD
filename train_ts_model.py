@@ -31,16 +31,29 @@ def parse_args():
 
 if __name__ == '__main__':
     args = parse_args()
-    set_seed(seed=args.seed, deterministic=args.deterministic)
+    from utils.distributed import (
+        cleanup_distributed,
+        configure_distributed,
+        init_distributed,
+        wrap_distributed,
+    )
 
-    from utils.trainer_ts_model import Trainer
-    from configs.ts_model_config import Config
-    from Model.ts_model import TSModel
+    distributed_context = init_distributed()
+    try:
+        set_seed(seed=args.seed + distributed_context.rank, deterministic=args.deterministic)
 
-    cfg = Config()
-    cfg.save_dir = args.ts_model_path
-    cfg.train_labeled_indices_pt = args.labeled_indices_pt
-    ts_model = TSModel(teacher_pth=args.teacher_pth).to(cfg.device)
-    trainer = Trainer(model=ts_model, cfg=cfg)
-    trainer.train()
+        from utils.trainer_ts_model import Trainer
+        from configs.ts_model_config import Config
+        from Model.ts_model import TSModel
+
+        cfg = Config()
+        configure_distributed(cfg, distributed_context, seed=args.seed)
+        cfg.save_dir = args.ts_model_path
+        cfg.train_labeled_indices_pt = args.labeled_indices_pt
+        ts_model = TSModel(teacher_pth=args.teacher_pth).to(cfg.device)
+        ts_model = wrap_distributed(ts_model, distributed_context)
+        trainer = Trainer(model=ts_model, cfg=cfg)
+        trainer.train()
+    finally:
+        cleanup_distributed()
     

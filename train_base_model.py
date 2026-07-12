@@ -30,16 +30,29 @@ def parse_args():
 
 if __name__ == '__main__':
     args = parse_args()
-    set_seed(seed=args.seed, deterministic=args.deterministic)
+    from utils.distributed import (
+        cleanup_distributed,
+        configure_distributed,
+        init_distributed,
+        wrap_distributed,
+    )
 
-    from utils.trainer_base_model import Trainer
-    from configs.base_model_config import Config
-    from Model.base_model import BaseModel
+    distributed_context = init_distributed()
+    try:
+        set_seed(seed=args.seed + distributed_context.rank, deterministic=args.deterministic)
 
-    cfg = Config()
-    cfg.save_dir = args.base_model_path
-    cfg.train_labeled_indices_pt = args.labeled_indices_pt
-    base_model = BaseModel().to(cfg.device)
-    trainer = Trainer(model=base_model, cfg=cfg)
-    trainer.train()
+        from utils.trainer_base_model import Trainer
+        from configs.base_model_config import Config
+        from Model.base_model import BaseModel
+
+        cfg = Config()
+        configure_distributed(cfg, distributed_context, seed=args.seed)
+        cfg.save_dir = args.base_model_path
+        cfg.train_labeled_indices_pt = args.labeled_indices_pt
+        base_model = BaseModel().to(cfg.device)
+        base_model = wrap_distributed(base_model, distributed_context)
+        trainer = Trainer(model=base_model, cfg=cfg)
+        trainer.train()
+    finally:
+        cleanup_distributed()
     

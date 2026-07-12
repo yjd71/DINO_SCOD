@@ -11,7 +11,7 @@ class BaseModel(nn.Module):
 
         # initialize the frozen DINOv2 model: DINOv2-ViT-B/14 (default)
         self.dino = torch.hub.load('./dinov2', 'dinov2_vitb14', source='local', pretrained=False)
-        self.dino.load_state_dict(torch.load('./dinov2_vitb14_pretrain.pth', map_location='cpu'))
+        self.dino.load_state_dict(torch.load('./weight/dinov2_vitb14_pretrain.pth', map_location='cpu'))
         for param in self.dino.parameters():
             param.requires_grad = False
         self.dino.eval()

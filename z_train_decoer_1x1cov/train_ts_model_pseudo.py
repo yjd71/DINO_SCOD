@@ -41,23 +41,36 @@ def parse_args():
 
 if __name__ == '__main__':
     args = parse_args()
-    set_seed(seed=args.seed, deterministic=args.deterministic)
+    from utils.distributed import (
+        cleanup_distributed,
+        configure_distributed,
+        init_distributed,
+        wrap_distributed,
+    )
 
-    from configs.ts_model_config import Config
-    import Model.ts_model as ts_model_module
-    from Model.ts_model import TSModel
-    from utils.trainer_ts_model_pseudo import Trainer
-    from utils.decoer_1x1cov import Conv1x1Decoder
-
-    cfg = Config()
-    cfg.save_dir = args.ts_model_path
-    cfg.train_labeled_indices_pt = args.labeled_indices_pt
-    original_decoder = ts_model_module.Decoder
-    ts_model_module.Decoder = Conv1x1Decoder
+    distributed_context = init_distributed()
     try:
-        ts_model = TSModel(teacher_pth=args.teacher_pth)
+        set_seed(seed=args.seed + distributed_context.rank, deterministic=args.deterministic)
+
+        from configs.ts_model_config import Config
+        import Model.ts_model as ts_model_module
+        from Model.ts_model import TSModel
+        from utils.trainer_ts_model_pseudo import Trainer
+        from utils.decoer_1x1cov import Conv1x1Decoder
+
+        cfg = Config()
+        configure_distributed(cfg, distributed_context, seed=args.seed)
+        cfg.save_dir = args.ts_model_path
+        cfg.train_labeled_indices_pt = args.labeled_indices_pt
+        original_decoder = ts_model_module.Decoder
+        ts_model_module.Decoder = Conv1x1Decoder
+        try:
+            ts_model = TSModel(teacher_pth=args.teacher_pth)
+        finally:
+            ts_model_module.Decoder = original_decoder
+        ts_model = ts_model.to(cfg.device)
+        ts_model = wrap_distributed(ts_model, distributed_context)
+        trainer = Trainer(model=ts_model, cfg=cfg)
+        trainer.train()
     finally:
-        ts_model_module.Decoder = original_decoder
-    ts_model = ts_model.to(cfg.device)
-    trainer = Trainer(model=ts_model, cfg=cfg)
-    trainer.train()
+        cleanup_distributed()

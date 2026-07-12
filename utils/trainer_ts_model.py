@@ -1,7 +1,8 @@
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
 from utils.dataloader import LabeledTrainDataset, UnlabeledTrainDataset
+from utils.distributed import is_main_process, reduce_mean, synchronize, unwrap_model
 import math
 import os
 import logging
@@ -76,6 +77,7 @@ class Trainer():
     def __init__(self, model, cfg, scheduler=None):
         self.model = model
         self.cfg = cfg
+        self.distributed = getattr(cfg, 'distributed', False)
         self.optimizer = optim.Adam(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
         self.scheduler = CosineDecay(self.optimizer, max_lr=cfg.learning_rate, min_lr=cfg.min_lr, max_epoch=cfg.epochs) if scheduler is None else scheduler
 
@@ -104,10 +106,33 @@ class Trainer():
         if len(self.unlabeled_train_set) == 0:
              raise ValueError('>>> Unlabeled training set is empty.')
         
+        self.labeled_sampler = (
+             DistributedSampler(
+                  self.labeled_train_set,
+                  num_replicas=cfg.world_size,
+                  rank=cfg.rank,
+                  shuffle=True,
+                  seed=cfg.seed,
+             )
+             if self.distributed
+             else None
+        )
+        self.unlabeled_sampler = (
+             DistributedSampler(
+                  self.unlabeled_train_set,
+                  num_replicas=cfg.world_size,
+                  rank=cfg.rank,
+                  shuffle=True,
+                  seed=cfg.seed,
+             )
+             if self.distributed
+             else None
+        )
         self.labeled_train_dl = DataLoader(
              self.labeled_train_set,
              batch_size=cfg.l_batch_size,
-             shuffle=True,
+             shuffle=self.labeled_sampler is None,
+             sampler=self.labeled_sampler,
              num_workers=cfg.num_workers,
              pin_memory=cfg.CUDA,
              persistent_workers=cfg.num_workers > 0,
@@ -117,7 +142,8 @@ class Trainer():
         self.unlabeled_train_dl = DataLoader(
              self.unlabeled_train_set,
              batch_size=cfg.u_batch_size,
-             shuffle=True,
+             shuffle=self.unlabeled_sampler is None,
+             sampler=self.unlabeled_sampler,
              num_workers=cfg.num_workers,
              pin_memory=cfg.CUDA,
              persistent_workers=cfg.num_workers > 0,
@@ -127,7 +153,9 @@ class Trainer():
         self.current_epoch = 1
 
         # create save directory
-        os.makedirs(cfg.save_dir, exist_ok=True)
+        if is_main_process():
+            os.makedirs(cfg.save_dir, exist_ok=True)
+        synchronize()
 
     def _cycle_loader(self, loader):
         while True:
@@ -142,7 +170,9 @@ class Trainer():
         epoch_loss_u_s = 0.0
         epoch_loss_u_h = 0.0
 
-        for itr_idx, (u_imgs, u_gt) in enumerate(tqdm(self.unlabeled_train_dl), start=1):
+        for itr_idx, (u_imgs, u_gt) in enumerate(
+            tqdm(self.unlabeled_train_dl, disable=not is_main_process()), start=1
+        ):
             self.optimizer.zero_grad(set_to_none=True)
 
             _, l_imgs, l_gt = next(labeled_iter)
@@ -190,25 +220,33 @@ class Trainer():
             loss.backward()
             self.optimizer.step()
 
-            self.model.EMA()  # batch EMA
+            unwrap_model(self.model).EMA()  # batch EMA
 
-            if itr_idx % self.cfg.log_interval == 0:
+            if is_main_process() and itr_idx % self.cfg.log_interval == 0:
                 print(f'[Train] Epoch: {self.current_epoch}, Iterate: {itr_idx}, Loss: {loss.item()}')
                 print(f'Loss_labeled: {loss_l_seg.item()}, Loss_unlabeled_soft: {loss_u_seg_s.item()}, Loss_unlabled_hard: {loss_u_seg_h.item()}')
 
         num_iters = len(self.unlabeled_train_dl)
+        avg_loss = reduce_mean(epoch_loss / num_iters, self.cfg.device)
+        avg_loss_l = reduce_mean(epoch_loss_l / num_iters, self.cfg.device)
+        avg_loss_u_s = reduce_mean(epoch_loss_u_s / num_iters, self.cfg.device)
+        avg_loss_u_h = reduce_mean(epoch_loss_u_h / num_iters, self.cfg.device)
         lr = self.scheduler.get_lr() if self.scheduler is not None else self.optimizer.param_groups[0]['lr']
-        print(
-            f'[Epoch] Epoch: {self.current_epoch}, '
-            f'Avg Loss: {epoch_loss / num_iters}, '
-            f'Avg Labeled: {epoch_loss_l / num_iters}, '
-            f'Avg Unlabeled Soft: {epoch_loss_u_s / num_iters}, '
-            f'Avg Unlabeled Hard: {epoch_loss_u_h / num_iters}, '
-            f'LR: {lr}'
-        )
+        if is_main_process():
+            print(
+                f'[Epoch] Epoch: {self.current_epoch}, '
+                f'Avg Loss: {avg_loss}, '
+                f'Avg Labeled: {avg_loss_l}, '
+                f'Avg Unlabeled Soft: {avg_loss_u_s}, '
+                f'Avg Unlabeled Hard: {avg_loss_u_h}, '
+                f'LR: {lr}'
+            )
         
-        if self.current_epoch > self.cfg.epochs - 5:
-             self.model.save_student(os.path.join(self.cfg.save_dir, f'student_epoch_{self.current_epoch}.pth'))
+        if is_main_process() and self.current_epoch > self.cfg.epochs - 5:
+             unwrap_model(self.model).save_student(
+                 os.path.join(self.cfg.save_dir, f'student_epoch_{self.current_epoch}.pth')
+             )
+        synchronize()
         
         self.current_epoch += 1
         
@@ -216,9 +254,16 @@ class Trainer():
             self.scheduler.step()
 
     def train(self):
-        print(f'<<< Start Training.')
-        print(f'<<< Labeled Data Num: {len(self.labeled_train_set)}.')
+        if is_main_process():
+            print(f'<<< Start Training.')
+            print(f'<<< Labeled Data Num: {len(self.labeled_train_set)}.')
         for epoch in range(self.cfg.epochs):
-            print(f'{current_time()} >>> Epoch: {self.current_epoch}/{self.cfg.epochs}')
+            if self.labeled_sampler is not None:
+                self.labeled_sampler.set_epoch(epoch)
+            if self.unlabeled_sampler is not None:
+                self.unlabeled_sampler.set_epoch(epoch)
+            if is_main_process():
+                print(f'{current_time()} >>> Epoch: {self.current_epoch}/{self.cfg.epochs}')
             self.train_epoch()
-        print(f'<<< Training Finished.')
+        if is_main_process():
+            print(f'<<< Training Finished.')
