@@ -4,7 +4,6 @@ import torch.nn.functional as F
 from einops import rearrange
 import math
 
-
 def tokens_to_map(tokens, height, width):
     """Convert ``[B, H*W, C]`` tokens to a contiguous feature map."""
     if tokens.dim() != 3:
@@ -154,10 +153,13 @@ class Decoder(nn.Module):
         self.seg_head_3 = nn.Conv2d(in_channels=out_dim * 2, out_channels=1, kernel_size=3, stride=1, padding=1, bias=False)
         self.seg_head_4 = nn.Conv2d(in_channels=out_dim * 2, out_channels=1, kernel_size=3, stride=1, padding=1, bias=False)
 
-        # PC-HBM is attached in the following implementation stage.  Keeping it
-        # ``None`` here preserves the exact legacy state_dict and parity path.
         self.pc_cfg = pc_cfg
-        self.pc_hbm = None
+        if pc_cfg is not None and getattr(pc_cfg, 'enabled', False):
+            from Model.PC_HBM.dino_engine import DinoPCHBMEngine
+
+            self.pc_hbm = DinoPCHBMEngine(pc_cfg)
+        else:
+            self.pc_hbm = None
 
     def _project_features(self, features):
         if not isinstance(features, (tuple, list)) or len(features) != 4:
@@ -293,6 +295,153 @@ class Decoder(nn.Module):
             'm2': F.interpolate(m2, size=token_hw, mode='bilinear', align_corners=False),
         }
 
+    def _memory_fallback_reason(self, memory):
+        if memory is None:
+            return 'memory_missing'
+        if not hasattr(memory, 'is_ready') or not memory.is_ready():
+            return 'memory_not_ready'
+        if self.pc_cfg is not None and hasattr(memory, 'validate_compat'):
+            try:
+                compatible = memory.validate_compat(self.pc_cfg.expected_memory_meta())
+            except (KeyError, RuntimeError, ValueError) as error:
+                return f'memory_incompatible:{error}'
+            if not compatible:
+                reason = getattr(compatible, 'reason', None)
+                return str(reason or 'memory_incompatible')
+        return None
+
+    def _forward_pc_hbm(
+        self,
+        features,
+        memory,
+        pc_mode,
+        epoch,
+        query_image_ids=None,
+    ):
+        state = self._project_features(features)
+        token_hw = state['token_hw']
+        output_hw = state['output_hw']
+
+        t4 = self._forward_t4(state)
+        m4, _ = self._predict_side(
+            t4, state['global_mask'], self.seg_head_4, token_hw, output_hw
+        )
+        t3 = self._forward_t3(state, t4)
+        m3, _ = self._predict_side(
+            t3, torch.sigmoid(m4), self.seg_head_3, token_hw, output_hw
+        )
+        t2_pre = self._forward_t2(state, t3)
+        m2_pre, _ = self._predict_side(
+            t2_pre, torch.sigmoid(m3), self.seg_head_2, token_hw, output_hw
+        )
+
+        x3_map = tokens_to_map(state['kv3'], *token_hw)
+        p3_map = tokens_to_map(t3, *token_hw)
+        p2_pre_map = tokens_to_map(t2_pre, *token_hw)
+        kv2_map = tokens_to_map(state['kv2'], *token_hw)
+        child_map = p2_pre_map + kv2_map
+        m3_token = F.interpolate(
+            m3, size=token_hw, mode='bilinear', align_corners=False
+        )
+        m2_pre_token = F.interpolate(
+            m2_pre, size=token_hw, mode='bilinear', align_corners=False
+        )
+
+        if pc_mode == 'parent_only':
+            pc_aux = self.pc_hbm.forward_parent_only(
+                x3=x3_map,
+                p3=p3_map,
+                m3=m3_token,
+                memory=memory,
+                query_image_ids=query_image_ids,
+            )
+            t2 = t2_pre
+            m2 = m2_pre
+            p2_refined_map = p2_pre_map
+            p2_aux = None
+        else:
+            pc_aux = self.pc_hbm.forward_parent_child(
+                x3=x3_map,
+                p3=p3_map,
+                child_map=child_map,
+                m3=m3_token,
+                m2_pre=m2_pre_token,
+                memory=memory,
+                epoch=epoch,
+                query_image_ids=query_image_ids,
+            )
+            t3_corr = map_to_tokens(pc_aux['p3_corr'])
+            t2 = self._forward_t2(state, t3_corr)
+            m2, _ = self._predict_side(
+                t2, torch.sigmoid(m3), self.seg_head_2, token_hw, output_hw
+            )
+            p2_map = tokens_to_map(t2, *token_hw)
+            m2_token = F.interpolate(
+                m2, size=token_hw, mode='bilinear', align_corners=False
+            )
+            p2_aux = self.pc_hbm.forward_p2(
+                p2=p2_map,
+                prob2=torch.sigmoid(m2_token),
+                pc_maps=pc_aux['pc_maps'],
+            )
+            p2_refined_map = p2_aux['p2_refined']
+
+        t1 = self._forward_t1(state, map_to_tokens(p2_refined_map))
+        z_main, p1_98 = self._predict_side(
+            t1, torch.sigmoid(m2), self.seg_head_1, token_hw, output_hw
+        )
+        use_final_refinement = pc_mode in {'full', 'teacher_pseudo'} and p2_aux is not None
+        if use_final_refinement:
+            p1_aux = self.pc_hbm.forward_p1(
+                p1=p1_98, z_main=z_main, p2_aux=p2_aux
+            )
+            mix_aux = self.pc_hbm.forward_mixture(
+                z_main=z_main,
+                p1_aux=p1_aux,
+                pc_maps=pc_aux['pc_maps'],
+                epoch=epoch,
+                ts_continuation=pc_mode == 'teacher_pseudo',
+            )
+            z_final = mix_aux['z_final']
+            p_final = mix_aux['p_final']
+        else:
+            p1_aux = None
+            mix_aux = None
+            if pc_mode == 'student_core':
+                z_final = None
+                p_final = None
+            else:
+                z_final = z_main
+                p_final = torch.sigmoid(z_main)
+
+        outputs = (m4, m3, m2, z_main, state['global_logit'])
+        aux = {
+            'm4': m4,
+            'm3': m3,
+            'm2': m2,
+            'global_logit': state['global_logit'],
+            'z_main': z_main,
+            'z_nomix': z_main,
+            'z_final': z_final,
+            'p_final': p_final,
+            'pc_active': True,
+            'fallback_reason': None,
+            'pc_hbm': pc_aux,
+            'p2_bra': p2_aux,
+            'p1_pra': p1_aux,
+            'mixture': mix_aux,
+            'mixture_skipped': not use_final_refinement,
+            'forward_mode': pc_mode,
+            'features': {
+                'x3': x3_map,
+                'p3': p3_map,
+                'p2_pre': p2_pre_map,
+                'p2_refined': p2_refined_map,
+                'p1': p1_98,
+            },
+        }
+        return outputs, self.pc_hbm.slim_aux(aux, mode=pc_mode)
+
     def forward(
         self,
         features,
@@ -305,10 +454,26 @@ class Decoder(nn.Module):
         if pc_mode not in self.VALID_PC_MODES:
             raise ValueError(f'Unsupported pc_mode={pc_mode!r}. Expected one of {sorted(self.VALID_PC_MODES)}.')
 
-        outputs, aux = self._forward_baseline(features)
+        fallback_reason = None
         if pc_mode != 'off':
-            aux['fallback_reason'] = 'pc_hbm_not_attached'
-            aux['forward_mode'] = pc_mode
+            if self.pc_hbm is None:
+                fallback_reason = 'pc_hbm_not_attached'
+            else:
+                fallback_reason = self._memory_fallback_reason(memory)
+
+        if pc_mode == 'off' or fallback_reason is not None:
+            outputs, aux = self._forward_baseline(features)
+            if pc_mode != 'off':
+                aux['fallback_reason'] = fallback_reason
+                aux['forward_mode'] = pc_mode
+        else:
+            outputs, aux = self._forward_pc_hbm(
+                features=features,
+                memory=memory,
+                pc_mode=pc_mode,
+                epoch=epoch,
+                query_image_ids=query_image_ids,
+            )
 
         if return_aux:
             return outputs, aux
