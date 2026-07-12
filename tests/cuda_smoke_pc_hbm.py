@@ -23,6 +23,7 @@ from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from Model.base_model import BaseModel
 from Model.decoder import Decoder
 from Model.PC_HBM.memory import PCMemory
+from Model.PC_HBM.training import pc_hbm_labeled_loss, pc_unlabeled_loss
 
 
 BATCH_BASE = 16
@@ -164,17 +165,50 @@ def extract_features(model: BaseModel, batch_size: int, config: DinoPCHBMConfig)
     return tuple(feature.detach() for feature in features)
 
 
-def finite_training_loss(outputs, aux) -> torch.Tensor:
-    tensors = [tensor for tensor in outputs if torch.is_tensor(tensor)]
-    z_final = aux.get("z_final")
-    if torch.is_tensor(z_final) and all(z_final is not tensor for tensor in tensors):
-        tensors.append(z_final)
-    if not tensors:
-        raise AssertionError("Decoder returned no tensor outputs for backward smoke")
-    loss = sum(tensor.float().square().mean() for tensor in tensors)
+def real_training_loss(
+    outputs,
+    aux,
+    config: DinoPCHBMConfig,
+    *,
+    pc_mode: str,
+    epoch: int,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Run the same loss family used by the real Base/TS trainers."""
+
+    z_main = aux.get("z_main")
+    if not torch.is_tensor(z_main):
+        raise AssertionError("Decoder aux is missing z_main logits")
+    if pc_mode == "student_core":
+        pseudo = torch.rand_like(z_main, dtype=torch.float32)
+        confidence = torch.full_like(pseudo, 0.75)
+        loss, metrics = pc_unlabeled_loss(
+            outputs,
+            aux,
+            pseudo,
+            confidence,
+            epoch=1,
+            config=config,
+        )
+    else:
+        gt = (torch.rand_like(z_main, dtype=torch.float32) > 0.5).float()
+        loss, metrics = pc_hbm_labeled_loss(
+            outputs,
+            aux,
+            gt,
+            epoch,
+            config,
+            pc_mode=pc_mode,
+            strict=True,
+        )
+        for name in ("L_B3", "L_gate", "L_boundary"):
+            value = metrics.get(name)
+            if not torch.is_tensor(value) or not torch.isfinite(value):
+                raise AssertionError(f"Missing or non-finite real labeled metric: {name}")
+        if not bool(metrics["L_B3"] > 0):
+            raise AssertionError("Real labeled smoke did not activate L_B3")
     if not torch.isfinite(loss):
         raise AssertionError("Non-finite PC-HBM smoke loss")
-    return loss
+    return loss, metrics
 
 
 def assert_finite_gradients(module: torch.nn.Module) -> None:
@@ -183,6 +217,18 @@ def assert_finite_gradients(module: torch.nn.Module) -> None:
         raise AssertionError("Backward produced no Decoder gradients")
     if not all(torch.isfinite(gradient).all() for gradient in gradients):
         raise AssertionError("Backward produced non-finite Decoder gradients")
+
+
+def assert_module_received_gradients(module: torch.nn.Module, name: str) -> None:
+    gradients = [
+        parameter.grad
+        for parameter in module.parameters()
+        if parameter.grad is not None
+    ]
+    if not gradients:
+        raise AssertionError(f"{name} received no gradient from the real PC-HBM loss")
+    if not all(torch.isfinite(gradient).all() for gradient in gradients):
+        raise AssertionError(f"{name} received non-finite gradients")
 
 
 def peak_gib() -> float:
@@ -205,6 +251,7 @@ def run_training_scenario(
     *,
     batch_size: int,
     pc_mode: str,
+    epoch: int,
 ) -> float:
     decoder.train()
     decoder.zero_grad(set_to_none=True)
@@ -216,7 +263,7 @@ def run_training_scenario(
             features,
             memory=memory,
             pc_mode=pc_mode,
-            epoch=30,
+            epoch=epoch,
             return_aux=True,
             query_image_ids=query_ids if pc_mode == "full" else None,
         )
@@ -224,12 +271,21 @@ def run_training_scenario(
             raise AssertionError(f"{label}: PC path unexpectedly inactive: {aux.get('fallback_reason')}")
         if pc_mode == "student_core" and not aux.get("mixture_skipped", False):
             raise AssertionError("Student core must skip P1/mixture")
-        loss = finite_training_loss(outputs, aux)
+        loss, metrics = real_training_loss(
+            outputs,
+            aux,
+            config,
+            pc_mode=pc_mode,
+            epoch=epoch,
+        )
     loss.backward()
     assert_finite_gradients(decoder)
+    if pc_mode == "full":
+        assert_module_received_gradients(decoder.pc_hbm.boundary3, "B3 boundary head")
+        assert_module_received_gradients(decoder.pc_hbm.gate_mlp, "PC gate MLP")
     peak = peak_gib()
     decoder.zero_grad(set_to_none=True)
-    del loss, outputs, aux, features
+    del loss, metrics, outputs, aux, features
     release()
     print(f"[PASS] {label}: batch={batch_size}, mode={pc_mode}, peak={peak:.2f} GiB")
     return peak
@@ -288,6 +344,7 @@ def run_attempt(name: str, overrides: dict[str, int], seed: int) -> dict[str, fl
             config,
             batch_size=BATCH_BASE,
             pc_mode="full",
+            epoch=11,
         ),
         "teacher_b32": run_teacher_scenario(model, memory, config),
         "student_labeled_full_b32": run_training_scenario(
@@ -298,6 +355,7 @@ def run_attempt(name: str, overrides: dict[str, int], seed: int) -> dict[str, fl
             config,
             batch_size=BATCH_STUDENT_LABELED,
             pc_mode="full",
+            epoch=31,
         ),
         "student_unlabeled_core_b32": run_training_scenario(
             "student unlabeled",
@@ -307,6 +365,7 @@ def run_attempt(name: str, overrides: dict[str, int], seed: int) -> dict[str, fl
             config,
             batch_size=BATCH_STUDENT_UNLABELED,
             pc_mode="student_core",
+            epoch=31,
         ),
     }
     del model, memory
