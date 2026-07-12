@@ -6,6 +6,7 @@ import torch
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from Model.decoder import Decoder
 from Model.PC_HBM.memory import PCMemory
+from Model.PC_HBM.training import pc_hbm_labeled_loss, prepare_pseudo_targets
 
 
 def _ready_memory(config: DinoPCHBMConfig) -> PCMemory:
@@ -146,3 +147,80 @@ def test_full_mode_backward_reaches_pc_modules(decoder_inputs):
         parameter.grad is not None
         for parameter in model.pc_hbm.parameters()
     )
+
+
+def test_decoder_memory_feature_builder_produces_labeled_only_ready_memory(
+    decoder_inputs,
+):
+    model, features, _ = decoder_inputs
+    gt = torch.zeros(1, 1, 98, 98)
+    gt[:, :, 20:78, 24:72] = 1
+    memory_features = model.forward_memory_features(features)
+    entries = model.pc_hbm.build_memory_entries(
+        memory_features, gt, ["labeled-sample"]
+    )
+    memory = PCMemory(
+        model.pc_cfg.memory_dim,
+        model.pc_cfg.value_dim,
+        model.pc_cfg.geometry_dim,
+    )
+    memory.append(entries)
+    memory.finalize(
+        compat_meta=model.pc_cfg.expected_memory_meta(
+            producer_fingerprint="unit-test"
+        )
+    )
+    assert memory.is_ready()
+    assert set(memory.route["img_ids"]) == {"labeled-sample"}
+    assert memory.parent["p3_keys"].device.type == "cpu"
+    assert memory.parent["p3_keys"].dtype == torch.float16
+    assert memory.parent["child_ptr"].amin() >= 0
+
+
+@pytest.mark.parametrize(("mode", "epoch"), (("off", 1), ("parent_only", 6), ("full", 11)))
+def test_real_decoder_aux_satisfies_strict_mode_loss_contract(
+    decoder_inputs, mode, epoch
+):
+    model, features, memory = decoder_inputs
+    outputs, aux = model(
+        features,
+        memory=None if mode == "off" else memory,
+        pc_mode=mode,
+        epoch=epoch,
+        return_aux=True,
+        query_image_ids=["query"],
+    )
+    gt = (torch.rand(1, 1, 98, 98) > 0.5).float()
+    loss, metrics = pc_hbm_labeled_loss(
+        outputs,
+        aux,
+        gt,
+        epoch,
+        model.pc_cfg,
+        pc_mode=mode,
+        strict=True,
+    )
+    assert torch.isfinite(loss)
+    assert "L_base" in metrics
+
+
+def test_real_teacher_aux_builds_probability_confidence_and_background_targets(
+    decoder_inputs,
+):
+    model, features, memory = decoder_inputs
+    _, aux = model(
+        features,
+        memory=memory,
+        pc_mode="teacher_pseudo",
+        epoch=31,
+        return_aux=True,
+        query_image_ids=["unlabeled-query"],
+    )
+    pseudo = prepare_pseudo_targets(aux, model.pc_cfg, strict=True)
+    assert pseudo["p_soft"].shape == (1, 1, 98, 98)
+    assert pseudo["confidence"].shape == (1, 1, 98, 98)
+    assert pseudo["confidence"].amin() >= 0
+    assert pseudo["confidence"].amax() <= 1
+    assert pseudo["hard_valid"].dtype == torch.bool
+    background = pseudo["hard_valid"] & (pseudo["hard_target"] == 0)
+    assert background.any() or (~pseudo["hard_valid"]).all()

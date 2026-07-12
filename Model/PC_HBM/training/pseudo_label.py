@@ -1,0 +1,253 @@
+"""Online PC-HBM pseudo targets and Student-core weighted objectives."""
+
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+import torch
+import torch.nn.functional as F
+
+from .losses import zero_like_loss
+
+
+def build_pc_confidence(aux: Mapping[str, Any], *, strict: bool = True) -> torch.Tensor:
+    """Multiply the five prescribed structural confidence factors.
+
+    The input ``p_final`` is already a probability.  It is deliberately not
+    passed through another sigmoid.
+    """
+
+    p_final = aux.get("p_final")
+    z_main = aux.get("z_main")
+    pc = aux.get("pc_hbm", {}) or {}
+    mixture = aux.get("mixture", {}) or {}
+    missing = []
+    if not torch.is_tensor(p_final):
+        missing.append("p_final")
+    if not torch.is_tensor(z_main):
+        missing.append("z_main")
+    c23 = _nested_get(pc, "C23_map")
+    pi = mixture.get("pi")
+    route_entropy = _nested_get(pc, "route_entropy_norm")
+    if not torch.is_tensor(c23):
+        missing.append("pc_hbm.C23_map")
+    if not torch.is_tensor(pi):
+        missing.append("mixture.pi")
+    if not torch.is_tensor(route_entropy):
+        missing.append("pc_hbm.route_entropy_norm")
+    if missing:
+        if strict:
+            raise KeyError(f"Teacher pseudo confidence is missing: {missing}")
+        if not torch.is_tensor(p_final):
+            raise KeyError("p_final is required even when strict=False")
+        return torch.zeros_like(p_final).detach()
+
+    p_final = p_final.detach().clamp(0.0, 1.0)
+    p_main = torch.sigmoid(z_main.detach())
+    if p_main.shape[-2:] != p_final.shape[-2:]:
+        p_main = F.interpolate(p_main, size=p_final.shape[-2:], mode="bilinear", align_corners=False)
+
+    probability_confidence = (2.0 * (p_final - 0.5).abs()).clamp(0.0, 1.0)
+    main_final_agreement = (1.0 - (p_final - p_main).abs()).clamp(0.0, 1.0)
+    c23 = F.interpolate(
+        c23.detach().to(dtype=p_final.dtype),
+        size=p_final.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    ).clamp(0.0, 1.0)
+
+    pi = pi.detach().to(dtype=p_final.dtype).clamp_min(1.0e-6)
+    if pi.size(1) != 4:
+        raise ValueError(f"mixture.pi must have four branches, got {tuple(pi.shape)}")
+    mixture_entropy = -(pi * pi.log()).sum(dim=1, keepdim=True) / math.log(4.0)
+    if mixture_entropy.shape[-2:] != p_final.shape[-2:]:
+        mixture_entropy = F.interpolate(
+            mixture_entropy,
+            size=p_final.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+    mixture_entropy = mixture_entropy.clamp(0.0, 1.0)
+
+    route_entropy = route_entropy.detach().to(device=p_final.device, dtype=p_final.dtype)
+    if route_entropy.ndim == 0:
+        route_entropy = route_entropy.expand(p_final.size(0))
+    if route_entropy.size(0) != p_final.size(0):
+        raise ValueError("route_entropy_norm batch dimension must match p_final")
+    route_entropy = route_entropy.reshape(route_entropy.size(0), -1).mean(dim=1)
+    route_confidence = (1.0 - route_entropy).view(-1, 1, 1, 1).clamp(0.0, 1.0)
+
+    confidence = (
+        probability_confidence
+        * main_final_agreement
+        * (1.0 - c23)
+        * (1.0 - mixture_entropy)
+        * route_confidence
+    )
+    return confidence.clamp(0.0, 1.0).detach()
+
+
+def prepare_pseudo_targets(
+    teacher_aux: Mapping[str, Any],
+    config: Any,
+    *,
+    strict: bool = True,
+) -> dict[str, torch.Tensor]:
+    """Clone probability, confidence and foreground/background hard masks."""
+
+    p_final = teacher_aux.get("p_final")
+    if not torch.is_tensor(p_final):
+        raise KeyError("teacher_aux['p_final'] probability is required")
+    p_soft = p_final.detach().clone()
+    confidence = build_pc_confidence(teacher_aux, strict=strict).detach().clone()
+    fg_threshold = float(getattr(config, "pseudo_fg_threshold", 0.70))
+    bg_threshold = float(getattr(config, "pseudo_bg_threshold", 0.30))
+    if not 0.0 <= bg_threshold < 0.5 < fg_threshold <= 1.0:
+        raise ValueError("pseudo thresholds must satisfy 0 <= bg < 0.5 < fg <= 1")
+    hard_target = (p_soft >= 0.5).to(dtype=p_soft.dtype)
+    hard_valid = (p_soft >= fg_threshold) | (p_soft <= bg_threshold)
+    hard_weight = confidence * hard_valid.to(dtype=confidence.dtype)
+    return {
+        "p_soft": p_soft,
+        "confidence": confidence,
+        "hard_target": hard_target,
+        "hard_valid": hard_valid,
+        "hard_weight": hard_weight,
+    }
+
+
+def weighted_structure_loss(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    confidence: torch.Tensor,
+    eps: float = 1.0e-6,
+) -> torch.Tensor:
+    """Confidence-weighted F3Net loss without dropping background samples."""
+
+    if target.ndim == 3:
+        target = target.unsqueeze(1)
+    if confidence.ndim == 3:
+        confidence = confidence.unsqueeze(1)
+    if target.shape[-2:] != logits.shape[-2:]:
+        target = F.interpolate(target.float(), size=logits.shape[-2:], mode="bilinear", align_corners=False)
+    if confidence.shape[-2:] != logits.shape[-2:]:
+        confidence = F.interpolate(
+            confidence.float(), size=logits.shape[-2:], mode="bilinear", align_corners=False
+        )
+    target = target.detach().to(device=logits.device, dtype=logits.dtype)
+    confidence = confidence.detach().to(device=logits.device, dtype=logits.dtype).clamp_min(0.0)
+    if target.shape != logits.shape or confidence.shape != logits.shape:
+        raise ValueError(
+            "logits, target and confidence must resolve to the same [B,1,H,W] shape, "
+            f"got {tuple(logits.shape)}, {tuple(target.shape)}, {tuple(confidence.shape)}"
+        )
+
+    structure_weight = 1.0 + 5.0 * torch.abs(
+        F.avg_pool2d(target, kernel_size=31, stride=1, padding=15) - target
+    )
+    weight = structure_weight * confidence
+    bce = F.binary_cross_entropy_with_logits(logits, target, reduction="none")
+    weighted_bce = (bce * weight).sum(dim=(2, 3)) / (weight.sum(dim=(2, 3)) + eps)
+    probability = torch.sigmoid(logits)
+    intersection = (probability * target * weight).sum(dim=(2, 3))
+    union = ((probability + target) * weight).sum(dim=(2, 3))
+    weighted_iou = 1.0 - (intersection + 1.0) / (union - intersection + 1.0)
+    return (weighted_bce + weighted_iou).mean()
+
+
+def pc_unlabeled_loss(
+    outputs: Sequence[torch.Tensor],
+    aux: Mapping[str, Any],
+    pseudo: torch.Tensor,
+    confidence: torch.Tensor,
+    epoch: int,
+    config: Any,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Supervise Student ``z_main`` plus low-weight original side logits."""
+
+    if not isinstance(outputs, (tuple, list)) or len(outputs) != 5:
+        raise ValueError("Student outputs must be (m4, m3, m2, z_main, global_logit)")
+    z_student = aux.get("z_main")
+    if not torch.is_tensor(z_student):
+        raise KeyError("student_core aux['z_main'] logits are required")
+    if aux.get("mixture_skipped") is False:
+        raise RuntimeError("Unlabeled Student supervision requires student_core/mixture_skipped")
+    p_soft = pseudo.detach().clone()
+    confidence = confidence.detach().clone()
+    fg_threshold = float(getattr(config, "pseudo_fg_threshold", 0.70))
+    bg_threshold = float(getattr(config, "pseudo_bg_threshold", 0.30))
+    hard_target = (p_soft >= 0.5).to(p_soft.dtype)
+    hard_valid = (p_soft >= fg_threshold) | (p_soft <= bg_threshold)
+    hard_weight = confidence * hard_valid.to(confidence.dtype)
+
+    l_soft = weighted_structure_loss(z_student, p_soft, confidence)
+    l_hard = weighted_structure_loss(z_student, hard_target, hard_weight)
+    ramp_epochs = max(1, int(getattr(config, "pseudo_hard_ramp_epochs", 3)))
+    hard_ramp = min(1.0, max(0.0, float(epoch) / float(ramp_epochs)))
+
+    m4, m3, m2, output_z_main, global_logit = outputs
+    # Guard against accidentally supervising a different final/mixture tensor.
+    if output_z_main.data_ptr() != z_student.data_ptr() and output_z_main.shape != z_student.shape:
+        raise ValueError("outputs[3] and aux['z_main'] must identify the Student main logit")
+    l_side = (
+        0.30 * weighted_structure_loss(m2, p_soft, confidence)
+        + 0.20 * weighted_structure_loss(m3, p_soft, confidence)
+        + 0.10 * weighted_structure_loss(m4, p_soft, confidence)
+        + 0.10 * weighted_structure_loss(global_logit, p_soft, confidence)
+    )
+    hard_weight_factor = float(getattr(config, "hard_loss_weight", 2.0))
+    unscaled = l_soft + hard_weight_factor * hard_ramp * l_hard + l_side
+    total = float(getattr(config, "lambda_u", 1.0)) * unscaled
+    log = {
+        "L_u_soft": l_soft.detach(),
+        "L_u_hard": l_hard.detach(),
+        "L_u_side": l_side.detach(),
+        "hard_ramp": z_student.new_tensor(hard_ramp).detach(),
+        "hard_valid_ratio": hard_valid.to(z_student.dtype).mean().detach(),
+        "pseudo_conf_mean": confidence.mean().detach(),
+        "loss_unlabeled": total.detach(),
+    }
+    return total, log
+
+
+def compute_pc_hbm_unlabeled_loss(
+    student_aux: Mapping[str, Any],
+    pseudo_prob: torch.Tensor,
+    confidence: torch.Tensor,
+    config: Any,
+    epoch: int,
+    outputs: Sequence[torch.Tensor] | None = None,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Reference-name wrapper; ``outputs`` is required for side supervision."""
+
+    if outputs is None:
+        z_main = student_aux.get("z_main")
+        if not torch.is_tensor(z_main):
+            raise KeyError("student_aux['z_main'] is required")
+        zero = zero_like_loss(z_main).view(1, 1, 1, 1).expand_as(z_main)
+        outputs = (zero, zero, zero, z_main, zero)
+    return pc_unlabeled_loss(outputs, student_aux, pseudo_prob, confidence, epoch, config)
+
+
+structure_aware_confidence = build_pc_confidence
+
+
+def _nested_get(mapping, key, default=None):
+    if key in mapping:
+        return mapping[key]
+    for value in mapping.values():
+        if isinstance(value, Mapping) and key in value:
+            return value[key]
+    return default
+
+
+__all__ = [
+    "build_pc_confidence",
+    "compute_pc_hbm_unlabeled_loss",
+    "pc_unlabeled_loss",
+    "prepare_pseudo_targets",
+    "structure_aware_confidence",
+    "weighted_structure_loss",
+]
