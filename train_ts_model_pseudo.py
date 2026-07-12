@@ -20,8 +20,8 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description='Train the RSBL teacher-student model with online teacher pseudo labels.'
     )
-    parser.add_argument('--teacher-pth', default='./results/results_random/base_model/base_model_epoch_30.pth')
-    parser.add_argument('--ts_model-path', default='./results/results_random/ts_model')
+    parser.add_argument('--teacher-pth', default='./results/results_origin/base_model/base_model_epoch_30.pth')
+    parser.add_argument('--ts_model-path', default='./results/results_origin/ts_model')
     parser.add_argument('--seed', type=int, default=2025)
     parser.add_argument('--deterministic', action='store_true', help='Use deterministic cuDNN kernels; slower.')
     parser.add_argument(
