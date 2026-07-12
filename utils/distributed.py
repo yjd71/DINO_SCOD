@@ -60,7 +60,14 @@ def configure_distributed(cfg, context, seed):
     cfg.seed = seed
 
 
-def wrap_distributed(model, context):
+def wrap_distributed(model, context, *, find_unused_parameters=False):
+    """Wrap ``model`` in DDP while preserving the legacy default.
+
+    PC-HBM intentionally skips different parameter groups in ``off``,
+    ``parent_only`` and ``student_core`` modes, so its dedicated entry points
+    opt into unused-parameter discovery.  Existing callers keep the previous
+    ``False`` behaviour.
+    """
     if not context.distributed:
         return model
     if context.device.type == 'cuda':
@@ -68,8 +75,12 @@ def wrap_distributed(model, context):
             model,
             device_ids=[context.local_rank],
             output_device=context.local_rank,
+            find_unused_parameters=bool(find_unused_parameters),
         )
-    return DistributedDataParallel(model)
+    return DistributedDataParallel(
+        model,
+        find_unused_parameters=bool(find_unused_parameters),
+    )
 
 
 def unwrap_model(model):
