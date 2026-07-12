@@ -2,8 +2,9 @@ import os
 import torch
 from numbers import Integral
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 import torchvision.transforms as transforms
+from torchvision.transforms import InterpolationMode
 from utils.data_augmentation import cv_random_flip, randomCrop, randomRotation, randomPeper, colorEnhance
 import cv2
 
@@ -178,7 +179,8 @@ class LabeledTrainDataset(Dataset):
                        rCrop=False,
                        rRotate=False,
                        colorEnhance=False,
-                       rPeper=False):
+                       rPeper=False,
+                       return_sample_key=False):
 
         self.l_train_size = l_train_size
         self.patch_size = 14
@@ -189,6 +191,7 @@ class LabeledTrainDataset(Dataset):
         self.rRotate = rRotate
         self.colorEnhance = colorEnhance
         self.rPeper = rPeper
+        self.return_sample_key = bool(return_sample_key)
 
         # load labeled data
         self.l_images, self.l_gts = [], []
@@ -199,6 +202,7 @@ class LabeledTrainDataset(Dataset):
 
         self.l_images = [pair['image'] for pair in pairs]
         self.l_gts = [pair['gt'] for pair in pairs]
+        self.sample_keys = [pair['key'] for pair in pairs]
 
 
         assert len(self.l_images) == len(self.l_gts), '>>> Number of labeled images and gts do not match.'
@@ -242,6 +246,8 @@ class LabeledTrainDataset(Dataset):
         # l_image_fold = self.image_fold(l_image)
         l_gt = self.gt_transforms(l_gt)
 
+        if self.return_sample_key:
+            return ori_img, l_image, l_gt, self.sample_keys[index]
         return ori_img, l_image, l_gt
 
     def __len__(self):
@@ -261,6 +267,96 @@ class LabeledTrainDataset(Dataset):
             raise FileNotFoundError(f'Failed to read mask: {path}')
         img = Image.fromarray(img, mode='L')
         return img
+
+
+class PCLabeledTrainDataset(LabeledTrainDataset):
+    """Labeled training data with a stable image id appended to each sample.
+
+    The legacy :class:`LabeledTrainDataset` keeps returning exactly
+    ``(original_image, normalized_image, gt)`` by default.  PC-HBM training
+    opts into this subclass and receives ``(..., sample_key)`` so retrieval
+    can exclude a query image from its own labeled memory.
+    """
+
+    def __init__(self, *args, **kwargs):
+        kwargs["return_sample_key"] = True
+        super().__init__(*args, **kwargs)
+
+
+class LabeledMemoryDataset(LabeledTrainDataset):
+    """Deterministic labeled-only dataset used to rebuild PC-HBM memory.
+
+    Samples are ``(sample_key, normalized_image, gt)``.  There is no random
+    crop, flip, rotation, colour enhancement, or mask noise, and masks use
+    nearest-neighbour resize to preserve their binary semantics.
+    """
+
+    def __init__(
+        self,
+        l_image_root,
+        l_gt_root,
+        l_txt_root,
+        l_train_size,
+        labeled_indices_pt=None,
+    ):
+        super().__init__(
+            l_image_root=l_image_root,
+            l_gt_root=l_gt_root,
+            l_txt_root=l_txt_root,
+            l_train_size=l_train_size,
+            labeled_indices_pt=labeled_indices_pt,
+            rVFlip=False,
+            rCrop=False,
+            rRotate=False,
+            colorEnhance=False,
+            rPeper=False,
+            return_sample_key=False,
+        )
+        self.gt_transforms = transforms.Compose(
+            [
+                transforms.Resize(
+                    (self.l_train_size, self.l_train_size),
+                    interpolation=InterpolationMode.NEAREST,
+                ),
+                transforms.ToTensor(),
+            ]
+        )
+
+    def __getitem__(self, index):
+        image = self.rgb_loader(self.l_images[index])
+        gt = self.binary_loader(self.l_gts[index])
+        return self.sample_keys[index], self.img_transforms(image), self.gt_transforms(gt)
+
+
+def build_labeled_memory_loader(
+    l_image_root,
+    l_gt_root,
+    l_txt_root,
+    l_train_size,
+    *,
+    labeled_indices_pt=None,
+    batch_size=16,
+    num_workers=0,
+    pin_memory=True,
+):
+    """Build the full, ordered, non-distributed labeled memory loader."""
+
+    dataset = LabeledMemoryDataset(
+        l_image_root=l_image_root,
+        l_gt_root=l_gt_root,
+        l_txt_root=l_txt_root,
+        l_train_size=l_train_size,
+        labeled_indices_pt=labeled_indices_pt,
+    )
+    return DataLoader(
+        dataset,
+        batch_size=int(batch_size),
+        shuffle=False,
+        drop_last=False,
+        num_workers=int(num_workers),
+        pin_memory=bool(pin_memory),
+        persistent_workers=bool(num_workers),
+    )
 
 
 class UnlabeledTrainDataset(Dataset):
