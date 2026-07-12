@@ -108,6 +108,7 @@ class BasePCHBMTrainer:
             raise ValueError("PC-HBM labeled training loader is empty")
 
         self.warning_tracker = DiagnosticWarningTracker(self.pc_cfg)
+        self._diagnostic_mode: str | None = None
         self.current_epoch = 1
         self.last_epoch_metrics: dict[str, float] = {}
         self.save_dir = Path(cfg.save_dir)
@@ -220,6 +221,7 @@ class BasePCHBMTrainer:
                 f"train_epoch expected current epoch {self.current_epoch}, received {epoch}"
             )
         mode = pc_mode_for_epoch(epoch, self.pc_cfg)
+        self._set_diagnostic_mode(mode)
         self._rebuild_epoch_memory(epoch)
         if mode != "off":
             self._assert_memory_ready(epoch)
@@ -308,7 +310,7 @@ class BasePCHBMTrainer:
             for name, total in sorted(running.items())
         }
         self.last_epoch_metrics = epoch_metrics
-        self.warning_tracker.update(epoch_metrics, emit=is_main_process())
+        self._update_warning_tracker(mode, epoch_metrics, emit=is_main_process())
         used_lr = float(self.optimizer.param_groups[0]["lr"])
         if self.scheduler is not None:
             self.scheduler.step()
@@ -355,12 +357,40 @@ class BasePCHBMTrainer:
         if completed_epoch < 0 or completed_epoch > int(self.cfg.epochs):
             raise RuntimeError(f"Invalid resume epoch: {completed_epoch}")
         self.current_epoch = completed_epoch + 1
+        self.warning_tracker.history.clear()
         history = (checkpoint.get("extra") or {}).get("diagnostic_history", {})
         if isinstance(history, Mapping):
             for name, values in history.items():
                 if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
                     self.warning_tracker.history[str(name)].extend(float(value) for value in values)
+        completed_mode = pc_mode_for_epoch(completed_epoch, self.pc_cfg)
+        self._diagnostic_mode = completed_mode
+        if completed_mode != "full":
+            self.warning_tracker.history.clear()
         return checkpoint
+
+    def _set_diagnostic_mode(self, mode: str) -> None:
+        """Track schedule transitions and start full-mode diagnostics from a clean window."""
+
+        mode = str(mode)
+        if mode not in {"off", "parent_only", "full"}:
+            raise ValueError(f"Unsupported PC-HBM diagnostic mode: {mode!r}")
+        if mode == "full" and self._diagnostic_mode != "full":
+            self.warning_tracker.history.clear()
+        self._diagnostic_mode = mode
+
+    def _update_warning_tracker(
+        self,
+        mode: str,
+        metrics: Mapping[str, Any],
+        *,
+        emit: bool,
+    ) -> list[str]:
+        """Update collapse warnings only when every PC-HBM branch is active."""
+
+        if mode != "full":
+            return []
+        return self.warning_tracker.update(metrics, emit=emit)
 
     def _save_epoch(self, epoch: int, epoch_metrics: Mapping[str, float]) -> None:
         if not is_main_process():
