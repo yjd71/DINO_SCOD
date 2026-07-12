@@ -45,9 +45,7 @@ class Attention(nn.Module):
         
         # use SDPA for faster attention computation
         if self.use_sdpa:
-            # q = q * self.scale
-            with torch.backends.cuda.sdp_kernel(enable_math=False, enable_flash=False, enable_mem_efficient=True):
-                out = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0., is_causal=False)
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0., is_causal=False)
         else:
             dots = torch.matmul(q, k.transpose(-1, -2)) * self.scale
             attn = self.attend(dots)

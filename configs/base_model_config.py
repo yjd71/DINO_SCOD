@@ -12,6 +12,7 @@ class Config():
         self.train_imgs = [os.path.join(self.dataset_dir, name, 'im') for name in self.train_sets]
         self.train_masks = [os.path.join(self.dataset_dir, name, 'gt') for name in self.train_sets]
         self.train_sample_txt = os.path.join(self.dataset_dir, 'sampled_images.txt')
+        self.train_labeled_indices_pt = None
         
         ''' Test Dataset '''
         # CHAMELEON

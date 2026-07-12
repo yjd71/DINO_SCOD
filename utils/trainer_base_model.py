@@ -8,6 +8,11 @@ from tqdm import tqdm
 from utils.metrics import MAE, wF, meanEM, meanFM, SM
 import torch.nn.functional as F
 import numpy as np
+from datetime import datetime
+
+
+def current_time():
+    return datetime.now().strftime('%m-%d %H:%M:%S')
 
 
 def structure_loss(logits, mask):
@@ -64,7 +69,7 @@ class Trainer():
     def __init__(self, model, cfg, scheduler=None):
         self.model = model
         self.cfg = cfg
-        self.optimizer = optim.Adam(model.parameters(), lr=cfg.learning_rate)
+        self.optimizer = optim.Adam(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
         self.scheduler = CosineDecay(self.optimizer, max_lr=cfg.learning_rate, min_lr=cfg.min_lr, max_epoch=cfg.epochs) if scheduler is None else scheduler
 
         self.labeled_train_set = LabeledTrainDataset(
@@ -72,6 +77,7 @@ class Trainer():
              l_gt_root=cfg.train_masks,
              l_txt_root=cfg.train_sample_txt,
              l_train_size=cfg.train_size,
+             labeled_indices_pt=cfg.train_labeled_indices_pt,
              rVFlip=True,
              rCrop=True,
              rRotate=False,
@@ -142,6 +148,7 @@ class Trainer():
         print(f'<<< Start Training.')
         print(f'<<< Labeled Data Num: {len(self.labeled_train_set)}.')
         for epoch in range(self.cfg.epochs):
+              print(f'{current_time()} >>> Epoch: {self.current_epoch}/{self.cfg.epochs}')
               self.train_epoch()
         print(f'<<< Training Finished.')
         

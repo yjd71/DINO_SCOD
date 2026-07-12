@@ -1,7 +1,8 @@
-import torch
-import random
-import numpy as np
 import argparse
+import random
+
+import numpy as np
+import torch
 
 
 def set_seed(seed=2025, deterministic=False):
@@ -16,7 +17,9 @@ def set_seed(seed=2025, deterministic=False):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Train the RSBL teacher-student model.')
+    parser = argparse.ArgumentParser(
+        description='Train the RSBL teacher-student model with online teacher pseudo labels.'
+    )
     parser.add_argument('--teacher-pth', default='./results/results_random/base_model/base_model_epoch_30.pth')
     parser.add_argument('--ts_model-path', default='./results/results_random/ts_model')
     parser.add_argument('--seed', type=int, default=2025)
@@ -24,7 +27,7 @@ def parse_args():
     parser.add_argument(
         '--labeled-indices-pt',
         default=None,
-        help='Optional .pt file containing labeled sample stems/keys or integer indices. Overrides train_sample_txt when set.'
+        help='Optional .pt file containing labeled sample stems/keys or integer indices. Overrides train_sample_txt when set.',
     )
     return parser.parse_args()
 
@@ -33,9 +36,9 @@ if __name__ == '__main__':
     args = parse_args()
     set_seed(seed=args.seed, deterministic=args.deterministic)
 
-    from utils.trainer_ts_model import Trainer
     from configs.ts_model_config import Config
     from Model.ts_model import TSModel
+    from utils.trainer_ts_model_pseudo import Trainer
 
     cfg = Config()
     cfg.save_dir = args.ts_model_path
@@ -43,4 +46,3 @@ if __name__ == '__main__':
     ts_model = TSModel(teacher_pth=args.teacher_pth).to(cfg.device)
     trainer = Trainer(model=ts_model, cfg=cfg)
     trainer.train()
-    
