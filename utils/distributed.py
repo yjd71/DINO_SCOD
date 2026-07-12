@@ -104,8 +104,13 @@ def reduce_mean(value, device):
 
 
 def synchronize():
-    if dist.is_initialized():
-        dist.barrier()
+    if not dist.is_initialized():
+        return
+    backend = str(dist.get_backend()).lower()
+    if 'nccl' in backend and torch.cuda.is_available():
+        dist.barrier(device_ids=[torch.cuda.current_device()])
+        return
+    dist.barrier()
 
 
 def cleanup_distributed():

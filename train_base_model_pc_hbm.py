@@ -20,6 +20,13 @@ def set_seed(seed: int = 2025, deterministic: bool = False) -> None:
     torch.backends.cudnn.benchmark = not deterministic
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("value must be a positive integer")
+    return parsed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the RSBL Base DINO PC-HBM model")
     parser.add_argument(
@@ -44,6 +51,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--labeled-indices-pt", default=None)
     parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument(
+        "--batch-size",
+        type=_positive_int,
+        default=None,
+        help=(
+            "Training batch size per rank/process. By default, inherit Config.batch_size "
+            "(currently 16); global batch size is batch_size * world_size."
+        ),
+    )
     parser.add_argument("--memory-batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--checkpoint-interval", type=int, default=1)
@@ -79,6 +95,8 @@ if __name__ == "__main__":
         cfg.save_dir = args.output_dir
         cfg.train_labeled_indices_pt = args.labeled_indices_pt
         cfg.epochs = args.epochs
+        if args.batch_size is not None:
+            cfg.batch_size = args.batch_size
         cfg.memory_batch_size = args.memory_batch_size
         cfg.checkpoint_interval = args.checkpoint_interval
         if args.num_workers is not None:
