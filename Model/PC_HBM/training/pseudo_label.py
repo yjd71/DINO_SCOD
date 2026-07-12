@@ -189,7 +189,7 @@ def pc_unlabeled_loss(
 
     m4, m3, m2, output_z_main, global_logit = outputs
     # Guard against accidentally supervising a different final/mixture tensor.
-    if output_z_main.data_ptr() != z_student.data_ptr() and output_z_main.shape != z_student.shape:
+    if output_z_main.data_ptr() != z_student.data_ptr() or output_z_main.shape != z_student.shape:
         raise ValueError("outputs[3] and aux['z_main'] must identify the Student main logit")
     l_side = (
         0.30 * weighted_structure_loss(m2, p_soft, confidence)

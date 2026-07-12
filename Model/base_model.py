@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
+import warnings
 from Model.decoder import Decoder
+from utils.checkpoint_pc_hbm import load_decoder_compatible
 
 
 class BaseModel(nn.Module):
@@ -69,7 +71,14 @@ class BaseModel(nn.Module):
     
     def inference(self, x, memory=None, epoch=None):
         x_features = self.extract_features(x)
-        if self.decoder.pc_hbm is None or memory is None:
+        if self.decoder.pc_hbm is None:
+            return self.decoder(features=x_features, pc_mode='off')[3]
+        if memory is None:
+            warnings.warn(
+                'PC-HBM memory is missing; using z_main logits.',
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return self.decoder(features=x_features, pc_mode='off')[3]
         _, aux = self.decoder(
             features=x_features,
@@ -78,6 +87,14 @@ class BaseModel(nn.Module):
             epoch=epoch,
             return_aux=True,
         )
+        if not aux['pc_active']:
+            warnings.warn(
+                f'PC-HBM inference fallback: {aux.get("fallback_reason")}; '
+                'using z_main logits.',
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return aux['z_main']
         return aux['z_final'] if aux['z_final'] is not None else aux['z_main']
     
     def save_decoder_checkpoint(self, path):
@@ -85,8 +102,11 @@ class BaseModel(nn.Module):
         torch.save(self.decoder.state_dict(), path)
         print(f'Successfully save seg parameters to {path}.')
 
-    def load_decoder_checkpoint(self, path):
+    def load_decoder_checkpoint(self, path, require_pc_complete=False):
         assert path.endswith('.pth'), f'Path should end with .pth, but got: {path}'
-        state_dict = torch.load(path, map_location='cpu')
-        self.decoder.load_state_dict(state_dict)
+        load_decoder_compatible(
+            self.decoder,
+            path,
+            require_pc_complete=bool(require_pc_complete),
+        )
         print(f'Successfully load seg parameters from {path}.')

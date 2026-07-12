@@ -133,6 +133,12 @@ The pre-trained DINOv2 model weights can be downloaded from https://github.com/f
 
 ## 3. Pre-computed Maps
 
+### DINO PC-HBM extension
+
+The opt-in DINO PC-HBM training, resume, inference, compatibility, and smoke-test
+commands are documented in [docs/PC_HBM.md](docs/PC_HBM.md). The original RSBL
+entry points remain available.
+
 + Pre-computed Maps: 
    + 1% Training Data: [Google Drive](https://drive.google.com/drive/folders/1Ljd9nxno9qznMyEmQKohbXD8-vRZmAmu?usp=sharing)
    + 5% Training Data: [Google Drive](https://drive.google.com/drive/folders/1tPLR9Jsnymsfv4LvDSCX3rX4_OrQOiJp?usp=sharing)

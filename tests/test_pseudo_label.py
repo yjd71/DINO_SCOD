@@ -1,5 +1,6 @@
 import math
 
+import pytest
 import torch
 
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
@@ -68,3 +69,16 @@ def test_unlabeled_main_never_uses_z_final():
     assert tensors[3].grad is not None
     assert z_final.grad is None
     assert log["hard_valid_ratio"] >= 0
+
+
+def test_unlabeled_loss_rejects_same_shape_different_main_logit():
+    cfg = DinoPCHBMConfig()
+    z_main = torch.randn(1, 1, 8, 8, requires_grad=True)
+    impostor = z_main.detach().clone().requires_grad_(True)
+    outputs = (z_main, z_main, z_main, impostor, z_main)
+    aux = {"z_main": z_main, "mixture_skipped": True}
+    pseudo = torch.rand_like(z_main)
+    confidence = torch.ones_like(z_main)
+
+    with pytest.raises(ValueError, match="identify the Student main logit"):
+        pc_unlabeled_loss(outputs, aux, pseudo, confidence, 1, cfg)

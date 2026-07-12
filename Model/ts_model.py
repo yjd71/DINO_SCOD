@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import warnings
 from Model.decoder import Decoder
 from utils.checkpoint_pc_hbm import load_decoder_compatible
 
@@ -115,7 +116,14 @@ class TSModel(nn.Module):
     
     def inference(self, x, memory=None, epoch=None):
         x_features = self.extract_features(x)
-        if self.student.pc_hbm is None or memory is None:
+        if self.student.pc_hbm is None:
+            return self.student(x_features, pc_mode='off')[3]
+        if memory is None:
+            warnings.warn(
+                'PC-HBM memory is missing; using z_main logits.',
+                RuntimeWarning,
+                stacklevel=2,
+            )
             return self.student(x_features, pc_mode='off')[3]
         _, aux = self.student(
             x_features,
@@ -124,6 +132,14 @@ class TSModel(nn.Module):
             epoch=epoch,
             return_aux=True,
         )
+        if not aux['pc_active']:
+            warnings.warn(
+                f'PC-HBM inference fallback: {aux.get("fallback_reason")}; '
+                'using z_main logits.',
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return aux['z_main']
         return aux['z_final'] if aux['z_final'] is not None else aux['z_main']
 
     def load_teacher(self, path):

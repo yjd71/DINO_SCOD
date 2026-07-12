@@ -1,7 +1,10 @@
+from dataclasses import asdict
 from types import SimpleNamespace
 
+import pytest
 import torch
 
+from configs.pc_hbm_dino_config import DinoPCHBMConfig
 import utils.distributed as distributed
 from utils.trainer_ts_model_pseudo_pc_hbm import PCHBMPseudoTrainer
 
@@ -41,6 +44,21 @@ def test_ts_decoder_epoch_continues_after_base_schedule():
     trainer.pc_cfg = SimpleNamespace(mixture_schedule_end_epoch=30)
     assert trainer._decoder_epoch(1) == 31
     assert trainer._decoder_epoch(15) == 45
+
+
+def test_ts_resume_rejects_missing_or_different_pc_config():
+    trainer = object.__new__(PCHBMPseudoTrainer)
+    trainer.pc_cfg = DinoPCHBMConfig()
+    saved = asdict(trainer.pc_cfg)
+
+    trainer._validate_resume_config(saved)
+    with pytest.raises(RuntimeError, match="has no pc_cfg"):
+        trainer._validate_resume_config(None)
+
+    incompatible = dict(saved)
+    incompatible["memory_schema_version"] += 1
+    with pytest.raises(RuntimeError, match="memory_schema_version"):
+        trainer._validate_resume_config(incompatible)
 
 
 def test_wrap_distributed_forwards_optional_unused_parameter_flag(monkeypatch):

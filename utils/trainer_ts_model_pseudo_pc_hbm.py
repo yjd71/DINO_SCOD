@@ -8,6 +8,7 @@ labels back into memory.
 
 from __future__ import annotations
 
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -173,6 +174,7 @@ class PCHBMPseudoTrainer:
                 ema_model=self.core_model.teacher,
                 restore_rng=True,
             )
+            self._validate_resume_config(checkpoint.get("pc_cfg"))
             self.current_epoch = int(checkpoint["epoch"]) + 1
             self._freeze_teacher()
 
@@ -188,6 +190,27 @@ class PCHBMPseudoTrainer:
         if student_keys != teacher_keys:
             raise RuntimeError("Teacher and Student parameter names/order do not match")
         self._freeze_teacher()
+
+    def _validate_resume_config(self, saved_config):
+        """Reject resumes produced with a different PC-HBM contract."""
+
+        if saved_config is None:
+            raise RuntimeError("PC-HBM TS resume checkpoint has no pc_cfg")
+        current = (
+            asdict(self.pc_cfg)
+            if is_dataclass(self.pc_cfg)
+            else dict(vars(self.pc_cfg))
+        )
+        saved = dict(saved_config)
+        if saved != current:
+            differing = sorted(
+                key
+                for key in set(saved) | set(current)
+                if saved.get(key) != current.get(key)
+            )
+            raise RuntimeError(
+                f"TS resume PC-HBM config differs for keys: {differing}"
+            )
 
     def _freeze_teacher(self):
         self.core_model.teacher.eval()
