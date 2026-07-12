@@ -33,6 +33,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from Model.decoder import Decoder
 from Model.PC_HBM.memory import PCMemory
+from Model.PC_HBM.training import pc_unlabeled_loss
 
 
 class _CheapTransformerBlock(nn.Module):
@@ -68,7 +69,7 @@ class _PCHBMDDPSmokeModule(nn.Module):
         branch: str | None = None,
         epoch: int = 13,
         query_image_ids: Sequence[str] | None = None,
-    ) -> torch.Tensor:
+    ) -> object:
         if branch == "student_labeled":
             mode = "full"
         elif branch == "student_unlabeled":
@@ -89,6 +90,15 @@ class _PCHBMDDPSmokeModule(nn.Module):
             return_aux=True,
             query_image_ids=query_image_ids,
         )
+
+        # Return the real nested Student output through DDP for the unlabeled
+        # branch.  With find_unused_parameters=True, _DDPSink independently
+        # clones the repeated outputs[3]/aux['z_main'] references; the loss
+        # contract must therefore not depend on shared storage identity.
+        if branch == "student_unlabeled":
+            if not aux["mixture_skipped"] or aux["z_final"] is not None:
+                raise RuntimeError("student_core must skip P1/mixture and z_final.")
+            return outputs, aux
 
         # Baseline supervision is present in every stage.  Keeping this loss
         # inside forward lets DDP discover the exact autograd graph returned by
@@ -115,10 +125,6 @@ class _PCHBMDDPSmokeModule(nn.Module):
         # P2-BRA and exposes z_main as its supervised output.
         if mode == "full":
             loss = loss + aux["z_final"].float().square().mean()
-        elif mode == "student_core":
-            if not aux["mixture_skipped"] or aux["z_final"] is not None:
-                raise RuntimeError("student_core must skip P1/mixture and z_final.")
-            loss = loss + aux["z_main"].float().abs().mean()
         return loss
 
 
@@ -365,13 +371,25 @@ def main() -> None:
         )
         labeled_loss.backward()
 
-        unlabeled_loss = ddp(
+        unlabeled_outputs, unlabeled_aux = ddp(
             _features(rank, 11),
             memory,
             branch="student_unlabeled",
             epoch=13,
             query_image_ids=[f"unlabeled-query-rank-{rank}"],
         )
+        pseudo = torch.sigmoid(unlabeled_aux["z_main"].detach())
+        confidence = torch.ones_like(pseudo)
+        unlabeled_loss, _ = pc_unlabeled_loss(
+            unlabeled_outputs,
+            unlabeled_aux,
+            pseudo,
+            confidence,
+            epoch=1,
+            config=config,
+        )
+        if not torch.isfinite(unlabeled_loss):
+            raise AssertionError("Non-finite TS Student unlabeled loss.")
         unlabeled_loss.backward()
         _assert_allreduce_consistent(
             _gradient_checksum(ddp.module), name="TS accumulated gradients"

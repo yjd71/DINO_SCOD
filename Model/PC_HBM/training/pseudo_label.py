@@ -174,6 +174,25 @@ def pc_unlabeled_loss(
         raise KeyError("student_core aux['z_main'] logits are required")
     if aux.get("mixture_skipped") is False:
         raise RuntimeError("Unlabeled Student supervision requires student_core/mixture_skipped")
+
+    m4, m3, m2, output_z_main, global_logit = outputs
+    if not torch.is_tensor(output_z_main):
+        raise TypeError("outputs[3] must be the Student main logit tensor")
+    # ``find_unused_parameters=True`` routes every tensor in the DDP return
+    # tree through _DDPSink.  When the same logical z_main occurs in both the
+    # output tuple and aux mapping, PyTorch independently clones those two
+    # occurrences, so storage identity/data_ptr is not a valid public
+    # contract.  Keep aux['z_main'] as the supervised tensor and validate the
+    # stable tensor metadata shared by wrapped and unwrapped forwards.
+    if (
+        output_z_main.shape != z_student.shape
+        or output_z_main.device != z_student.device
+        or output_z_main.dtype != z_student.dtype
+    ):
+        raise ValueError(
+            "outputs[3] and aux['z_main'] must have matching shape, device, and dtype"
+        )
+
     p_soft = pseudo.detach().clone()
     confidence = confidence.detach().clone()
     fg_threshold = float(getattr(config, "pseudo_fg_threshold", 0.70))
@@ -187,10 +206,6 @@ def pc_unlabeled_loss(
     ramp_epochs = max(1, int(getattr(config, "pseudo_hard_ramp_epochs", 3)))
     hard_ramp = min(1.0, max(0.0, float(epoch) / float(ramp_epochs)))
 
-    m4, m3, m2, output_z_main, global_logit = outputs
-    # Guard against accidentally supervising a different final/mixture tensor.
-    if output_z_main.data_ptr() != z_student.data_ptr() or output_z_main.shape != z_student.shape:
-        raise ValueError("outputs[3] and aux['z_main'] must identify the Student main logit")
     l_side = (
         0.30 * weighted_structure_loss(m2, p_soft, confidence)
         + 0.20 * weighted_structure_loss(m3, p_soft, confidence)

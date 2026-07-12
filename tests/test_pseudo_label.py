@@ -71,14 +71,40 @@ def test_unlabeled_main_never_uses_z_final():
     assert log["hard_valid_ratio"] >= 0
 
 
-def test_unlabeled_loss_rejects_same_shape_different_main_logit():
+def test_unlabeled_loss_accepts_ddp_cloned_main_logit():
+    cfg = DinoPCHBMConfig()
+    source = torch.randn(1, 1, 8, 8, requires_grad=True)
+    output_z_main = source.clone()
+    aux_z_main = source.clone()
+    aux_z_main.retain_grad()
+    sides = [torch.randn_like(source, requires_grad=True) for _ in range(4)]
+    outputs = (sides[0], sides[1], sides[2], output_z_main, sides[3])
+    aux = {"z_main": aux_z_main, "mixture_skipped": True}
+    pseudo = torch.rand_like(source)
+    confidence = torch.ones_like(source)
+
+    assert output_z_main.data_ptr() != aux_z_main.data_ptr()
+    loss, _ = pc_unlabeled_loss(outputs, aux, pseudo, confidence, 1, cfg)
+    loss.backward()
+
+    assert aux_z_main.grad is not None and torch.isfinite(aux_z_main.grad).all()
+    assert source.grad is not None and torch.isfinite(source.grad).all()
+
+
+@pytest.mark.parametrize(
+    ("output_z_main", "match"),
+    [
+        (torch.randn(1, 1, 7, 8), "shape, device, and dtype"),
+        (torch.randn(1, 1, 8, 8, dtype=torch.float64), "shape, device, and dtype"),
+    ],
+)
+def test_unlabeled_loss_rejects_incompatible_main_logit_contract(output_z_main, match):
     cfg = DinoPCHBMConfig()
     z_main = torch.randn(1, 1, 8, 8, requires_grad=True)
-    impostor = z_main.detach().clone().requires_grad_(True)
-    outputs = (z_main, z_main, z_main, impostor, z_main)
+    outputs = (z_main, z_main, z_main, output_z_main, z_main)
     aux = {"z_main": z_main, "mixture_skipped": True}
     pseudo = torch.rand_like(z_main)
     confidence = torch.ones_like(z_main)
 
-    with pytest.raises(ValueError, match="identify the Student main logit"):
+    with pytest.raises(ValueError, match=match):
         pc_unlabeled_loss(outputs, aux, pseudo, confidence, 1, cfg)
