@@ -27,6 +27,40 @@ def zero_like_loss(reference: torch.Tensor) -> torch.Tensor:
     return reference.sum() * 0.0
 
 
+def probability_bce(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Compute BCE on sigmoid probabilities without AMP's unsafe CUDA kernel.
+
+    PC-HBM boundary and gate heads expose probabilities rather than raw logits.
+    CUDA autocast therefore cannot use ``binary_cross_entropy`` directly.  Keep
+    the probability contract, but perform the loss itself in explicit FP32.
+    """
+
+    if not torch.is_tensor(prediction) or not torch.is_tensor(target):
+        raise TypeError("prediction and target must be torch.Tensor instances")
+    if prediction.shape != target.shape:
+        raise ValueError(
+            f"prediction and target must have the same shape, got "
+            f"{tuple(prediction.shape)} and {tuple(target.shape)}"
+        )
+    if not prediction.is_floating_point():
+        raise TypeError("prediction must use a floating-point dtype")
+    if reduction not in {"none", "mean", "sum"}:
+        raise ValueError(f"unsupported reduction: {reduction!r}")
+
+    eps = 1.0e-4 if prediction.dtype in (torch.float16, torch.bfloat16) else 1.0e-6
+    device_type = prediction.device.type
+    with torch.autocast(device_type=device_type, enabled=False):
+        probability_fp32 = prediction.float().clamp(eps, 1.0 - eps)
+        target_fp32 = target.detach().to(device=prediction.device, dtype=torch.float32)
+        target_fp32 = target_fp32.clamp(0.0, 1.0)
+        return F.binary_cross_entropy(probability_fp32, target_fp32, reduction=reduction)
+
+
 def structure_loss(logits: torch.Tensor, target: torch.Tensor, eps: float = 1.0e-6) -> torch.Tensor:
     """F3Net/RSBL weighted BCE plus weighted IoU for matching spatial sizes."""
 
@@ -357,34 +391,77 @@ def _gate_loss(pc, aux, gt, reference):
     target = gather_by_boundary_indices(target_map, indices).reshape_as(gate)
     target = target * (1.0 - contradiction.detach()).reshape_as(target).clamp(0.0, 1.0)
     valid = _query_valid(pc, gate.size(0), gate).to(gate.dtype).view(-1, *([1] * (gate.ndim - 1)))
-    per_element = F.binary_cross_entropy(
-        gate.clamp(1.0e-6, 1.0 - 1.0e-6), target.detach(), reduction="none"
-    )
-    expanded_valid = valid.expand_as(per_element)
+    per_element = probability_bce(gate, target, reduction="none")
+    expanded_valid = valid.bool().expand_as(per_element)
     if not bool(expanded_valid.bool().any()):
-        return zero_like_loss(gate)
+        return zero_like_loss(per_element)
+    expanded_valid = expanded_valid.to(per_element.dtype)
     return (per_element * expanded_valid).sum() / expanded_valid.sum().clamp_min(1.0)
 
 
-def _single_boundary_loss(prediction, gt, reference):
+def _single_boundary_loss(prediction, gt, reference, *, valid_mask=None):
     if not torch.is_tensor(prediction) or not prediction.numel():
         return zero_like_loss(prediction if torch.is_tensor(prediction) else reference)
-    target = build_gt_boundary(gt, tuple(prediction.shape[-2:])).to(prediction.dtype)
-    return F.binary_cross_entropy(prediction.clamp(1.0e-6, 1.0 - 1.0e-6), target)
+    target = build_gt_boundary(gt, tuple(prediction.shape[-2:])).to(
+        device=prediction.device, dtype=prediction.dtype
+    )
+    if target.shape != prediction.shape:
+        if target.shape[0] != prediction.shape[0] or target.shape[1] != prediction.shape[1]:
+            raise ValueError(
+                f"boundary target shape {tuple(target.shape)} is incompatible with "
+                f"prediction shape {tuple(prediction.shape)}"
+            )
+
+    per_element = probability_bce(prediction, target, reduction="none")
+    if valid_mask is None:
+        return per_element.mean()
+    if not torch.is_tensor(valid_mask):
+        raise TypeError("valid_mask must be a torch.Tensor or None")
+
+    mask = valid_mask.detach()
+    if mask.ndim == prediction.ndim - 1:
+        mask = mask.unsqueeze(1)
+    if mask.ndim != prediction.ndim:
+        raise ValueError(
+            f"valid_mask must have {prediction.ndim - 1} or {prediction.ndim} dimensions, "
+            f"got {mask.ndim}"
+        )
+    if mask.shape[0] != prediction.shape[0]:
+        raise ValueError(
+            f"valid_mask batch size {mask.shape[0]} does not match prediction "
+            f"batch size {prediction.shape[0]}"
+        )
+    mask = mask.to(device=prediction.device, dtype=torch.float32)
+    if tuple(mask.shape[-2:]) != tuple(prediction.shape[-2:]):
+        mask = F.interpolate(mask, size=prediction.shape[-2:], mode="nearest")
+    if mask.shape[1] == 1 and prediction.shape[1] != 1:
+        mask = mask.expand(-1, prediction.shape[1], -1, -1)
+    elif mask.shape[1] != prediction.shape[1]:
+        raise ValueError(
+            f"valid_mask channels {mask.shape[1]} do not match prediction "
+            f"channels {prediction.shape[1]}"
+        )
+    mask = mask.clamp(0.0, 1.0).to(per_element.dtype)
+    denominator = mask.sum()
+    if not bool(denominator > 0):
+        return zero_like_loss(per_element)
+    return (per_element * mask).sum() / denominator
 
 
 def _boundary_loss(pc, p2, p1, gt, reference):
     predictions = (
-        _nested_get(pc, "B3"),
-        _nested_get(p2, "B2"),
-        _nested_get(p2, "B2_refined_map"),
-        _nested_get(p1, "B1"),
+        (_nested_get(pc, "B3"), None),
+        (_nested_get(p2, "B2"), None),
+        (_nested_get(p2, "B2_refined_map"), _nested_get(p2, "valid2_map")),
+        (_nested_get(p1, "B1"), None),
     )
     total = zero_like_loss(reference)
     count = 0
-    for prediction in predictions:
+    for prediction, valid_mask in predictions:
         if torch.is_tensor(prediction) and prediction.numel():
-            total = total + _single_boundary_loss(prediction, gt, reference)
+            total = total + _single_boundary_loss(
+                prediction, gt, reference, valid_mask=valid_mask
+            )
             count += 1
     return total if count else zero_like_loss(reference)
 
