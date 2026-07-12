@@ -6,6 +6,7 @@ import torch
 
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
 import utils.distributed as distributed
+import utils.trainer_ts_model_pseudo_pc_hbm as ts_trainer
 from utils.trainer_ts_model_pseudo_pc_hbm import PCHBMPseudoTrainer
 
 
@@ -44,6 +45,39 @@ def test_ts_decoder_epoch_continues_after_base_schedule():
     trainer.pc_cfg = SimpleNamespace(mixture_schedule_end_epoch=30)
     assert trainer._decoder_epoch(1) == 31
     assert trainer._decoder_epoch(15) == 45
+
+
+def test_train_prints_start_and_end_time_for_every_epoch(monkeypatch, capsys):
+    trainer = object.__new__(PCHBMPseudoTrainer)
+    trainer.current_epoch = 1
+    trainer.cfg = SimpleNamespace(epochs=2)
+    trainer.scheduler = SimpleNamespace(step=lambda: None)
+    trainer.optimizer = SimpleNamespace(param_groups=[{"lr": 1.0e-4}])
+    trainer.train_epoch = lambda: {"loss": 1.25, "confidence": 0.125}
+    trainer._save_epoch = lambda epoch, metrics: None
+    trainer._export_final_memory = lambda: None
+
+    timestamps = iter(
+        (
+            "2026-07-13T01:00:00+08:00",
+            "2026-07-13T01:05:00+08:00",
+            "2026-07-13T01:05:01+08:00",
+            "2026-07-13T01:10:00+08:00",
+        )
+    )
+    monkeypatch.setattr(ts_trainer, "_current_local_timestamp", lambda: next(timestamps))
+    monkeypatch.setattr(ts_trainer, "is_main_process", lambda: True)
+    monkeypatch.setattr(ts_trainer, "synchronize", lambda: None)
+
+    trainer.train()
+
+    output = capsys.readouterr().out
+    assert "epoch 1/2: start_time=2026-07-13T01:00:00+08:00" in output
+    assert "epoch 1/2: loss=1.250000" in output
+    assert "end_time=2026-07-13T01:05:00+08:00" in output
+    assert "epoch 2/2: start_time=2026-07-13T01:05:01+08:00" in output
+    assert "epoch 2/2: loss=1.250000" in output
+    assert "end_time=2026-07-13T01:10:00+08:00" in output
 
 
 def test_ts_resume_rejects_missing_or_different_pc_config():

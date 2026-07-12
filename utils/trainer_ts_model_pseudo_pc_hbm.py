@@ -9,6 +9,7 @@ labels back into memory.
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -43,6 +44,12 @@ from utils.distributed import (
     unwrap_model,
 )
 from utils.pc_memory_runner import build_memory_compat_meta, rebuild_memory
+
+
+def _current_local_timestamp() -> str:
+    """Return an ISO-8601 local timestamp with an explicit UTC offset."""
+
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 class PCHBMPseudoTrainer:
@@ -473,6 +480,12 @@ class PCHBMPseudoTrainer:
             )
         for epoch in range(self.current_epoch, int(self.cfg.epochs) + 1):
             self.current_epoch = epoch
+            if is_main_process():
+                print(
+                    f">>> TS PC-HBM epoch {epoch}/{self.cfg.epochs}: "
+                    f"start_time={_current_local_timestamp()}",
+                    flush=True,
+                )
             metrics = self.train_epoch()
             self.scheduler.step()
             self._save_epoch(epoch, metrics)
@@ -481,7 +494,8 @@ class PCHBMPseudoTrainer:
                 print(
                     f">>> TS PC-HBM epoch {epoch}/{self.cfg.epochs}: "
                     f"loss={metrics['loss']:.6f}, confidence={metrics['confidence']:.4f}, "
-                    f"lr={lr:.3e}"
+                    f"lr={lr:.3e}, end_time={_current_local_timestamp()}",
+                    flush=True,
                 )
             synchronize()
         self._export_final_memory()
