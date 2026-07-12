@@ -197,14 +197,14 @@ def pc_unlabeled_loss(
     confidence = confidence.detach().clone()
     fg_threshold = float(getattr(config, "pseudo_fg_threshold", 0.70))
     bg_threshold = float(getattr(config, "pseudo_bg_threshold", 0.30))
-    hard_target = (p_soft >= 0.5).to(p_soft.dtype)
+    # hard_target = (p_soft >= 0.5).to(p_soft.dtype)
     hard_valid = (p_soft >= fg_threshold) | (p_soft <= bg_threshold)
-    hard_weight = confidence * hard_valid.to(confidence.dtype)
+    # hard_weight = confidence * hard_valid.to(confidence.dtype)
 
     l_soft = weighted_structure_loss(z_student, p_soft, confidence)
-    l_hard = weighted_structure_loss(z_student, hard_target, hard_weight)
-    ramp_epochs = max(1, int(getattr(config, "pseudo_hard_ramp_epochs", 3)))
-    hard_ramp = min(1.0, max(0.0, float(epoch) / float(ramp_epochs)))
+    # l_hard = weighted_structure_loss(z_student, hard_target, hard_weight)
+    # ramp_epochs = max(1, int(getattr(config, "pseudo_hard_ramp_epochs", 3)))
+    # hard_ramp = min(1.0, max(0.0, float(epoch) / float(ramp_epochs)))
 
     l_side = (
         0.30 * weighted_structure_loss(m2, p_soft, confidence)
@@ -212,14 +212,15 @@ def pc_unlabeled_loss(
         + 0.10 * weighted_structure_loss(m4, p_soft, confidence)
         + 0.10 * weighted_structure_loss(global_logit, p_soft, confidence)
     )
-    hard_weight_factor = float(getattr(config, "hard_loss_weight", 2.0))
-    unscaled = l_soft + hard_weight_factor * hard_ramp * l_hard + l_side
+    # hard_weight_factor = float(getattr(config, "hard_loss_weight", 2.0))
+    # unscaled = l_soft + hard_weight_factor * hard_ramp * l_hard + l_side
+    unscaled = l_soft + l_side
     total = float(getattr(config, "lambda_u", 1.0)) * unscaled
     log = {
         "L_u_soft": l_soft.detach(),
-        "L_u_hard": l_hard.detach(),
+        # "L_u_hard": l_hard.detach(),
         "L_u_side": l_side.detach(),
-        "hard_ramp": z_student.new_tensor(hard_ramp).detach(),
+        # "hard_ramp": z_student.new_tensor(hard_ramp).detach(),
         "hard_valid_ratio": hard_valid.to(z_student.dtype).mean().detach(),
         "pseudo_conf_mean": confidence.mean().detach(),
         "loss_unlabeled": total.detach(),

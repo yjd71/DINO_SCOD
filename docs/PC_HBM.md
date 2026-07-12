@@ -20,7 +20,7 @@
 
 ```powershell
 conda run -n yjd python train_base_model_pc_hbm.py `
-  --output-dir .\results\base_pc_hbm `
+  --output-dir ./results/base_pc_hbm `
   --epochs 30
 ```
 
@@ -28,7 +28,7 @@ conda run -n yjd python train_base_model_pc_hbm.py `
 
 ```powershell
 conda run -n yjd python -m torch.distributed.run --standalone --nproc_per_node=2 `
-  train_base_model_pc_hbm.py --output-dir .\results\base_pc_hbm --epochs 30
+  train_base_model_pc_hbm.py --output-dir ./results/base_pc_hbm --epochs 30
 ```
 
 `--batch-size` 始终表示每个 rank/进程的物理 batch；不传时继承
@@ -40,23 +40,23 @@ Base 使用 1-based 调度：epoch 1–5 为 `off`，6–10 为
 
 ```powershell
 conda run -n yjd python train_base_model_pc_hbm.py `
-  --output-dir .\results\base_pc_hbm `
-  --resume .\results\base_pc_hbm\training_resume.pth `
+  --output-dir ./results/base_pc_hbm `
+  --resume ./results/base_pc_hbm/training_resume.pth `
   --epochs 30
 ```
 
 ### Linux/Bash 服务器恢复
 
-Linux shell 必须使用 `/` 路径和 Bash 的 `\` 行续接符，不要直接复制上面的
-PowerShell 路径。尤其是 `.\results\base_pc_hbm`：Bash 会把反斜杠当作转义符，
+Linux shell 必须使用 `/` 路径和 Bash 的 `/` 行续接符，不要直接复制上面的
+PowerShell 路径。尤其是 `./results/base_pc_hbm`：Bash 会把反斜杠当作转义符，
 可能实际写入仓库根目录下的 `.resultsbase_pc_hbm`，而不是
 `./results/base_pc_hbm`。
 
 恢复前同时查找正确目录和这个可能的误解析目录，不自动移动或覆盖 artifact：
 
 ```bash
-find ./results ./.resultsbase_pc_hbm -type f \
-  \( -name 'training_resume.pth' -o -name '*resume*.pth' \) \
+find ./results ./.resultsbase_pc_hbm -type f /
+  /( -name 'training_resume.pth' -o -name '*resume*.pth' /) /
   -print 2>/dev/null
 ```
 
@@ -82,12 +82,12 @@ PY
 完成 Epoch 6 smoke：
 
 ```bash
-conda run -n yjd python -m torch.distributed.run \
-  --standalone --nproc_per_node=2 \
-  train_base_model_pc_hbm.py \
-  --output-dir ./results/base_pc_hbm_amp_fix \
-  --resume "$RESUME" \
-  --batch-size 16 \
+conda run -n yjd python -m torch.distributed.run /
+  --standalone --nproc_per_node=2 /
+  train_base_model_pc_hbm.py /
+  --output-dir ./results/base_pc_hbm_amp_fix /
+  --resume "$RESUME" /
+  --batch-size 16 /
   --epochs 6
 ```
 
@@ -95,12 +95,12 @@ Epoch 6 验证通过后，从新目录的 checkpoint 接续到 Epoch 11：
 
 ```bash
 EPOCH6_RESUME=./results/base_pc_hbm_amp_fix/training_resume.pth
-conda run -n yjd python -m torch.distributed.run \
-  --standalone --nproc_per_node=2 \
-  train_base_model_pc_hbm.py \
-  --output-dir ./results/base_pc_hbm_epoch11_smoke \
-  --resume "$EPOCH6_RESUME" \
-  --batch-size 16 \
+conda run -n yjd python -m torch.distributed.run /
+  --standalone --nproc_per_node=2 /
+  train_base_model_pc_hbm.py /
+  --output-dir ./results/base_pc_hbm_epoch11_smoke /
+  --resume "$EPOCH6_RESUME" /
+  --batch-size 16 /
   --epochs 11
 ```
 
@@ -108,12 +108,12 @@ Epoch 11 full-mode 验证通过后再继续到 Epoch 30：
 
 ```bash
 EPOCH11_RESUME=./results/base_pc_hbm_epoch11_smoke/training_resume.pth
-conda run -n yjd python -m torch.distributed.run \
-  --standalone --nproc_per_node=2 \
-  train_base_model_pc_hbm.py \
-  --output-dir ./results/base_pc_hbm \
-  --resume "$EPOCH11_RESUME" \
-  --batch-size 16 \
+conda run -n yjd python -m torch.distributed.run /
+  --standalone --nproc_per_node=2 /
+  train_base_model_pc_hbm.py /
+  --output-dir ./results/base_pc_hbm /
+  --resume "$EPOCH11_RESUME" /
+  --batch-size 16 /
   --epochs 30
 ```
 
@@ -131,8 +131,8 @@ TS 默认拒绝不完整的 legacy Base 权重，并要求完整 Base PC-HBM che
 
 ```powershell
 conda run -n yjd python train_ts_model_pseudo_pc_hbm.py `
-  --base-pc-checkpoint .\results\base_pc_hbm\base_pc_hbm_decoder_epoch_30.pth `
-  --output-dir .\results\pc_hbm\ts_model `
+  --base-pc-checkpoint ./results/base_pc_hbm/base_pc_hbm_decoder_epoch_30.pth `
+  --output-dir ./results/pc_hbm/ts_model `
   --epochs 15
 ```
 
@@ -140,9 +140,9 @@ conda run -n yjd python train_ts_model_pseudo_pc_hbm.py `
 
 ```powershell
 conda run -n yjd python train_ts_model_pseudo_pc_hbm.py `
-  --base-pc-checkpoint .\results\base_pc_hbm\base_pc_hbm_decoder_epoch_30.pth `
-  --resume .\results\pc_hbm\ts_model\ts_pc_hbm_resume_latest.pth `
-  --output-dir .\results\pc_hbm\ts_model `
+  --base-pc-checkpoint ./results/base_pc_hbm/base_pc_hbm_decoder_epoch_30.pth `
+  --resume ./results/pc_hbm/ts_model/ts_pc_hbm_resume_latest.pth `
+  --output-dir ./results/pc_hbm/ts_model `
   --epochs 15
 ```
 
@@ -157,12 +157,12 @@ PC-HBM 训练结果。
 Linux 双卡正式 TS 命令为：
 
 ```bash
-conda run -n yjd python -m torch.distributed.run \
-  --standalone --nproc_per_node=2 \
-  train_ts_model_pseudo_pc_hbm.py \
-  --base-pc-checkpoint \
-    ./results/base_pc_hbm/base_pc_hbm_decoder_epoch_30.pth \
-  --output-dir ./results/pc_hbm/ts_model \
+conda run -n yjd python -m torch.distributed.run /
+  --standalone --nproc_per_node=2 /
+  train_ts_model_pseudo_pc_hbm.py /
+  --base-pc-checkpoint /
+    ./results/base_pc_hbm/base_pc_hbm_decoder_epoch_30.pth /
+  --output-dir ./results/pc_hbm/ts_model /
   --epochs 15
 ```
 
@@ -172,10 +172,10 @@ conda run -n yjd python -m torch.distributed.run \
 
 ```powershell
 conda run -n yjd python inference.py `
-  --decoder-checkpoint .\results\pc_hbm\ts_model\ts_pc_hbm_student_final.pth `
-  --memory-checkpoint .\results\pc_hbm\ts_model\ts_pc_hbm_memory_final.pth `
+  --decoder-checkpoint ./results/pc_hbm/ts_model/ts_pc_hbm_student_final.pth `
+  --memory-checkpoint ./results/pc_hbm/ts_model/ts_pc_hbm_memory_final.pth `
   --require-producer-match `
-  --pred-root .\results\pc_hbm\predictions
+  --pred-root ./results/pc_hbm/predictions
 ```
 
 memory 通过架构、schema、输入/输出尺寸、DINO 层索引、维度、dtype 和 source
@@ -186,7 +186,7 @@ memory 通过架构、schema、输入/输出尺寸、DINO 层索引、维度、d
 旧调用仍可用：
 
 ```powershell
-conda run -n yjd python inference.py --checkpoint .\path\to\legacy_decoder.pth
+conda run -n yjd python inference.py --checkpoint ./path/to/legacy_decoder.pth
 ```
 
 旧 raw state dict 可以在无 memory 的 baseline 路径加载；当提供 memory 时，
