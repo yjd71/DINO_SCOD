@@ -61,6 +61,7 @@ def _full_aux(outputs, size=16):
         "p2_bra": {
             "B2": torch.full((1, 1, 28, 28), 0.5, requires_grad=True),
             "B2_refined_map": torch.full((1, 1, 28, 28), 0.5, requires_grad=True),
+            "valid2_map": torch.ones(1, 28, 28, dtype=torch.bool),
         },
         "p1_pra": {"B1": torch.full((1, 1, size, size), 0.5, requires_grad=True)},
         "mixture": mixture,
@@ -106,6 +107,25 @@ def test_full_loss_is_finite_and_backpropagates():
     loss.backward()
     assert outputs[3].grad is not None
     assert aux["pc_hbm"]["S_child"].grad is not None
+
+
+def test_refined_boundary_gradient_is_limited_to_valid2_map():
+    cfg = DinoPCHBMConfig()
+    gt = torch.zeros(1, 1, 32, 32)
+    outputs = _outputs()
+    aux = _full_aux(outputs)
+    refined = aux["p2_bra"]["B2_refined_map"]
+    valid2 = torch.zeros(1, 28, 28, dtype=torch.bool)
+    valid2[:, 0, 0] = True
+    aux["p2_bra"]["valid2_map"] = valid2
+
+    loss, _ = pc_hbm_labeled_loss(outputs, aux, gt, 11, cfg)
+    loss.backward()
+
+    assert refined.grad is not None
+    assert refined.grad[0, 0, 0, 0].abs() > 0
+    assert torch.count_nonzero(refined.grad[0, 0, 1:, :]) == 0
+    assert torch.count_nonzero(refined.grad[0, 0, 0, 1:]) == 0
 
 
 def test_quality_loss_normalizes_across_all_four_branches():
