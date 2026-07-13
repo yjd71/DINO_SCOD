@@ -105,6 +105,12 @@ def test_decoder_pc_modes_have_stable_outputs_and_aux_schema(
         assert aux["p_final"].amax() <= 1
     if mode in {"full", "teacher_pseudo"}:
         torch.testing.assert_close(aux["z_final"], outputs[3])
+    if mode == "off":
+        assert aux["features"]["p3"].shape == (1, 128, 28, 28)
+        assert aux["features"]["p2"].shape == (1, 128, 28, 28)
+    if mode == "teacher_pseudo":
+        assert aux["distill_features"]["p3_corr"].shape == (1, 128, 28, 28)
+        assert aux["distill_features"]["p2_refined"].shape == (1, 128, 28, 28)
 
 
 def test_missing_or_incompatible_memory_returns_explicit_baseline_fallback(
@@ -204,7 +210,7 @@ def test_real_decoder_aux_satisfies_strict_mode_loss_contract(
     assert "L_base" in metrics
 
 
-def test_real_teacher_aux_builds_probability_confidence_and_background_targets(
+def test_real_teacher_aux_builds_soft_targets_and_corrected_features(
     decoder_inputs,
 ):
     model, features, memory = decoder_inputs
@@ -221,6 +227,7 @@ def test_real_teacher_aux_builds_probability_confidence_and_background_targets(
     assert pseudo["confidence"].shape == (1, 1, 98, 98)
     assert pseudo["confidence"].amin() >= 0
     assert pseudo["confidence"].amax() <= 1
-    assert pseudo["hard_valid"].dtype == torch.bool
-    background = pseudo["hard_valid"] & (pseudo["hard_target"] == 0)
-    assert background.any() or (~pseudo["hard_valid"]).all()
+    assert not any(key.startswith("hard") for key in pseudo)
+    distill = pseudo["distill_features"]
+    assert distill["p3_corr"].shape == (1, 128, 28, 28)
+    assert distill["p2_refined"].shape == (1, 128, 28, 28)

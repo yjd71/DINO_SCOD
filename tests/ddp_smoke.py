@@ -33,7 +33,8 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from Model.decoder import Decoder
 from Model.PC_HBM.memory import PCMemory
-from Model.PC_HBM.training import pc_unlabeled_loss
+from Model.PC_HBM.training import pc_unlabeled_loss, update_ema_module
+from utils.pc_memory_runner import module_fingerprint
 
 
 class _CheapTransformerBlock(nn.Module):
@@ -49,11 +50,12 @@ class _CheapTransformerBlock(nn.Module):
 
 
 class _PCHBMDDPSmokeModule(nn.Module):
-    """Expose Base modes and TS branch dispatch through one DDP wrapper."""
+    """Expose Base modes or raw teacher-only Student branches through DDP."""
 
-    def __init__(self, config: DinoPCHBMConfig) -> None:
+    def __init__(self, config: DinoPCHBMConfig, *, teacher_only: bool = False) -> None:
         super().__init__()
-        self.student = Decoder(pc_cfg=config)
+        self.teacher_only = bool(teacher_only)
+        self.student = Decoder(pc_cfg=None if self.teacher_only else config)
         dim = config.decoder_dim
         self.student.TransBlock_seg1 = _CheapTransformerBlock(dim)
         self.student.TransBlock_seg2 = _CheapTransformerBlock(dim)
@@ -71,9 +73,9 @@ class _PCHBMDDPSmokeModule(nn.Module):
         query_image_ids: Sequence[str] | None = None,
     ) -> object:
         if branch == "student_labeled":
-            mode = "full"
+            mode = "off" if self.teacher_only else "full"
         elif branch == "student_unlabeled":
-            mode = "student_core"
+            mode = "off" if self.teacher_only else "student_core"
         elif branch is None and pc_mode is not None:
             mode = pc_mode
         else:
@@ -96,8 +98,10 @@ class _PCHBMDDPSmokeModule(nn.Module):
         # clones the repeated outputs[3]/aux['z_main'] references; the loss
         # contract must therefore not depend on shared storage identity.
         if branch == "student_unlabeled":
-            if not aux["mixture_skipped"] or aux["z_final"] is not None:
-                raise RuntimeError("student_core must skip P1/mixture and z_final.")
+            if not aux["mixture_skipped"]:
+                raise RuntimeError("Student unlabeled path must skip mixture.")
+            if not self.teacher_only and aux["z_final"] is not None:
+                raise RuntimeError("student_core must not return z_final.")
             return outputs, aux
 
         # Baseline supervision is present in every stage.  Keeping this loss
@@ -267,6 +271,26 @@ def _gradient_checksum(module: nn.Module) -> torch.Tensor:
     )
 
 
+def _assert_finite_gradient_group(
+    module: _PCHBMDDPSmokeModule,
+    *,
+    pc_parameters: bool,
+    expected: bool,
+    name: str,
+) -> None:
+    gradients = [
+        parameter.grad
+        for parameter_name, parameter in module.student.named_parameters()
+        if parameter_name.startswith("pc_hbm.") == pc_parameters
+        and parameter.grad is not None
+    ]
+    if bool(gradients) != expected:
+        state = "receive" if expected else "not receive"
+        raise AssertionError(f"{name} must {state} gradients in this Base stage.")
+    if not all(torch.isfinite(gradient).all() for gradient in gradients):
+        raise AssertionError(f"{name} received non-finite gradients.")
+
+
 def _assert_allreduce_consistent(
     local_checksum: torch.Tensor,
     *,
@@ -340,8 +364,11 @@ def main() -> None:
         ddp = DDP(model, find_unused_parameters=True)
         optimizer = torch.optim.SGD(ddp.parameters(), lr=1e-5)
 
-        # Base schedule: changing unused parameter sets across iterations must
-        # not leave a stale reducer state or hang either rank.
+        # Base uses find_unused_parameters=True because the unused set changes
+        # by stage: off leaves every PC parameter unused; parent_only activates
+        # only the parent/B3 subset; full activates the complete correction
+        # path.  Legacy Decoder supervision remains live in all three stages.
+        # The changing reducer graph must not become stale or hang either rank.
         for step, mode in enumerate(("off", "parent_only", "full")):
             optimizer.zero_grad(set_to_none=True)
             loss = ddp(
@@ -354,26 +381,52 @@ def main() -> None:
             if not torch.isfinite(loss):
                 raise AssertionError(f"Non-finite Base loss in mode={mode}.")
             loss.backward()
+            _assert_finite_gradient_group(
+                ddp.module,
+                pc_parameters=False,
+                expected=True,
+                name=f"Base/{mode} legacy Decoder",
+            )
+            _assert_finite_gradient_group(
+                ddp.module,
+                pc_parameters=True,
+                expected=mode != "off",
+                name=f"Base/{mode} PC-HBM",
+            )
             optimizer.step()
             _assert_allreduce_consistent(
                 _parameter_checksum(ddp.module), name=f"Base/{mode} parameters"
             )
 
-        # TS order: two normally synchronized backwards through the same DDP
-        # wrapper, with no no_sync and only one optimizer step afterwards.
-        optimizer.zero_grad(set_to_none=True)
-        labeled_loss = ddp(
+        # Teacher-only TS uses a raw Student with no PC-HBM parameters and
+        # find_unused_parameters=False.  Both backwards synchronize normally.
+        torch.manual_seed(271828)
+        raw_model = _PCHBMDDPSmokeModule(config, teacher_only=True)
+        if raw_model.student.pc_hbm is not None:
+            raise AssertionError("Teacher-only TS Student must be raw and contain no PC-HBM.")
+        raw_ddp = DDP(raw_model, find_unused_parameters=False)
+        raw_optimizer = torch.optim.SGD(raw_ddp.parameters(), lr=1e-5)
+        torch.manual_seed(161803)
+        frozen_teacher = _PCHBMDDPSmokeModule(config).student
+        frozen_teacher.eval().requires_grad_(False)
+        teacher_pc_fingerprint = module_fingerprint(frozen_teacher.pc_hbm)
+
+        # One zero_grad and one optimizer step intentionally bracket two normal
+        # synchronized backwards.  There is no no_sync(): labeled raw/off and
+        # unlabeled raw/off distillation must both all-reduce and accumulate.
+        raw_optimizer.zero_grad(set_to_none=True)
+        labeled_loss = raw_ddp(
             _features(rank, 10),
-            memory,
+            None,
             branch="student_labeled",
             epoch=13,
             query_image_ids=[f"labeled-query-rank-{rank}"],
         )
         labeled_loss.backward()
 
-        unlabeled_outputs, unlabeled_aux = ddp(
+        unlabeled_outputs, unlabeled_aux = raw_ddp(
             _features(rank, 11),
-            memory,
+            None,
             branch="student_unlabeled",
             epoch=13,
             query_image_ids=[f"unlabeled-query-rank-{rank}"],
@@ -387,23 +440,36 @@ def main() -> None:
             confidence,
             epoch=1,
             config=config,
+            teacher_features={
+                "p3_corr": unlabeled_aux["features"]["p3"].detach() + 0.01,
+                "p2_refined": unlabeled_aux["features"]["p2"].detach() + 0.01,
+            },
         )
         if not torch.isfinite(unlabeled_loss):
             raise AssertionError("Non-finite TS Student unlabeled loss.")
         unlabeled_loss.backward()
         _assert_allreduce_consistent(
-            _gradient_checksum(ddp.module), name="TS accumulated gradients"
+            _gradient_checksum(raw_ddp.module), name="TS accumulated gradients"
         )
-        optimizer.step()
+        raw_optimizer.step()
+        update_ema_module(
+            raw_ddp.module.student,
+            frozen_teacher,
+            momentum=0.995,
+            shared_only=True,
+            exclude_prefixes=("pc_hbm.",),
+        )
+        if module_fingerprint(frozen_teacher.pc_hbm) != teacher_pc_fingerprint:
+            raise AssertionError("Selective EMA modified frozen Teacher PC-HBM state.")
         _assert_allreduce_consistent(
-            _parameter_checksum(ddp.module), name="TS parameters"
+            _parameter_checksum(raw_ddp.module), name="TS raw Student parameters"
         )
 
         dist.barrier()
         if rank == 0:
             print(
                 "DDP PC-HBM smoke passed: 2 ranks/Gloo; "
-                "Base off,parent_only,full; TS full+student_core double backward; "
+                "Base off,parent_only,full; TS raw/off double backward and selective EMA; "
                 "all-reduce checksums consistent.",
                 flush=True,
             )

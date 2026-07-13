@@ -130,6 +130,7 @@ def pc_hbm_labeled_loss(
     *,
     pc_mode: str | None = None,
     strict: bool = True,
+    _include_base: bool = True,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Compute the mode-specific labeled objective and detached log scalars.
 
@@ -138,13 +139,18 @@ def pc_hbm_labeled_loss(
     term, with the memory group ramped over full epochs 11/12/13.
     """
 
-    l_base = base_structure_loss(outputs, gt)
+    if not isinstance(outputs, (tuple, list)) or len(outputs) != 5:
+        raise ValueError("Decoder outputs must be (m4, m3, m2, z_main, global_logit)")
     reference = outputs[3]
+    l_base = base_structure_loss(outputs, gt) if _include_base else zero_like_loss(reference)
     mode = _resolve_mode(pc_mode, aux, epoch, config)
     _validate_pc_activation(aux, mode, strict)
     terms = _zero_terms(reference)
-    terms["L_base"] = l_base
+    if _include_base:
+        terms["L_base"] = l_base
     if mode == "off":
+        if not _include_base:
+            raise ValueError("PC-only labeled loss does not support pc_mode='off'")
         terms["loss_labeled"] = l_base
         return l_base, _detach_terms(terms)
 
@@ -164,7 +170,10 @@ def pc_hbm_labeled_loss(
         terms["L_mem"] = terms["L_parent"]
         terms["L_boundary"] = terms["L_B3"]
         terms["loss_labeled"] = total
-        return total, _detach_terms(terms)
+        detached = _detach_terms(terms)
+        if not _include_base:
+            detached.pop("L_base", None)
+        return total, detached
 
     z_final = (aux or {}).get("z_final")
     if z_final is None:
@@ -205,7 +214,39 @@ def pc_hbm_labeled_loss(
     )
     terms["loss_labeled"] = total
     _append_means(terms, pc, mixture, reference)
-    return total, _detach_terms(terms)
+    detached = _detach_terms(terms)
+    if not _include_base:
+        detached.pop("L_base", None)
+    return total, detached
+
+
+def pc_hbm_pc_only_labeled_loss(
+    outputs: Sequence[torch.Tensor],
+    aux: Mapping[str, Any] | None,
+    gt: torch.Tensor,
+    epoch: int | None,
+    config: Any,
+    *,
+    pc_mode: str | None = None,
+    strict: bool = True,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Train only PC-HBM branches while keeping every baseline output unsupervised.
+
+    The objective intentionally excludes ``L_base``.  ``parent_only`` therefore
+    contains exactly the weighted parent and B3 terms, while ``full`` reuses the
+    established PC-HBM objective starting at ``L_final``.
+    """
+
+    return pc_hbm_labeled_loss(
+        outputs,
+        aux,
+        gt,
+        epoch,
+        config,
+        pc_mode=pc_mode,
+        strict=strict,
+        _include_base=False,
+    )
 
 
 def compute_pc_hbm_labeled_loss(
@@ -612,6 +653,7 @@ __all__ = [
     "base_structure_loss",
     "compute_pc_hbm_labeled_loss",
     "pc_hbm_labeled_loss",
+    "pc_hbm_pc_only_labeled_loss",
     "pc_injection_strength",
     "pc_mode_for_epoch",
     "structure_loss",

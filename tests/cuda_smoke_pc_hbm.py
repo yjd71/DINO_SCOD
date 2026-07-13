@@ -23,7 +23,12 @@ from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from Model.base_model import BaseModel
 from Model.decoder import Decoder
 from Model.PC_HBM.memory import PCMemory
-from Model.PC_HBM.training import pc_hbm_labeled_loss, pc_unlabeled_loss
+from Model.PC_HBM.training import (
+    base_structure_loss,
+    pc_hbm_labeled_loss,
+    pc_unlabeled_loss,
+    prepare_pseudo_targets,
+)
 
 
 BATCH_BASE = 16
@@ -200,10 +205,12 @@ def real_training_loss(
             pc_mode=pc_mode,
             strict=True,
         )
-        for name in ("L_B3", "L_gate", "L_boundary"):
+        for name in ("L_base", "L_B3", "L_gate", "L_boundary"):
             value = metrics.get(name)
             if not torch.is_tensor(value) or not torch.isfinite(value):
                 raise AssertionError(f"Missing or non-finite real labeled metric: {name}")
+        if not bool(metrics["L_base"] > 0):
+            raise AssertionError("Real joint labeled smoke did not activate L_base")
         if not bool(metrics["L_B3"] > 0):
             raise AssertionError("Real labeled smoke did not activate L_B3")
     if not torch.isfinite(loss):
@@ -227,6 +234,24 @@ def assert_module_received_gradients(module: torch.nn.Module, name: str) -> None
     ]
     if not gradients:
         raise AssertionError(f"{name} received no gradient from the real PC-HBM loss")
+    if not all(torch.isfinite(gradient).all() for gradient in gradients):
+        raise AssertionError(f"{name} received non-finite gradients")
+
+
+def assert_decoder_group_received_gradients(
+    decoder: Decoder,
+    *,
+    pc_parameters: bool,
+    name: str,
+) -> None:
+    gradients = [
+        parameter.grad
+        for parameter_name, parameter in decoder.named_parameters()
+        if parameter_name.startswith("pc_hbm.") == pc_parameters
+        and parameter.grad is not None
+    ]
+    if not gradients:
+        raise AssertionError(f"{name} received no gradient from the joint labeled loss")
     if not all(torch.isfinite(gradient).all() for gradient in gradients):
         raise AssertionError(f"{name} received non-finite gradients")
 
@@ -281,6 +306,16 @@ def run_training_scenario(
     loss.backward()
     assert_finite_gradients(decoder)
     if pc_mode == "full":
+        assert_decoder_group_received_gradients(
+            decoder,
+            pc_parameters=False,
+            name="Base legacy Decoder",
+        )
+        assert_decoder_group_received_gradients(
+            decoder,
+            pc_parameters=True,
+            name="Base PC-HBM",
+        )
         assert_module_received_gradients(decoder.pc_hbm.boundary3, "B3 boundary head")
         assert_module_received_gradients(decoder.pc_hbm.gate_mlp, "PC gate MLP")
     peak = peak_gib()
@@ -328,6 +363,92 @@ def run_teacher_scenario(
     return peak
 
 
+def _raw_student_from_enhancer(model: BaseModel) -> Decoder:
+    student = Decoder(pc_cfg=None)
+    student.load_state_dict(
+        {
+            name: value
+            for name, value in model.decoder.state_dict().items()
+            if not name.startswith("pc_hbm.")
+        },
+        strict=True,
+    )
+    return student.cuda()
+
+
+def run_raw_student_labeled_scenario(
+    model: BaseModel,
+    config: DinoPCHBMConfig,
+) -> float:
+    student = _raw_student_from_enhancer(model).train()
+    torch.cuda.reset_peak_memory_stats()
+    features = extract_features(model, BATCH_STUDENT_LABELED, config)
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        outputs, aux = student(features, pc_mode="off", return_aux=True)
+        if aux.get("pc_active", True):
+            raise AssertionError("Raw labeled Student unexpectedly activated PC-HBM")
+        gt = (torch.rand_like(aux["z_main"], dtype=torch.float32) > 0.5).float()
+        loss = base_structure_loss(outputs, gt)
+    loss.backward()
+    assert_finite_gradients(student)
+    peak = peak_gib()
+    del loss, gt, outputs, aux, features, student
+    release()
+    print(
+        f"[PASS] student labeled raw: batch={BATCH_STUDENT_LABELED}, "
+        f"mode=off, peak={peak:.2f} GiB"
+    )
+    return peak
+
+
+def run_raw_student_unlabeled_scenario(
+    model: BaseModel,
+    memory: PCMemory,
+    config: DinoPCHBMConfig,
+) -> float:
+    teacher = Decoder(pc_cfg=config)
+    teacher.load_state_dict(model.decoder.state_dict(), strict=True)
+    teacher.requires_grad_(False).eval().cuda()
+    student = _raw_student_from_enhancer(model).train()
+    torch.cuda.reset_peak_memory_stats()
+    features = extract_features(model, BATCH_STUDENT_UNLABELED, config)
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16):
+        _, teacher_aux = teacher(
+            features,
+            memory=memory,
+            pc_mode="teacher_pseudo",
+            epoch=30,
+            return_aux=True,
+        )
+    pseudo = prepare_pseudo_targets(teacher_aux, config, strict=True)
+    if any(name.startswith("hard_") for name in pseudo):
+        raise AssertionError("Teacher-only pseudo targets must not contain hard supervision")
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        outputs, student_aux = student(features, pc_mode="off", return_aux=True)
+        loss, metrics = pc_unlabeled_loss(
+            outputs,
+            student_aux,
+            pseudo["p_soft"],
+            pseudo["confidence"],
+            epoch=1,
+            config=config,
+            teacher_features=pseudo["distill_features"],
+        )
+    loss.backward()
+    assert_finite_gradients(student)
+    for name in ("L_u_soft", "L_u_feat_p3", "L_u_feat_p2"):
+        if name not in metrics or not torch.isfinite(metrics[name]):
+            raise AssertionError(f"Missing or non-finite teacher-only metric: {name}")
+    peak = peak_gib()
+    del loss, metrics, outputs, student_aux, pseudo, teacher_aux, features, teacher, student
+    release()
+    print(
+        f"[PASS] student unlabeled raw: batch={BATCH_STUDENT_UNLABELED}, "
+        f"mode=off+feature_distill, peak={peak:.2f} GiB"
+    )
+    return peak
+
+
 def run_attempt(name: str, overrides: dict[str, int], seed: int) -> dict[str, float]:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -347,25 +468,9 @@ def run_attempt(name: str, overrides: dict[str, int], seed: int) -> dict[str, fl
             epoch=11,
         ),
         "teacher_b32": run_teacher_scenario(model, memory, config),
-        "student_labeled_full_b32": run_training_scenario(
-            "student labeled",
-            model.decoder,
-            model,
-            memory,
-            config,
-            batch_size=BATCH_STUDENT_LABELED,
-            pc_mode="full",
-            epoch=31,
-        ),
-        "student_unlabeled_core_b32": run_training_scenario(
-            "student unlabeled",
-            model.decoder,
-            model,
-            memory,
-            config,
-            batch_size=BATCH_STUDENT_UNLABELED,
-            pc_mode="student_core",
-            epoch=31,
+        "student_labeled_raw_b32": run_raw_student_labeled_scenario(model, config),
+        "student_unlabeled_raw_b32": run_raw_student_unlabeled_scenario(
+            model, memory, config
         ),
     }
     del model, memory

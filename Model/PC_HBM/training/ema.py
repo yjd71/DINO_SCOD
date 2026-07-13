@@ -17,14 +17,39 @@ def make_ema_copy(module: nn.Module) -> nn.Module:
 
 
 @torch.no_grad()
-def update_ema_module(student: nn.Module, teacher: nn.Module, momentum: float = 0.995) -> None:
-    """EMA parameters by exact name and copy every registered buffer."""
+def update_ema_module(
+    student: nn.Module,
+    teacher: nn.Module,
+    momentum: float = 0.995,
+    *,
+    shared_only: bool = False,
+    exclude_prefixes: tuple[str, ...] = (),
+) -> None:
+    """EMA parameters by name and copy registered buffers.
+
+    ``shared_only`` supports a raw Student paired with a PC-HBM Teacher.  In
+    that mode names beginning with ``exclude_prefixes`` are deliberately left
+    untouched on the Teacher, while every remaining Student/Teacher key must
+    still match exactly.  The default retains the original strict contract.
+    """
 
     momentum = float(momentum)
     if not 0.0 <= momentum <= 1.0:
         raise ValueError(f"EMA momentum must be in [0,1], got {momentum}")
-    student_parameters = dict(student.named_parameters())
-    teacher_parameters = dict(teacher.named_parameters())
+    exclude_prefixes = tuple(str(prefix) for prefix in exclude_prefixes)
+
+    def selected(named_values):
+        values = dict(named_values)
+        if not shared_only:
+            return values
+        return {
+            name: value
+            for name, value in values.items()
+            if not name.startswith(exclude_prefixes)
+        }
+
+    student_parameters = selected(student.named_parameters())
+    teacher_parameters = selected(teacher.named_parameters())
     if student_parameters.keys() != teacher_parameters.keys():
         mismatch = sorted(student_parameters.keys() ^ teacher_parameters.keys())
         raise RuntimeError(f"EMA parameter key mismatch: {mismatch}")
@@ -37,8 +62,8 @@ def update_ema_module(student: nn.Module, teacher: nn.Module, momentum: float = 
             alpha=1.0 - momentum,
         )
 
-    student_buffers = dict(student.named_buffers())
-    teacher_buffers = dict(teacher.named_buffers())
+    student_buffers = selected(student.named_buffers())
+    teacher_buffers = selected(teacher.named_buffers())
     if student_buffers.keys() != teacher_buffers.keys():
         mismatch = sorted(student_buffers.keys() ^ teacher_buffers.keys())
         raise RuntimeError(f"EMA buffer key mismatch: {mismatch}")

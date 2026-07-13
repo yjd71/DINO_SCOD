@@ -32,24 +32,80 @@ from Model.PC_HBM.training import (
     pc_mode_for_epoch,
     update_ema_module,
 )
+from Model.PC_HBM.training.losses import pc_hbm_pc_only_labeled_loss
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from utils.checkpoint_pc_hbm import (
+    build_artifact_metadata,
+    compute_labeled_split_fingerprint,
+    compute_labeled_split_fingerprint_from_indices_pt,
     load_training_resume,
+    read_artifact_metadata,
     save_decoder_checkpoint,
     save_memory_checkpoint,
     save_training_resume,
+    state_dict_fingerprint,
 )
 from utils.dataloader import PCLabeledTrainDataset
 from utils.distributed import is_main_process, reduce_mean, synchronize, unwrap_model
-from utils.pc_memory_runner import build_labeled_memory_loader, rebuild_memory
+from utils.pc_memory_runner import (
+    build_labeled_memory_loader,
+    build_memory_compat_meta,
+    rebuild_memory,
+)
 
 
 def current_time() -> str:
     return datetime.now().strftime("%m-%d %H:%M:%S")
 
 
+def configure_teacher_only_trainability(model: nn.Module) -> tuple[str, ...]:
+    """Freeze the baseline model and leave only ``decoder.pc_hbm`` trainable.
+
+    This helper is intentionally called before DDP wrapping by the dedicated
+    entry point.  The trainer calls it again as an idempotent safety check for
+    direct/single-process construction.
+    """
+
+    base_model = unwrap_model(model)
+    decoder = getattr(base_model, "decoder", None)
+    pc_hbm = getattr(decoder, "pc_hbm", None)
+    if not isinstance(pc_hbm, nn.Module):
+        raise RuntimeError("teacher_only training requires decoder.pc_hbm to be an nn.Module")
+    base_model.requires_grad_(False)
+    pc_hbm.requires_grad_(True)
+    trainable = tuple(
+        name for name, parameter in decoder.named_parameters() if parameter.requires_grad
+    )
+    if not trainable or any(not name.startswith("pc_hbm.") for name in trainable):
+        raise RuntimeError(
+            "teacher_only trainability must contain only non-empty pc_hbm.* parameters"
+        )
+    return trainable
+
+
+def configure_two_stage_trainability(model: nn.Module) -> tuple[str, ...]:
+    """Freeze DINO/the outer model and train the complete Decoder in both stages."""
+
+    base_model = unwrap_model(model)
+    decoder = getattr(base_model, "decoder", None)
+    if not isinstance(decoder, nn.Module):
+        raise RuntimeError("two_stage training requires model.decoder to be an nn.Module")
+    if getattr(decoder, "pc_hbm", None) is None:
+        raise RuntimeError("two_stage training requires decoder.pc_hbm")
+    base_model.requires_grad_(False)
+    decoder.requires_grad_(True)
+    dino = getattr(base_model, "dino", None)
+    if isinstance(dino, nn.Module):
+        dino.requires_grad_(False)
+        dino.eval()
+    trainable = tuple(name for name, _ in decoder.named_parameters())
+    if not trainable:
+        raise RuntimeError("two_stage training requires a non-empty Decoder")
+    return trainable
+
+
 class BasePCHBMTrainer:
-    """Train only the Decoder with the locked 1-based PC-HBM schedule."""
+    """Train the Decoder with the selected locked 1-based PC-HBM schedule."""
 
     def __init__(
         self,
@@ -65,10 +121,28 @@ class BasePCHBMTrainer:
         scaler=None,
         memory_decoder: nn.Module | None = None,
         memory_rebuild_fn: Callable[..., Any] = rebuild_memory,
+        training_design: str | None = None,
     ) -> None:
         self.model = model
         self.cfg = cfg
         self.pc_cfg = pc_cfg or getattr(cfg, "pc_hbm", None) or DinoPCHBMConfig()
+        self.training_design = str(
+            training_design or getattr(cfg, "training_design", "joint")
+        )
+        if self.training_design not in {"two_stage", "teacher_only", "joint"}:
+            raise ValueError(f"Unsupported Base PC-HBM training design: {self.training_design!r}")
+        if self.training_design in {"two_stage", "teacher_only"}:
+            configure = getattr(self.pc_cfg, "configure_training_design", None)
+            if not callable(configure):
+                raise RuntimeError(
+                    f"{self.training_design} training requires "
+                    "pc_cfg.configure_training_design()"
+                )
+            configure(self.training_design)
+        if self.training_design == "teacher_only":
+            configure_teacher_only_trainability(model)
+        elif self.training_design == "two_stage":
+            configure_two_stage_trainability(model)
         self.device = torch.device(getattr(cfg, "device", "cpu"))
         self.distributed = bool(getattr(cfg, "distributed", False))
         self.model_without_ddp = unwrap_model(model)
@@ -77,6 +151,10 @@ class BasePCHBMTrainer:
         self.decoder = self.model_without_ddp.decoder
         if getattr(self.decoder, "pc_hbm", None) is None:
             raise RuntimeError("Base PC-HBM trainer requires BaseModel(pc_cfg=DinoPCHBMConfig(...))")
+        dino = getattr(self.model_without_ddp, "dino", None)
+        if isinstance(dino, nn.Module):
+            dino.requires_grad_(False)
+            dino.eval()
 
         self.optimizer = optimizer or Adam(
             (parameter for parameter in self.decoder.parameters() if parameter.requires_grad),
@@ -107,10 +185,50 @@ class BasePCHBMTrainer:
         if len(self.labeled_train_dl) == 0:
             raise ValueError("PC-HBM labeled training loader is empty")
 
+        dataset = self.labeled_train_set or getattr(self.labeled_train_dl, "dataset", None)
+        sample_keys = getattr(dataset, "sample_keys", None)
+        if sample_keys:
+            cfg.labeled_split_fingerprint = compute_labeled_split_fingerprint(sample_keys)
+        elif self.training_design in {"teacher_only", "two_stage"} and getattr(
+            cfg, "train_labeled_indices_pt", None
+        ):
+            cfg.labeled_split_fingerprint = compute_labeled_split_fingerprint_from_indices_pt(
+                cfg.train_labeled_indices_pt
+            )
+        elif not getattr(cfg, "labeled_split_fingerprint", None):
+            fallback_dataset = getattr(self.labeled_train_dl, "dataset", None)
+            fallback_size = len(fallback_dataset) if fallback_dataset is not None else len(
+                self.labeled_train_dl
+            )
+            cfg.labeled_split_fingerprint = compute_labeled_split_fingerprint(
+                [f"@loader/{index}" for index in range(fallback_size)]
+            )
+        if not getattr(cfg, "baseline_fingerprint", None):
+            cfg.baseline_fingerprint = state_dict_fingerprint(
+                {
+                    name: value
+                    for name, value in self.decoder.state_dict().items()
+                    if not name.startswith("pc_hbm.")
+                }
+            )
+
         self.warning_tracker = DiagnosticWarningTracker(self.pc_cfg)
         self._diagnostic_mode: str | None = None
         self.current_epoch = 1
         self.last_epoch_metrics: dict[str, float] = {}
+        self.checkpoint_metadata = dict(
+            getattr(cfg, "pc_checkpoint_metadata", {}) or {}
+        )
+        for metadata_name in ("baseline_fingerprint", "labeled_split_fingerprint"):
+            metadata_value = getattr(cfg, metadata_name, None)
+            if metadata_value is not None:
+                self.checkpoint_metadata.setdefault(metadata_name, str(metadata_value))
+        self.checkpoint_metadata.update(
+            {
+                "training_design": self.training_design,
+                "pc_frozen": False,
+            }
+        )
         self.save_dir = Path(cfg.save_dir)
         if is_main_process():
             self.save_dir.mkdir(parents=True, exist_ok=True)
@@ -163,7 +281,27 @@ class BasePCHBMTrainer:
         )
 
     def _validate_decoder_only_optimizer(self) -> None:
-        expected = {id(parameter) for parameter in self.decoder.parameters() if parameter.requires_grad}
+        expected_by_name = {
+            name: parameter
+            for name, parameter in self.decoder.named_parameters()
+            if parameter.requires_grad
+        }
+        if self.training_design == "teacher_only" and (
+            not expected_by_name
+            or any(not name.startswith("pc_hbm.") for name in expected_by_name)
+        ):
+            raise RuntimeError(
+                "teacher_only Base optimizer requires only non-empty pc_hbm.* parameters"
+            )
+        if self.training_design == "two_stage":
+            all_decoder_parameters = dict(self.decoder.named_parameters())
+            if expected_by_name.keys() != all_decoder_parameters.keys():
+                frozen = sorted(all_decoder_parameters.keys() - expected_by_name.keys())
+                raise RuntimeError(
+                    "two_stage Base optimizer requires every Decoder parameter to be "
+                    f"trainable; frozen={frozen}"
+                )
+        expected = {id(parameter) for parameter in expected_by_name.values()}
         actual = {
             id(parameter)
             for group in self.optimizer.param_groups
@@ -226,7 +364,7 @@ class BasePCHBMTrainer:
         if mode != "off":
             self._assert_memory_ready(epoch)
 
-        self.model.train()
+        self._set_model_train_mode()
         self.memory_decoder.eval()
         running: dict[str, float] = defaultdict(float)
         batch_count = 0
@@ -254,7 +392,12 @@ class BasePCHBMTrainer:
                 if not isinstance(result, (tuple, list)) or len(result) != 2:
                     raise RuntimeError("PC-HBM model must return (outputs, aux) with return_aux=True")
                 outputs, aux = result
-                loss, loss_metrics = pc_hbm_labeled_loss(
+                loss_function = (
+                    pc_hbm_pc_only_labeled_loss
+                    if self.training_design == "teacher_only"
+                    else pc_hbm_labeled_loss
+                )
+                loss, loss_metrics = loss_function(
                     outputs,
                     aux,
                     gt,
@@ -271,15 +414,16 @@ class BasePCHBMTrainer:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(self.optimizer)
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                self.decoder.parameters(), float(self.pc_cfg.grad_clip_norm)
+                (
+                    parameter
+                    for parameter in self.decoder.parameters()
+                    if parameter.requires_grad
+                ),
+                float(self.pc_cfg.grad_clip_norm),
             )
             self.scaler.step(self.optimizer)
             self.scaler.update()
-            update_ema_module(
-                self.decoder,
-                self.memory_decoder,
-                momentum=float(self.pc_cfg.ema_momentum),
-            )
+            self._update_memory_decoder()
 
             diagnostics = collect_pc_diagnostics(aux, gt)
             batch_metrics = {
@@ -339,6 +483,8 @@ class BasePCHBMTrainer:
             if is_main_process():
                 print(f"{current_time()} >>> Epoch {epoch}/{self.cfg.epochs}")
             self.train_epoch(epoch)
+        if self.training_design in {"teacher_only", "two_stage"}:
+            self._finalize_teacher_enhancer()
         if is_main_process():
             print("<<< Base PC-HBM training finished")
 
@@ -353,6 +499,7 @@ class BasePCHBMTrainer:
             restore_rng=restore_rng,
         )
         self._validate_resume_config(checkpoint.get("pc_cfg"))
+        self._validate_resume_design(checkpoint)
         completed_epoch = int(checkpoint.get("epoch", 0))
         if completed_epoch < 0 or completed_epoch > int(self.cfg.epochs):
             raise RuntimeError(f"Invalid resume epoch: {completed_epoch}")
@@ -409,6 +556,7 @@ class BasePCHBMTrainer:
             scaler=self.scaler,
             ema_model=self.memory_decoder,
             pc_cfg=self.pc_cfg,
+            artifact_meta=self._artifact_metadata("resume"),
             extra={
                 "epoch_metrics": dict(epoch_metrics),
                 "diagnostic_history": diagnostic_history,
@@ -421,12 +569,119 @@ class BasePCHBMTrainer:
             self.decoder,
             self.pc_cfg,
             epoch,
+            artifact_meta=self._artifact_metadata("teacher_enhancer"),
         )
         if hasattr(self.memory, "is_ready") and bool(self.memory.is_ready()):
             save_memory_checkpoint(
                 self.save_dir / f"base_pc_hbm_memory_epoch_{epoch}.pth",
                 self.memory,
+                artifact_meta=self._artifact_metadata("teacher_memory"),
             )
+
+    def _set_model_train_mode(self) -> None:
+        self.model.train()
+        dino = getattr(self.model_without_ddp, "dino", None)
+        if isinstance(dino, nn.Module):
+            dino.eval()
+        if self.training_design == "teacher_only":
+            # Frozen baseline buffers and stochastic layers must remain bitwise stable.
+            self.decoder.eval()
+            self.decoder.pc_hbm.train()
+
+    @torch.no_grad()
+    def _update_memory_decoder(self) -> None:
+        update_ema_module(
+            self.decoder,
+            self.memory_decoder,
+            momentum=float(self.pc_cfg.ema_momentum),
+        )
+        if self.training_design != "teacher_only":
+            return
+        # The producer tracks only the learned enhancer by EMA.  Frozen legacy
+        # weights are copied exactly so repeated EMA arithmetic cannot introduce
+        # rounding drift relative to the baseline checkpoint.
+        source = dict(self.decoder.named_parameters())
+        target = dict(self.memory_decoder.named_parameters())
+        for name, source_value in source.items():
+            if not name.startswith("pc_hbm."):
+                target[name].copy_(source_value)
+
+    def _finalize_teacher_enhancer(self) -> None:
+        """Rebuild final memory from the main Decoder and export matched artifacts."""
+
+        final_epoch = max(0, self.current_epoch - 1)
+        compat_meta = build_memory_compat_meta(
+            self.pc_cfg,
+            self.decoder,
+            producer_source="decoder",
+        )
+        self.memory_rebuild_fn(
+            model=self.model,
+            memory_decoder=self.decoder,
+            memory_loader=self.memory_loader,
+            memory=self.memory,
+            device=self.device,
+            config=self.pc_cfg,
+            compat_meta=compat_meta,
+            use_amp=self.amp_enabled,
+        )
+        self._assert_memory_ready(final_epoch)
+        synchronize()
+        if not is_main_process():
+            return
+        save_decoder_checkpoint(
+            self.save_dir / "teacher_enhancer.pth",
+            self.decoder,
+            self.pc_cfg,
+            final_epoch,
+            artifact_meta=self._artifact_metadata("teacher_enhancer"),
+        )
+        save_memory_checkpoint(
+            self.save_dir / "teacher_enhancer_memory.pth",
+            self.memory,
+            compat_meta=compat_meta,
+            artifact_meta=self._artifact_metadata("teacher_memory"),
+        )
+
+    def _artifact_metadata(self, artifact_role: str) -> dict[str, Any]:
+        return build_artifact_metadata(
+            training_design=self.training_design,
+            artifact_role=str(artifact_role),
+            labeled_split_fingerprint=str(
+                self.checkpoint_metadata["labeled_split_fingerprint"]
+            ),
+            baseline_fingerprint=str(self.checkpoint_metadata["baseline_fingerprint"]),
+            pc_frozen=artifact_role in {"teacher_enhancer", "teacher_memory"},
+        )
+
+    def _validate_resume_design(self, checkpoint: Mapping[str, Any]) -> None:
+        current_design = str(getattr(self, "training_design", "joint"))
+        metadata = read_artifact_metadata(checkpoint)
+        if metadata is None:
+            if current_design != "joint":
+                raise RuntimeError(
+                    "Legacy resume checkpoint has no training_design; it is allowed only "
+                    "with --training-design joint"
+                )
+            return
+        saved_design = metadata["training_design"]
+        if str(saved_design) != current_design:
+            raise RuntimeError(
+                "Cannot resume across PC-HBM training designs: "
+                f"checkpoint={saved_design!r}, requested={current_design!r}"
+            )
+        if metadata["artifact_role"] != "resume":
+            raise RuntimeError(
+                f"Base resume requires artifact_role='resume', got {metadata['artifact_role']!r}"
+            )
+        if bool(metadata["pc_frozen"]):
+            raise RuntimeError("Base resume artifact cannot mark PC-HBM as frozen")
+        for key in ("labeled_split_fingerprint", "baseline_fingerprint"):
+            expected = str(self.checkpoint_metadata[key])
+            if str(metadata[key]) != expected:
+                raise RuntimeError(
+                    f"Resume {key} mismatch: checkpoint={metadata[key]!r}, expected={expected!r}"
+                )
 
     def _validate_resume_config(self, saved_config: Any) -> None:
         if saved_config is None:
@@ -492,4 +747,10 @@ class BasePCHBMTrainer:
 Trainer = BasePCHBMTrainer
 
 
-__all__ = ["BasePCHBMTrainer", "Trainer", "current_time"]
+__all__ = [
+    "BasePCHBMTrainer",
+    "Trainer",
+    "configure_teacher_only_trainability",
+    "configure_two_stage_trainability",
+    "current_time",
+]

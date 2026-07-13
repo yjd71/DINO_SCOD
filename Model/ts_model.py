@@ -2,11 +2,32 @@ import torch
 import torch.nn as nn
 import warnings
 from Model.decoder import Decoder
+from Model.PC_HBM.training.ema import update_ema_module
 from utils.checkpoint_pc_hbm import load_decoder_compatible
 
 class TSModel(nn.Module):
-    def __init__(self, teacher_pth=None, pc_cfg=None, allow_legacy_pc_init=False):
+    VALID_TRAINING_DESIGNS = {'teacher_only', 'joint'}
+
+    def __init__(
+        self,
+        teacher_pth=None,
+        student_pth=None,
+        pc_cfg=None,
+        allow_legacy_pc_init=False,
+        training_design='teacher_only',
+    ):
         super(TSModel, self).__init__()
+
+        if training_design not in self.VALID_TRAINING_DESIGNS:
+            raise ValueError(
+                f'Unsupported training_design={training_design!r}; expected one of '
+                f'{sorted(self.VALID_TRAINING_DESIGNS)}.'
+            )
+        if training_design == 'teacher_only' and allow_legacy_pc_init:
+            raise ValueError(
+                'teacher_only requires a complete Teacher PC-HBM checkpoint; '
+                'allow_legacy_pc_init is only valid for joint migration experiments.'
+            )
         
         # initialize the DINOv2 model: DINOv2-ViT-B/14 (default)
         self.dino = torch.hub.load('./dinov2', 'dinov2_vitb14', source='local', pretrained=False)
@@ -16,11 +37,19 @@ class TSModel(nn.Module):
         
         self.pc_cfg = pc_cfg
         self.allow_legacy_pc_init = allow_legacy_pc_init
+        self.training_design = training_design
         self.teacher = Decoder(pc_cfg=pc_cfg)  # Teacher Network Decoder
-        self.student = Decoder(pc_cfg=pc_cfg)  # Student Network Decoder
+        self.student = Decoder(
+            pc_cfg=None if training_design == 'teacher_only' else pc_cfg
+        )  # Student Network Decoder
 
         self.load_teacher(teacher_pth)
-        self.load_student(teacher_pth)
+        if student_pth is not None:
+            self.load_student(student_pth)
+        elif training_design == 'teacher_only':
+            self._initialize_raw_student_from_teacher()
+        else:
+            self.load_student(teacher_pth)
 
     def train(self, mode=True):
         super().train(mode)
@@ -59,9 +88,20 @@ class TSModel(nn.Module):
             raise RuntimeError(
                 f'Teacher PC-HBM path is inactive: {aux.get("fallback_reason")}'
             )
+        if self.training_design == 'teacher_only':
+            distill_features = aux.get('distill_features')
+            if not isinstance(distill_features, dict) or not all(
+                torch.is_tensor(distill_features.get(key))
+                for key in ('p3_corr', 'p2_refined')
+            ):
+                raise RuntimeError(
+                    'Teacher PC-HBM path did not return P3/P2 distillation features.'
+                )
         return aux
 
     def student_labeled(self, features, memory, epoch, query_image_ids=None):
+        if self.training_design == 'teacher_only':
+            return self.student(features, pc_mode='off', return_aux=True)
         return self.student(
             features,
             memory=memory,
@@ -72,6 +112,8 @@ class TSModel(nn.Module):
         )
 
     def student_unlabeled(self, features, memory, epoch):
+        if self.training_design == 'teacher_only':
+            return self.student(features, pc_mode='off', return_aux=True)
         return self.student(
             features,
             memory=memory,
@@ -116,7 +158,7 @@ class TSModel(nn.Module):
     
     def inference(self, x, memory=None, epoch=None):
         x_features = self.extract_features(x)
-        if self.student.pc_hbm is None:
+        if self.training_design == 'teacher_only' or self.student.pc_hbm is None:
             return self.student(x_features, pc_mode='off')[3]
         if memory is None:
             warnings.warn(
@@ -158,6 +200,15 @@ class TSModel(nn.Module):
         self._load_decoder(self.student, path, role='student')
         print(f'Successfully load student parameters from "{path}".')
 
+    def _initialize_raw_student_from_teacher(self):
+        raw_state = {
+            name: value
+            for name, value in self.teacher.state_dict().items()
+            if not name.startswith('pc_hbm.')
+        }
+        self.student.load_state_dict(raw_state, strict=True)
+        print('Initialized raw Student parameters from the Teacher legacy decoder.')
+
     def _load_decoder(self, decoder, path, role):
         try:
             return load_decoder_compatible(
@@ -183,21 +234,13 @@ class TSModel(nn.Module):
 
     @torch.no_grad()
     def update_teacher(self, momentum=0.995):
-        student_params = dict(self.student.named_parameters())
-        teacher_params = dict(self.teacher.named_parameters())
-        if student_params.keys() != teacher_params.keys():
-            differing = set(student_params).symmetric_difference(teacher_params)
-            raise RuntimeError(f'Teacher/student EMA key mismatch: {sorted(differing)}')
-        for name, student_value in student_params.items():
-            teacher_params[name].mul_(momentum).add_(student_value, alpha=1.0 - momentum)
-
-        student_buffers = dict(self.student.named_buffers())
-        teacher_buffers = dict(self.teacher.named_buffers())
-        if student_buffers.keys() != teacher_buffers.keys():
-            differing = set(student_buffers).symmetric_difference(teacher_buffers)
-            raise RuntimeError(f'Teacher/student buffer mismatch: {sorted(differing)}')
-        for name, student_value in student_buffers.items():
-            teacher_buffers[name].copy_(student_value)
+        update_ema_module(
+            self.student,
+            self.teacher,
+            momentum=momentum,
+            shared_only=self.training_design == 'teacher_only',
+            exclude_prefixes=('pc_hbm.',),
+        )
 
     def EMA(self, alpha=0.995):
         self.update_teacher(momentum=alpha)

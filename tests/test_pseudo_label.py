@@ -6,6 +6,7 @@ import torch
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from Model.PC_HBM.training.pseudo_label import (
     build_pc_confidence,
+    confidence_weighted_feature_cosine_loss,
     pc_unlabeled_loss,
     prepare_pseudo_targets,
     weighted_structure_loss,
@@ -31,7 +32,7 @@ def test_confidence_is_exact_five_factor_product_without_double_sigmoid():
     torch.testing.assert_close(confidence, torch.full_like(confidence, expected))
 
 
-def test_hard_targets_keep_reliable_foreground_and_background():
+def test_soft_targets_clone_corrected_features_without_hard_contract():
     cfg = DinoPCHBMConfig()
     p = torch.tensor([[[[0.1, 0.4, 0.8]]]])
     pi = torch.tensor([0.97, 0.01, 0.01, 0.01]).view(1, 4, 1, 1).expand(1, 4, 1, 3)
@@ -40,11 +41,40 @@ def test_hard_targets_keep_reliable_foreground_and_background():
         "z_main": torch.logit(p.clamp(1e-4, 1 - 1e-4)),
         "pc_hbm": {"C23_map": torch.zeros_like(p), "route_entropy_norm": torch.zeros(1)},
         "mixture": {"pi": pi},
+        "distill_features": {
+            "p3_corr": torch.randn(1, 4, 2, 2),
+            "p2_refined": torch.randn(1, 4, 2, 2),
+        },
     }
     targets = prepare_pseudo_targets(aux, cfg)
-    assert targets["hard_valid"].tolist() == [[[[True, False, True]]]]
-    assert targets["hard_target"].tolist() == [[[[0.0, 0.0, 1.0]]]]
-    assert targets["hard_weight"][0, 0, 0, 0] > 0
+    assert set(targets) == {"p_soft", "confidence", "distill_features"}
+    assert not any(key.startswith("hard") for key in targets)
+    for name in ("p3_corr", "p2_refined"):
+        cloned = targets["distill_features"][name]
+        original = aux["distill_features"][name]
+        torch.testing.assert_close(cloned, original)
+        assert cloned.data_ptr() != original.data_ptr()
+
+
+def test_feature_distillation_is_confidence_weighted_and_student_only():
+    student = torch.randn(2, 8, 4, 4, requires_grad=True)
+    teacher = torch.randn(2, 8, 4, 4, requires_grad=True)
+    confidence = torch.ones(2, 1, 8, 8)
+    loss = confidence_weighted_feature_cosine_loss(student, teacher, confidence)
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert student.grad is not None and student.grad.abs().sum() > 0
+    assert teacher.grad is None
+
+    zero_student = torch.randn(1, 4, 3, 3, requires_grad=True)
+    zero_loss = confidence_weighted_feature_cosine_loss(
+        zero_student,
+        torch.randn_like(zero_student),
+        torch.zeros(1, 1, 6, 6),
+    )
+    zero_loss.backward()
+    assert zero_loss == 0
+    assert zero_student.grad is not None and zero_student.grad.abs().sum() == 0
 
 
 def test_weighted_loss_learns_from_all_background_target():
@@ -68,7 +98,8 @@ def test_unlabeled_main_never_uses_z_final():
     loss.backward()
     assert tensors[3].grad is not None
     assert z_final.grad is None
-    assert log["hard_valid_ratio"] >= 0
+    assert not any("hard" in key.lower() for key in log)
+    assert log["pseudo_conf_positive_fraction"] == 1
 
 
 def test_unlabeled_loss_accepts_ddp_cloned_main_logit():

@@ -94,27 +94,30 @@ def prepare_pseudo_targets(
     config: Any,
     *,
     strict: bool = True,
-) -> dict[str, torch.Tensor]:
-    """Clone probability, confidence and foreground/background hard masks."""
+) -> dict[str, Any]:
+    """Clone soft probability, confidence and optional Teacher features."""
 
     p_final = teacher_aux.get("p_final")
     if not torch.is_tensor(p_final):
         raise KeyError("teacher_aux['p_final'] probability is required")
     p_soft = p_final.detach().clone()
     confidence = build_pc_confidence(teacher_aux, strict=strict).detach().clone()
-    fg_threshold = float(getattr(config, "pseudo_fg_threshold", 0.70))
-    bg_threshold = float(getattr(config, "pseudo_bg_threshold", 0.30))
-    if not 0.0 <= bg_threshold < 0.5 < fg_threshold <= 1.0:
-        raise ValueError("pseudo thresholds must satisfy 0 <= bg < 0.5 < fg <= 1")
-    hard_target = (p_soft >= 0.5).to(dtype=p_soft.dtype)
-    hard_valid = (p_soft >= fg_threshold) | (p_soft <= bg_threshold)
-    hard_weight = confidence * hard_valid.to(dtype=confidence.dtype)
+    distill_features = teacher_aux.get("distill_features")
+    cloned_features = None
+    if distill_features is not None:
+        if not isinstance(distill_features, Mapping):
+            raise TypeError("teacher_aux['distill_features'] must be a mapping")
+        cloned_features = {}
+        for name in ("p3_corr", "p2_refined"):
+            value = distill_features.get(name)
+            if not torch.is_tensor(value):
+                raise KeyError(f"teacher_aux['distill_features']['{name}'] is required")
+            cloned_features[name] = value.detach().clone()
+
     return {
         "p_soft": p_soft,
         "confidence": confidence,
-        "hard_target": hard_target,
-        "hard_valid": hard_valid,
-        "hard_weight": hard_weight,
+        "distill_features": cloned_features,
     }
 
 
@@ -157,6 +160,41 @@ def weighted_structure_loss(
     return (weighted_bce + weighted_iou).mean()
 
 
+def confidence_weighted_feature_cosine_loss(
+    student_feature: torch.Tensor,
+    teacher_feature: torch.Tensor,
+    confidence: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Confidence-weighted per-pixel normalized cosine distance."""
+
+    if not all(torch.is_tensor(value) for value in (student_feature, teacher_feature, confidence)):
+        raise TypeError("student_feature, teacher_feature and confidence must be tensors")
+    if student_feature.ndim != 4 or teacher_feature.ndim != 4:
+        raise ValueError("Student and Teacher features must be [B,C,H,W]")
+    if student_feature.shape != teacher_feature.shape:
+        raise ValueError(
+            "Student/Teacher distillation feature shapes must match, got "
+            f"{tuple(student_feature.shape)} and {tuple(teacher_feature.shape)}"
+        )
+    if confidence.ndim != 4 or confidence.shape[0] != student_feature.shape[0]:
+        raise ValueError("confidence must be [B,1,H,W] with the same batch size")
+    if confidence.shape[1] != 1:
+        raise ValueError("confidence must have exactly one channel")
+
+    target = teacher_feature.detach().to(device=student_feature.device)
+    student_norm = F.normalize(student_feature.float(), dim=1, eps=eps)
+    teacher_norm = F.normalize(target.float(), dim=1, eps=eps)
+    distance = 1.0 - (student_norm * teacher_norm).sum(dim=1, keepdim=True)
+    weight = F.interpolate(
+        confidence.detach().float().to(student_feature.device),
+        size=student_feature.shape[-2:],
+        mode="bilinear",
+        align_corners=False,
+    ).clamp_(0.0, 1.0)
+    return (distance * weight).sum() / weight.sum().clamp_min(eps)
+
+
 def pc_unlabeled_loss(
     outputs: Sequence[torch.Tensor],
     aux: Mapping[str, Any],
@@ -164,16 +202,18 @@ def pc_unlabeled_loss(
     confidence: torch.Tensor,
     epoch: int,
     config: Any,
+    *,
+    teacher_features: Mapping[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Supervise Student ``z_main`` plus low-weight original side logits."""
+    """Supervise raw Student logits and optional P3/P2 raw features."""
 
     if not isinstance(outputs, (tuple, list)) or len(outputs) != 5:
         raise ValueError("Student outputs must be (m4, m3, m2, z_main, global_logit)")
     z_student = aux.get("z_main")
     if not torch.is_tensor(z_student):
-        raise KeyError("student_core aux['z_main'] logits are required")
+        raise KeyError("Student aux['z_main'] logits are required")
     if aux.get("mixture_skipped") is False:
-        raise RuntimeError("Unlabeled Student supervision requires student_core/mixture_skipped")
+        raise RuntimeError("Unlabeled Student supervision requires off/student_core mode")
 
     m4, m3, m2, output_z_main, global_logit = outputs
     if not torch.is_tensor(output_z_main):
@@ -195,16 +235,8 @@ def pc_unlabeled_loss(
 
     p_soft = pseudo.detach().clone()
     confidence = confidence.detach().clone()
-    fg_threshold = float(getattr(config, "pseudo_fg_threshold", 0.70))
-    bg_threshold = float(getattr(config, "pseudo_bg_threshold", 0.30))
-    # hard_target = (p_soft >= 0.5).to(p_soft.dtype)
-    hard_valid = (p_soft >= fg_threshold) | (p_soft <= bg_threshold)
-    # hard_weight = confidence * hard_valid.to(confidence.dtype)
 
     l_soft = weighted_structure_loss(z_student, p_soft, confidence)
-    # l_hard = weighted_structure_loss(z_student, hard_target, hard_weight)
-    # ramp_epochs = max(1, int(getattr(config, "pseudo_hard_ramp_epochs", 3)))
-    # hard_ramp = min(1.0, max(0.0, float(epoch) / float(ramp_epochs)))
 
     l_side = (
         0.30 * weighted_structure_loss(m2, p_soft, confidence)
@@ -212,17 +244,45 @@ def pc_unlabeled_loss(
         + 0.10 * weighted_structure_loss(m4, p_soft, confidence)
         + 0.10 * weighted_structure_loss(global_logit, p_soft, confidence)
     )
-    # hard_weight_factor = float(getattr(config, "hard_loss_weight", 2.0))
-    # unscaled = l_soft + hard_weight_factor * hard_ramp * l_hard + l_side
-    unscaled = l_soft + l_side
+
+    zero = zero_like_loss(z_student)
+    l_feat_p3 = zero
+    l_feat_p2 = zero
+    if teacher_features is not None:
+        if not isinstance(teacher_features, Mapping):
+            raise TypeError("teacher_features must be a mapping")
+        student_features = aux.get("features")
+        if not isinstance(student_features, Mapping):
+            raise KeyError("Student aux['features'] is required for feature distillation")
+        p3_student = student_features.get("p3")
+        p2_student = student_features.get("p2")
+        p3_teacher = teacher_features.get("p3_corr")
+        p2_teacher = teacher_features.get("p2_refined")
+        if not all(torch.is_tensor(value) for value in (p3_student, p2_student, p3_teacher, p2_teacher)):
+            raise KeyError("P3/P2 Student and corrected Teacher features are required")
+        l_feat_p3 = confidence_weighted_feature_cosine_loss(
+            p3_student, p3_teacher, confidence
+        )
+        l_feat_p2 = confidence_weighted_feature_cosine_loss(
+            p2_student, p2_teacher, confidence
+        )
+
+    p3_weight = float(getattr(config, "feature_distill_p3_weight", 0.05))
+    p2_weight = float(getattr(config, "feature_distill_p2_weight", 0.10))
+    l_feature = p3_weight * l_feat_p3 + p2_weight * l_feat_p2
+    unscaled = l_soft + l_side + l_feature
     total = float(getattr(config, "lambda_u", 1.0)) * unscaled
+    positive_confidence = confidence > 0
     log = {
         "L_u_soft": l_soft.detach(),
-        # "L_u_hard": l_hard.detach(),
         "L_u_side": l_side.detach(),
-        # "hard_ramp": z_student.new_tensor(hard_ramp).detach(),
-        "hard_valid_ratio": hard_valid.to(z_student.dtype).mean().detach(),
+        "L_u_feat_p3": l_feat_p3.detach(),
+        "L_u_feat_p2": l_feat_p2.detach(),
+        "L_u_feature": l_feature.detach(),
         "pseudo_conf_mean": confidence.mean().detach(),
+        "pseudo_conf_max": confidence.max().detach(),
+        "pseudo_conf_positive_fraction": positive_confidence.to(z_student.dtype).mean().detach(),
+        "pseudo_conf_positive_count": positive_confidence.sum().detach(),
         "loss_unlabeled": total.detach(),
     }
     return total, log
@@ -235,6 +295,8 @@ def compute_pc_hbm_unlabeled_loss(
     config: Any,
     epoch: int,
     outputs: Sequence[torch.Tensor] | None = None,
+    *,
+    teacher_features: Mapping[str, torch.Tensor] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Reference-name wrapper; ``outputs`` is required for side supervision."""
 
@@ -244,7 +306,15 @@ def compute_pc_hbm_unlabeled_loss(
             raise KeyError("student_aux['z_main'] is required")
         zero = zero_like_loss(z_main).view(1, 1, 1, 1).expand_as(z_main)
         outputs = (zero, zero, zero, z_main, zero)
-    return pc_unlabeled_loss(outputs, student_aux, pseudo_prob, confidence, epoch, config)
+    return pc_unlabeled_loss(
+        outputs,
+        student_aux,
+        pseudo_prob,
+        confidence,
+        epoch,
+        config,
+        teacher_features=teacher_features,
+    )
 
 
 structure_aware_confidence = build_pc_confidence
@@ -261,6 +331,7 @@ def _nested_get(mapping, key, default=None):
 
 __all__ = [
     "build_pc_confidence",
+    "confidence_weighted_feature_cosine_loss",
     "compute_pc_hbm_unlabeled_loss",
     "pc_unlabeled_loss",
     "prepare_pseudo_targets",

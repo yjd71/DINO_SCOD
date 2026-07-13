@@ -226,6 +226,11 @@ class Decoder(nn.Module):
         seg_2_tokens = self._forward_t2(state, seg_3_tokens)
         seg_1_tokens = self._forward_t1(state, seg_2_tokens)
 
+        # Keep the baseline numerical path unchanged while exposing the raw
+        # 28x28 decoder features used by teacher-only feature distillation.
+        p3_map = tokens_to_map(seg_3_tokens, *state['token_hw'])
+        p2_map = tokens_to_map(seg_2_tokens, *state['token_hw'])
+
         seg_4, _ = self._predict_side(
             seg_4_tokens, state['global_mask'], self.seg_head_4,
             state['token_hw'], state['output_hw'],
@@ -264,7 +269,13 @@ class Decoder(nn.Module):
             'mixture': None,
             'mixture_skipped': True,
             'forward_mode': 'off',
-            'features': {'p1': seg_1_feature},
+            'features': {
+                'p3': p3_map,
+                'p2': p2_map,
+                'p2_pre': p2_map,
+                'p1': seg_1_feature,
+            },
+            'distill_features': None,
         }
         return outputs, aux
 
@@ -415,6 +426,12 @@ class Decoder(nn.Module):
                 p_final = torch.sigmoid(z_main)
 
         outputs = (m4, m3, m2, z_main, state['global_logit'])
+        distill_features = None
+        if pc_mode == 'teacher_pseudo':
+            distill_features = {
+                'p3_corr': pc_aux['p3_corr'],
+                'p2_refined': p2_refined_map,
+            }
         aux = {
             'm4': m4,
             'm3': m3,
@@ -432,6 +449,7 @@ class Decoder(nn.Module):
             'mixture': mix_aux,
             'mixture_skipped': not use_final_refinement,
             'forward_mode': pc_mode,
+            'distill_features': distill_features,
             'features': {
                 'x3': x3_map,
                 'p3': p3_map,

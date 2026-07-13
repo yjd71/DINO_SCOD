@@ -26,11 +26,17 @@ from Model.PC_HBM.training import (
     prepare_pseudo_targets,
     update_ema_module,
 )
+from Model.PC_HBM.training.losses import base_structure_loss
 from utils.checkpoint_pc_hbm import (
+    build_artifact_metadata,
+    compute_labeled_split_fingerprint,
     load_training_resume,
+    read_artifact_metadata,
     save_decoder_checkpoint,
     save_memory_checkpoint,
     save_training_resume,
+    state_dict_fingerprint,
+    validate_artifact_metadata,
 )
 from utils.dataloader import (
     PCLabeledTrainDataset,
@@ -43,13 +49,29 @@ from utils.distributed import (
     synchronize,
     unwrap_model,
 )
-from utils.pc_memory_runner import build_memory_compat_meta, rebuild_memory
+from utils.pc_memory_runner import build_memory_compat_meta, module_fingerprint, rebuild_memory
 
 
 def _current_local_timestamp() -> str:
     """Return an ISO-8601 local timestamp with an explicit UTC offset."""
 
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def validate_teacher_enhancer_checkpoint(
+    source, labeled_split_fingerprint: str
+) -> dict[str, Any]:
+    """Accept both Base warm-up variants without weakening Teacher identity."""
+
+    return validate_artifact_metadata(
+        source,
+        {
+            "training_design": ("teacher_only", "two_stage"),
+            "artifact_role": "teacher_enhancer",
+            "labeled_split_fingerprint": str(labeled_split_fingerprint),
+            "pc_frozen": True,
+        },
+    )
 
 
 class PCHBMPseudoTrainer:
@@ -68,10 +90,14 @@ class PCHBMPseudoTrainer:
         self.model = model
         self.cfg = cfg
         self.pc_cfg = pc_cfg
+        self.training_design = str(getattr(cfg, "pc_training_design", "teacher_only"))
+        if self.training_design not in {"teacher_only", "joint"}:
+            raise ValueError(f"Unsupported PC-HBM training design: {self.training_design}")
         self.distributed = bool(getattr(cfg, "distributed", False))
         self.device = torch.device(cfg.device)
         self.core_model = unwrap_model(model)
         self._validate_model_contract()
+        self._teacher_pc_fingerprint = module_fingerprint(self.core_model.teacher.pc_hbm)
 
         # The published TS protocol fixes both physical batches at 32.  DDP
         # partitions data across ranks but does not change the per-rank batch.
@@ -166,6 +192,42 @@ class PCHBMPseudoTrainer:
             config=pc_cfg,
         )
 
+        split_fingerprint = compute_labeled_split_fingerprint(
+            self.labeled_train_set.sample_keys
+        )
+        self.cfg.labeled_split_fingerprint = split_fingerprint
+        teacher_checkpoint = getattr(self.cfg, "teacher_pc_checkpoint", None)
+        if self.training_design == "teacher_only" and teacher_checkpoint:
+            # The TS protocol stays teacher-only.  Its frozen Teacher enhancer
+            # may come from either supported Base warm-up protocol.
+            teacher_metadata = validate_teacher_enhancer_checkpoint(
+                teacher_checkpoint, split_fingerprint
+            )
+        else:
+            teacher_metadata = read_artifact_metadata(teacher_checkpoint) if teacher_checkpoint else None
+        if teacher_metadata is not None:
+            self.cfg.baseline_fingerprint = teacher_metadata["baseline_fingerprint"]
+        else:
+            self.cfg.baseline_fingerprint = state_dict_fingerprint(
+                {
+                    name: value
+                    for name, value in self.core_model.teacher.state_dict().items()
+                    if not name.startswith("pc_hbm.")
+                }
+            )
+        student_checkpoint = getattr(self.cfg, "student_checkpoint", None)
+        if self.training_design == "teacher_only" and student_checkpoint:
+            validate_artifact_metadata(
+                student_checkpoint,
+                {
+                    "training_design": "teacher_only",
+                    "artifact_role": "student_raw",
+                    "labeled_split_fingerprint": split_fingerprint,
+                    "baseline_fingerprint": self.cfg.baseline_fingerprint,
+                    "pc_frozen": True,
+                },
+            )
+
         self.current_epoch = 1
         self.save_dir = Path(cfg.save_dir)
         if is_main_process():
@@ -180,6 +242,7 @@ class PCHBMPseudoTrainer:
                 scaler=self.scaler,
                 ema_model=self.core_model.teacher,
                 restore_rng=True,
+                expected_artifact_meta=self._artifact_metadata("resume"),
             )
             self._validate_resume_config(checkpoint.get("pc_cfg"))
             self.current_epoch = int(checkpoint["epoch"]) + 1
@@ -188,14 +251,21 @@ class PCHBMPseudoTrainer:
     def _validate_model_contract(self):
         if getattr(self.core_model, "pc_cfg", None) is None:
             raise ValueError("TSModel must be constructed with DinoPCHBMConfig")
-        if getattr(self.core_model.student, "pc_hbm", None) is None:
-            raise ValueError("Student Decoder has no PC-HBM engine")
         if getattr(self.core_model.teacher, "pc_hbm", None) is None:
             raise ValueError("Teacher Decoder has no PC-HBM engine")
         student_keys = tuple(dict(self.core_model.student.named_parameters()))
         teacher_keys = tuple(dict(self.core_model.teacher.named_parameters()))
-        if student_keys != teacher_keys:
-            raise RuntimeError("Teacher and Student parameter names/order do not match")
+        if self.training_design == "joint":
+            if getattr(self.core_model.student, "pc_hbm", None) is None:
+                raise ValueError("Joint Student Decoder has no PC-HBM engine")
+            if student_keys != teacher_keys:
+                raise RuntimeError("Teacher and Student parameter names/order do not match")
+        else:
+            if getattr(self.core_model.student, "pc_hbm", None) is not None:
+                raise ValueError("teacher_only Student must not instantiate PC-HBM")
+            teacher_shared = tuple(key for key in teacher_keys if not key.startswith("pc_hbm."))
+            if student_keys != teacher_shared:
+                raise RuntimeError("Raw Student keys do not match the Teacher legacy keys")
         self._freeze_teacher()
 
     def _validate_resume_config(self, saved_config):
@@ -280,6 +350,7 @@ class PCHBMPseudoTrainer:
 
         pc = aux.get("pc_hbm", {}) or {}
         mixture = aux.get("mixture", {}) or {}
+        distill_features = aux.get("distill_features", {}) or {}
 
         def clone_tensor(value, name):
             if not torch.is_tensor(value):
@@ -299,6 +370,14 @@ class PCHBMPseudoTrainer:
                 ),
             },
             "mixture": {"pi": clone_tensor(mixture.get("pi"), "mixture.pi")},
+            "distill_features": {
+                "p3_corr": clone_tensor(
+                    distill_features.get("p3_corr"), "distill_features.p3_corr"
+                ),
+                "p2_refined": clone_tensor(
+                    distill_features.get("p2_refined"), "distill_features.p2_refined"
+                ),
+            },
         }
 
     def train_epoch(self):
@@ -315,7 +394,15 @@ class PCHBMPseudoTrainer:
         # loader.  The resulting CPU-FP16 memory remains read-only this epoch.
         self._rebuild_memory(self.core_model.teacher, producer_source="ema_teacher")
         labeled_iter = self._cycle_loader(self.labeled_train_dl)
-        totals = {"loss": 0.0, "labeled": 0.0, "unlabeled": 0.0, "confidence": 0.0}
+        totals = {
+            "loss": 0.0,
+            "labeled": 0.0,
+            "unlabeled": 0.0,
+            "confidence": 0.0,
+            "confidence_max": 0.0,
+            "confidence_positive_fraction": 0.0,
+            "confidence_positive_count": 0.0,
+        }
         steps = 0
 
         progress = tqdm(
@@ -330,7 +417,7 @@ class PCHBMPseudoTrainer:
             u_imgs = u_imgs.to(self.device, non_blocking=bool(self.cfg.CUDA))
             self.optimizer.zero_grad(set_to_none=True)
 
-            # 1) Labeled Student full pass and its synchronized backward.
+            # 1) Labeled Student uses the untouched raw/off path in teacher-only mode.
             with self._autocast():
                 l_features = self.core_model.extract_features(l_imgs)
                 l_outputs, l_aux = self.model(
@@ -340,15 +427,19 @@ class PCHBMPseudoTrainer:
                     epoch=decoder_epoch,
                     query_image_ids=list(l_image_ids),
                 )
-                l_loss, l_log = pc_hbm_labeled_loss(
-                    l_outputs,
-                    l_aux,
-                    l_gt,
-                    decoder_epoch,
-                    self.pc_cfg,
-                    pc_mode="full",
-                    strict=True,
-                )
+                if self.training_design == "teacher_only":
+                    l_loss = base_structure_loss(l_outputs, l_gt)
+                    l_log = {"L_base": l_loss.detach()}
+                else:
+                    l_loss, l_log = pc_hbm_labeled_loss(
+                        l_outputs,
+                        l_aux,
+                        l_gt,
+                        decoder_epoch,
+                        self.pc_cfg,
+                        pc_mode="full",
+                        strict=True,
+                    )
             self.scaler.scale(l_loss).backward()
             l_loss_value = float(l_loss.detach())
             del l_features, l_outputs, l_aux, l_gt, l_imgs, l_image_ids, l_loss, l_log
@@ -389,6 +480,7 @@ class PCHBMPseudoTrainer:
                     pseudo["confidence"],
                     epoch,
                     self.pc_cfg,
+                    teacher_features=pseudo.get("distill_features"),
                 )
             self.scaler.scale(u_loss).backward()
 
@@ -406,6 +498,8 @@ class PCHBMPseudoTrainer:
                     self.core_model.student,
                     self.core_model.teacher,
                     momentum=float(getattr(self.pc_cfg, "ema_momentum", 0.995)),
+                    shared_only=self.training_design == "teacher_only",
+                    exclude_prefixes=("pc_hbm.",) if self.training_design == "teacher_only" else (),
                 )
 
             u_loss_value = float(u_loss.detach())
@@ -415,30 +509,59 @@ class PCHBMPseudoTrainer:
             totals["labeled"] += l_loss_value
             totals["unlabeled"] += u_loss_value
             totals["confidence"] += confidence_value
+            totals["confidence_max"] += float(u_log.get("pseudo_conf_max", 0.0))
+            totals["confidence_positive_fraction"] += float(
+                u_log.get("pseudo_conf_positive_fraction", 0.0)
+            )
+            totals["confidence_positive_count"] += float(
+                u_log.get("pseudo_conf_positive_count", 0.0)
+            )
             steps += 1
             progress.set_postfix(
                 loss=f"{total_value:.4f}",
-                conf=f"{confidence_value:.3f}",
+                conf=f"{confidence_value:.3e}",
             )
             del u_features, u_outputs, u_aux, pseudo, u_imgs, u_loss, u_log
 
         if steps == 0:
             raise RuntimeError("PC-HBM TS epoch completed without optimizer steps")
+        if module_fingerprint(self.core_model.teacher.pc_hbm) != self._teacher_pc_fingerprint:
+            raise RuntimeError("Frozen Teacher PC-HBM parameters or buffers changed during TS")
         means = {
             name: reduce_mean(value / steps, self.device)
             for name, value in totals.items()
         }
         return means
 
+    def _artifact_metadata(self, artifact_role: str) -> dict[str, Any]:
+        return build_artifact_metadata(
+            training_design=self.training_design,
+            artifact_role=str(artifact_role),
+            labeled_split_fingerprint=str(self.cfg.labeled_split_fingerprint),
+            baseline_fingerprint=str(self.cfg.baseline_fingerprint),
+            pc_frozen=self.training_design == "teacher_only",
+        )
+
     def _save_epoch(self, epoch: int, metrics: Mapping[str, float]):
         if not is_main_process():
             return
         save_decoder_checkpoint(
-            self.save_dir / f"ts_pc_hbm_student_epoch_{epoch}.pth",
+            self.save_dir
+            / (
+                f"student_raw_epoch_{epoch}.pth"
+                if self.training_design == "teacher_only"
+                else f"ts_pc_hbm_student_epoch_{epoch}.pth"
+            ),
             self.core_model.student,
             self.pc_cfg,
             epoch,
-            extra={"metrics": dict(metrics), "producer": "student"},
+            artifact_meta=self._artifact_metadata(
+                "student_raw" if self.training_design == "teacher_only" else "student_joint"
+            ),
+            extra={
+                "metrics": dict(metrics),
+                "producer": "student_raw" if self.training_design == "teacher_only" else "student",
+            },
         )
         save_training_resume(
             self.save_dir / "ts_pc_hbm_resume_latest.pth",
@@ -449,10 +572,26 @@ class PCHBMPseudoTrainer:
             scaler=self.scaler,
             ema_model=self.core_model.teacher,
             pc_cfg=self.pc_cfg,
-            extra={"metrics": dict(metrics)},
+            artifact_meta=self._artifact_metadata("resume"),
+            extra={
+                "metrics": dict(metrics),
+            },
         )
 
     def _export_final_memory(self):
+        if self.training_design == "teacher_only":
+            if is_main_process():
+                save_decoder_checkpoint(
+                    self.save_dir / "student_raw.pth",
+                    self.core_model.student,
+                    self.pc_cfg,
+                    int(self.cfg.epochs),
+                    artifact_meta=self._artifact_metadata("student_raw"),
+                    extra={
+                        "producer": "student_raw_final",
+                    },
+                )
+            return
         # Final inference artifacts must have a memory produced by the final
         # Student, not the preceding epoch's EMA Teacher snapshot.
         compat_meta = self._rebuild_memory(
@@ -465,12 +604,14 @@ class PCHBMPseudoTrainer:
                 self.core_model.student,
                 self.pc_cfg,
                 int(self.cfg.epochs),
+                artifact_meta=self._artifact_metadata("student_joint"),
                 extra={"producer": "student_final"},
             )
             save_memory_checkpoint(
                 self.save_dir / "ts_pc_hbm_memory_final.pth",
                 self.memory,
                 compat_meta=compat_meta,
+                artifact_meta=self._artifact_metadata("student_memory"),
             )
 
     def train(self):
@@ -493,7 +634,9 @@ class PCHBMPseudoTrainer:
                 lr = self.optimizer.param_groups[0]["lr"]
                 print(
                     f">>> TS PC-HBM epoch {epoch}/{self.cfg.epochs}: "
-                    f"loss={metrics['loss']:.6f}, confidence={metrics['confidence']:.4f}, "
+                    f"loss={metrics['loss']:.6f}, confidence={metrics['confidence']:.3e}, "
+                    f"confidence_max={metrics['confidence_max']:.3e}, "
+                    f"confidence_positive={metrics['confidence_positive_fraction']:.3%}, "
                     f"lr={lr:.3e}, end_time={_current_local_timestamp()}",
                     flush=True,
                 )

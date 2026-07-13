@@ -30,6 +30,16 @@ def _positive_int(value: str) -> int:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train the RSBL Base DINO PC-HBM model")
     parser.add_argument(
+        "--training-design",
+        choices=("two_stage", "teacher_only", "joint"),
+        default="two_stage",
+        help=(
+            "two_stage trains the legacy Decoder for epochs 1-5, then jointly "
+            "trains the legacy Decoder and PC-HBM from epoch 6; teacher_only "
+            "keeps the legacy Decoder frozen."
+        ),
+    )
+    parser.add_argument(
         "--output-dir",
         "--base-model-path",
         dest="output_dir",
@@ -40,12 +50,20 @@ def parse_args() -> argparse.Namespace:
     initialization.add_argument(
         "--decoder-checkpoint",
         default=None,
-        help="Optional raw/nested legacy or complete PC-HBM Decoder checkpoint.",
+        help="Optional raw/nested Decoder initialization for joint compatibility mode.",
     )
     initialization.add_argument(
         "--resume",
         default=None,
         help="Resume checkpoint produced by this entry point.",
+    )
+    parser.add_argument(
+        "--baseline-checkpoint",
+        default=None,
+        help=(
+            "Legacy/baseline Decoder initialization: required for teacher_only and "
+            "optional as a two_stage warm start."
+        ),
     )
     parser.add_argument("--seed", type=int, default=2025)
     parser.add_argument("--deterministic", action="store_true")
@@ -73,19 +91,51 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def validate_training_args(args: argparse.Namespace) -> None:
+    """Reject incompatible initialization contracts before model construction."""
+
+    if args.training_design in {"teacher_only", "two_stage"} and not args.labeled_indices_pt:
+        raise ValueError(
+            f"--labeled-indices-pt is required for --training-design {args.training_design}"
+        )
+    if args.training_design == "teacher_only":
+        if not args.baseline_checkpoint:
+            raise ValueError(
+                "--baseline-checkpoint is required for --training-design teacher_only"
+            )
+        if args.decoder_checkpoint:
+            raise ValueError("--decoder-checkpoint is not supported by teacher_only")
+    elif args.training_design == "two_stage":
+        if args.decoder_checkpoint:
+            raise ValueError("--decoder-checkpoint is reserved for --training-design joint")
+    elif args.baseline_checkpoint:
+        raise ValueError(
+            "--baseline-checkpoint is only valid for --training-design teacher_only or two_stage"
+        )
+
+
 if __name__ == "__main__":
     args = parse_args()
+    validate_training_args(args)
     from configs.base_model_config import Config
     from configs.pc_hbm_dino_config import DinoPCHBMConfig
     from Model.base_model import BaseModel
-    from utils.checkpoint_pc_hbm import load_decoder_compatible
+    from utils.checkpoint_pc_hbm import (
+        extract_non_pc_decoder_state,
+        load_decoder_compatible,
+        state_dict_fingerprint,
+    )
     from utils.distributed import (
         cleanup_distributed,
         configure_distributed,
         init_distributed,
         wrap_distributed,
     )
-    from utils.trainer_base_model_pc_hbm import BasePCHBMTrainer
+    from utils.trainer_base_model_pc_hbm import (
+        BasePCHBMTrainer,
+        configure_teacher_only_trainability,
+        configure_two_stage_trainability,
+    )
 
     context = init_distributed()
     try:
@@ -93,6 +143,7 @@ if __name__ == "__main__":
         cfg = Config()
         configure_distributed(cfg, context, seed=args.seed)
         cfg.save_dir = args.output_dir
+        cfg.training_design = args.training_design
         cfg.train_labeled_indices_pt = args.labeled_indices_pt
         cfg.epochs = args.epochs
         if args.batch_size is not None:
@@ -108,8 +159,30 @@ if __name__ == "__main__":
             use_amp=not args.no_amp,
             exclude_self_match=not args.allow_self_match,
         )
+        pc_cfg.configure_training_design(args.training_design)
         model = BaseModel(pc_cfg=pc_cfg).to(cfg.device)
-        if args.decoder_checkpoint:
+        if args.training_design in {"teacher_only", "two_stage"} and args.baseline_checkpoint:
+            cfg.baseline_fingerprint = state_dict_fingerprint(
+                extract_non_pc_decoder_state(args.baseline_checkpoint)
+            )
+            load_result = load_decoder_compatible(
+                model.decoder,
+                args.baseline_checkpoint,
+                require_pc_complete=False,
+            )
+            expected_missing_pc = {
+                name for name in model.decoder.state_dict() if name.startswith("pc_hbm.")
+            }
+            if set(load_result.missing_keys) != expected_missing_pc:
+                raise RuntimeError(
+                    "--baseline-checkpoint must be a legacy/raw baseline Decoder without "
+                    "PC-HBM weights"
+                )
+        if args.training_design == "teacher_only":
+            configure_teacher_only_trainability(model)
+        elif args.training_design == "two_stage":
+            configure_two_stage_trainability(model)
+        elif args.decoder_checkpoint:
             load_decoder_compatible(
                 model.decoder,
                 args.decoder_checkpoint,
@@ -130,7 +203,12 @@ if __name__ == "__main__":
                 ) from error
             model = wrap_distributed(model, context)
 
-        trainer = BasePCHBMTrainer(model=model, cfg=cfg, pc_cfg=pc_cfg)
+        trainer = BasePCHBMTrainer(
+            model=model,
+            cfg=cfg,
+            pc_cfg=pc_cfg,
+            training_design=args.training_design,
+        )
         if args.resume:
             trainer.resume(args.resume)
         trainer.train()

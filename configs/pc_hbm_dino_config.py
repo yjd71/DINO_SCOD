@@ -113,6 +113,7 @@ class DinoPCHBMConfig:
     # Base-model stages.
     parent_start_epoch: int = 6
     full_pc_start_epoch: int = 11
+    teacher_only_full_start_epoch: int = 6
     pc_injection_ramp_epochs: int = 3
 
     # Labeled loss.
@@ -127,10 +128,13 @@ class DinoPCHBMConfig:
 
     # Unlabeled branch.
     lambda_u: float = 1.0
+    use_hard_pseudo: bool = False
     hard_loss_weight: float = 2.0
     pseudo_fg_threshold: float = 0.70
     pseudo_bg_threshold: float = 0.30
     pseudo_hard_ramp_epochs: int = 3
+    feature_distill_p3_weight: float = 0.05
+    feature_distill_p2_weight: float = 0.10
 
     # Optimization.
     use_amp: bool = True
@@ -166,8 +170,32 @@ class DinoPCHBMConfig:
             raise ValueError("Region sampling settings must have one value per region.")
         if self.parent_start_epoch < 1 or self.full_pc_start_epoch < self.parent_start_epoch:
             raise ValueError("Invalid parent/full PC epoch schedule.")
+        if self.teacher_only_full_start_epoch < 2:
+            raise ValueError("teacher_only_full_start_epoch must leave a parent-only warmup.")
+        if self.feature_distill_p3_weight < 0 or self.feature_distill_p2_weight < 0:
+            raise ValueError("Feature distillation weights must be non-negative.")
         if self.mixture_schedule_end_epoch < self.mixture_schedule_start_epoch:
             raise ValueError("Invalid mixture annealing interval.")
+
+    def configure_training_design(self, training_design: str) -> None:
+        """Apply the stage schedule for the selected trainer without changing schemas."""
+
+        design = str(training_design)
+        if design == "joint":
+            return
+        if design == "two_stage":
+            # Complete Base preheating: legacy-only -> parent-only -> full PC-HBM.
+            self.parent_start_epoch = 6
+            self.full_pc_start_epoch = 11
+            self.mixture_schedule_start_epoch = 11
+            self.mixture_schedule_end_epoch = 30
+            return
+        if design != "teacher_only":
+            raise ValueError(f"Unsupported PC-HBM training design: {design}")
+        self.parent_start_epoch = 1
+        self.full_pc_start_epoch = int(self.teacher_only_full_start_epoch)
+        self.mixture_schedule_start_epoch = int(self.teacher_only_full_start_epoch)
+        self.mixture_schedule_end_epoch = 30
 
     def pc_mode_for_epoch(self, epoch: int) -> str:
         """Return the 1-based Base-training mode for ``epoch``."""
@@ -227,4 +255,3 @@ class DinoPCHBMConfig:
 
 
 DEFAULT_PC_HBM_CONFIG = DinoPCHBMConfig()
-

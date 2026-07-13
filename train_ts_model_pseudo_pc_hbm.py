@@ -34,9 +34,22 @@ def parse_args():
         description="Train RSBL DINO PC-HBM with online EMA-Teacher pseudo labels."
     )
     parser.add_argument(
+        "--training-design",
+        choices=("teacher_only", "joint"),
+        default="teacher_only",
+        help="Teacher-only distillation is the default; joint preserves the legacy PC-HBM flow.",
+    )
+    parser.add_argument(
+        "--teacher-pc-checkpoint",
         "--base-pc-checkpoint",
+        dest="teacher_pc_checkpoint",
         required=True,
-        help="Complete Base PC-HBM Decoder checkpoint (legacy weights are rejected by default).",
+        help="Complete Base PC-HBM Teacher/enhancer checkpoint.",
+    )
+    parser.add_argument(
+        "--student-checkpoint",
+        default=None,
+        help="Optional raw Student checkpoint; defaults to non-PC weights from the Teacher checkpoint.",
     )
     parser.add_argument(
         "--output-dir",
@@ -67,8 +80,17 @@ def parse_args():
     return parser.parse_args()
 
 
+def validate_training_args(args) -> None:
+    if args.training_design == "teacher_only":
+        if not args.labeled_indices_pt:
+            raise ValueError("teacher_only TS requires --labeled-indices-pt")
+        if args.allow_legacy_pc_init:
+            raise ValueError("--allow-legacy-pc-init is only valid with --training-design joint")
+
+
 def main():
     args = parse_args()
+    validate_training_args(args)
     context = init_distributed()
     process_seed = int(args.seed) + int(context.rank)
     set_seed(process_seed, deterministic=args.deterministic)
@@ -80,21 +102,27 @@ def main():
     cfg.memory_num_workers = int(args.memory_num_workers)
     cfg.train_labeled_indices_pt = args.labeled_indices_pt
     cfg.save_dir = args.output_dir
+    cfg.pc_training_design = str(args.training_design)
+    cfg.teacher_pc_checkpoint = args.teacher_pc_checkpoint
+    cfg.student_checkpoint = args.student_checkpoint
     # Locked protocol: do not expose a batch-size downgrade through this CLI.
     cfg.l_batch_size = 32
     cfg.u_batch_size = 32
     configure_distributed(cfg, context, seed=int(args.seed))
 
     pc_cfg = DinoPCHBMConfig()
+    pc_cfg.configure_training_design(args.training_design)
     model = TSModel(
-        teacher_pth=args.base_pc_checkpoint,
+        teacher_pth=args.teacher_pc_checkpoint,
+        student_pth=args.student_checkpoint,
         pc_cfg=pc_cfg,
         allow_legacy_pc_init=bool(args.allow_legacy_pc_init),
+        training_design=args.training_design,
     ).to(context.device)
     model = wrap_distributed(
         model,
         context,
-        find_unused_parameters=True,
+        find_unused_parameters=args.training_design == "joint",
     )
     trainer = PCHBMPseudoTrainer(
         model,
