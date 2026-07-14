@@ -227,7 +227,12 @@ def test_real_teacher_aux_builds_soft_targets_and_corrected_features(
     assert pseudo["confidence"].shape == (1, 1, 98, 98)
     assert pseudo["confidence"].amin() >= 0
     assert pseudo["confidence"].amax() <= 1
-    assert not any(key.startswith("hard") for key in pseudo)
+    assert pseudo["hard_target"].shape == (1, 1, 98, 98)
+    assert pseudo["hard_valid"].shape == (1, 1, 98, 98)
+    torch.testing.assert_close(
+        pseudo["hard_weight"],
+        pseudo["confidence"] * pseudo["hard_valid"],
+    )
     distill = pseudo["distill_features"]
     assert distill["p3_corr"].shape == (1, 128, 28, 28)
     assert distill["p2_refined"].shape == (1, 128, 28, 28)

@@ -95,13 +95,14 @@ def prepare_pseudo_targets(
     *,
     strict: bool = True,
 ) -> dict[str, Any]:
-    """Clone soft probability, confidence and optional Teacher features."""
+    """Clone soft/hard pseudo targets and optional corrected Teacher features."""
 
     p_final = teacher_aux.get("p_final")
     if not torch.is_tensor(p_final):
         raise KeyError("teacher_aux['p_final'] probability is required")
     p_soft = p_final.detach().clone()
     confidence = build_pc_confidence(teacher_aux, strict=strict).detach().clone()
+    hard_targets = _build_hard_pseudo_targets(p_soft, confidence, config)
     distill_features = teacher_aux.get("distill_features")
     cloned_features = None
     if distill_features is not None:
@@ -117,7 +118,37 @@ def prepare_pseudo_targets(
     return {
         "p_soft": p_soft,
         "confidence": confidence,
+        **hard_targets,
         "distill_features": cloned_features,
+    }
+
+
+def _build_hard_pseudo_targets(
+    p_soft: torch.Tensor,
+    confidence: torch.Tensor,
+    config: Any,
+) -> dict[str, torch.Tensor]:
+    """Build the legacy reliable-foreground/background hard target contract."""
+
+    if not torch.is_tensor(p_soft) or not torch.is_tensor(confidence):
+        raise TypeError("p_soft and confidence must be tensors")
+    if p_soft.shape != confidence.shape:
+        raise ValueError(
+            "p_soft and confidence must have identical shapes, got "
+            f"{tuple(p_soft.shape)} and {tuple(confidence.shape)}"
+        )
+    fg_threshold = float(getattr(config, "pseudo_fg_threshold", 0.70))
+    bg_threshold = float(getattr(config, "pseudo_bg_threshold", 0.30))
+    if not 0.0 <= bg_threshold < 0.5 < fg_threshold <= 1.0:
+        raise ValueError("pseudo thresholds must satisfy 0 <= bg < 0.5 < fg <= 1")
+
+    hard_target = (p_soft >= 0.5).to(dtype=p_soft.dtype)
+    hard_valid = (p_soft >= fg_threshold) | (p_soft <= bg_threshold)
+    hard_weight = confidence * hard_valid.to(dtype=confidence.dtype)
+    return {
+        "hard_target": hard_target,
+        "hard_valid": hard_valid,
+        "hard_weight": hard_weight,
     }
 
 
@@ -235,8 +266,22 @@ def pc_unlabeled_loss(
 
     p_soft = pseudo.detach().clone()
     confidence = confidence.detach().clone()
+    hard_targets = _build_hard_pseudo_targets(p_soft, confidence, config)
+    zero = zero_like_loss(z_student)
 
     l_soft = weighted_structure_loss(z_student, p_soft, confidence)
+    use_hard_pseudo = bool(getattr(config, "use_hard_pseudo", True))
+    if use_hard_pseudo:
+        l_hard = weighted_structure_loss(
+            z_student,
+            hard_targets["hard_target"],
+            hard_targets["hard_weight"],
+        )
+        ramp_epochs = max(1, int(getattr(config, "pseudo_hard_ramp_epochs", 3)))
+        hard_ramp = min(1.0, max(0.0, float(epoch) / float(ramp_epochs)))
+    else:
+        l_hard = zero
+        hard_ramp = 0.0
 
     l_side = (
         0.30 * weighted_structure_loss(m2, p_soft, confidence)
@@ -245,7 +290,6 @@ def pc_unlabeled_loss(
         + 0.10 * weighted_structure_loss(global_logit, p_soft, confidence)
     )
 
-    zero = zero_like_loss(z_student)
     l_feat_p3 = zero
     l_feat_p2 = zero
     if teacher_features is not None:
@@ -270,15 +314,26 @@ def pc_unlabeled_loss(
     p3_weight = float(getattr(config, "feature_distill_p3_weight", 0.05))
     p2_weight = float(getattr(config, "feature_distill_p2_weight", 0.10))
     l_feature = p3_weight * l_feat_p3 + p2_weight * l_feat_p2
-    unscaled = l_soft + l_side + l_feature
+    hard_loss_weight = float(getattr(config, "hard_loss_weight", 2.0))
+    if hard_loss_weight < 0.0:
+        raise ValueError("hard_loss_weight must be non-negative")
+    l_hard_weighted = hard_loss_weight * hard_ramp * l_hard
+    unscaled = l_soft + l_hard_weighted + l_side + l_feature
     total = float(getattr(config, "lambda_u", 1.0)) * unscaled
     positive_confidence = confidence > 0
     log = {
         "L_u_soft": l_soft.detach(),
+        "L_u_hard": l_hard.detach(),
+        "L_u_hard_weighted": l_hard_weighted.detach(),
         "L_u_side": l_side.detach(),
         "L_u_feat_p3": l_feat_p3.detach(),
         "L_u_feat_p2": l_feat_p2.detach(),
         "L_u_feature": l_feature.detach(),
+        "hard_ramp": z_student.new_tensor(hard_ramp).detach(),
+        "hard_valid_ratio": hard_targets["hard_valid"]
+        .to(dtype=z_student.dtype)
+        .mean()
+        .detach(),
         "pseudo_conf_mean": confidence.mean().detach(),
         "pseudo_conf_max": confidence.max().detach(),
         "pseudo_conf_positive_fraction": positive_confidence.to(z_student.dtype).mean().detach(),

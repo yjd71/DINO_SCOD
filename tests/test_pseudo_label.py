@@ -32,7 +32,7 @@ def test_confidence_is_exact_five_factor_product_without_double_sigmoid():
     torch.testing.assert_close(confidence, torch.full_like(confidence, expected))
 
 
-def test_soft_targets_clone_corrected_features_without_hard_contract():
+def test_pseudo_targets_restore_hard_contract_and_clone_corrected_features():
     cfg = DinoPCHBMConfig()
     p = torch.tensor([[[[0.1, 0.4, 0.8]]]])
     pi = torch.tensor([0.97, 0.01, 0.01, 0.01]).view(1, 4, 1, 1).expand(1, 4, 1, 3)
@@ -47,8 +47,26 @@ def test_soft_targets_clone_corrected_features_without_hard_contract():
         },
     }
     targets = prepare_pseudo_targets(aux, cfg)
-    assert set(targets) == {"p_soft", "confidence", "distill_features"}
-    assert not any(key.startswith("hard") for key in targets)
+    assert set(targets) == {
+        "p_soft",
+        "confidence",
+        "hard_target",
+        "hard_valid",
+        "hard_weight",
+        "distill_features",
+    }
+    torch.testing.assert_close(
+        targets["hard_target"],
+        torch.tensor([[[[0.0, 0.0, 1.0]]]]),
+    )
+    torch.testing.assert_close(
+        targets["hard_valid"],
+        torch.tensor([[[[True, False, True]]]]),
+    )
+    torch.testing.assert_close(
+        targets["hard_weight"],
+        targets["confidence"] * targets["hard_valid"],
+    )
     for name in ("p3_corr", "p2_refined"):
         cloned = targets["distill_features"][name]
         original = aux["distill_features"][name]
@@ -87,6 +105,32 @@ def test_weighted_loss_learns_from_all_background_target():
     assert logits.grad is not None and logits.grad.abs().sum() > 0
 
 
+def test_weighted_hard_loss_is_differentiable_zero_for_an_empty_mask():
+    logits = torch.zeros(1, 1, 4, 4, requires_grad=True)
+    target = torch.ones_like(logits)
+    loss = weighted_structure_loss(logits, target, torch.zeros_like(logits))
+
+    assert loss.requires_grad
+    assert loss == 0
+    loss.backward()
+    assert logits.grad is not None
+    assert logits.grad.abs().sum() == 0
+
+
+def test_hard_mask_gradient_keeps_reliable_foreground_and_background_only():
+    logits = torch.zeros(1, 1, 1, 3, requires_grad=True)
+    hard_target = torch.tensor([[[[0.0, 1.0, 1.0]]]])
+    hard_weight = torch.tensor([[[[1.0, 0.0, 1.0]]]])
+
+    loss = weighted_structure_loss(logits, hard_target, hard_weight)
+    loss.backward()
+
+    gradient = logits.grad[0, 0, 0]
+    assert gradient[0] > 0  # reliable background
+    assert gradient[1] == 0  # uncertain pixel
+    assert gradient[2] < 0  # reliable foreground
+
+
 def test_unlabeled_main_never_uses_z_final():
     cfg = DinoPCHBMConfig()
     tensors = [torch.randn(1, 1, 8, 8, requires_grad=True) for _ in range(5)]
@@ -98,8 +142,126 @@ def test_unlabeled_main_never_uses_z_final():
     loss.backward()
     assert tensors[3].grad is not None
     assert z_final.grad is None
-    assert not any("hard" in key.lower() for key in log)
+    assert {
+        "L_u_hard",
+        "L_u_hard_weighted",
+        "hard_ramp",
+        "hard_valid_ratio",
+    } <= set(log)
     assert log["pseudo_conf_positive_fraction"] == 1
+
+
+@pytest.mark.parametrize(
+    ("epoch", "expected_ramp"),
+    ((1, 1 / 3), (2, 2 / 3), (3, 1.0), (8, 1.0)),
+)
+def test_hard_loss_matches_legacy_ramp_and_keeps_reliable_background(
+    epoch, expected_ramp
+):
+    cfg = DinoPCHBMConfig()
+    tensors = [torch.zeros(1, 1, 8, 8, requires_grad=True) for _ in range(5)]
+    pseudo = torch.full((1, 1, 8, 8), 0.1)
+    confidence = torch.ones_like(pseudo)
+    aux = {"z_main": tensors[3], "mixture_skipped": True}
+
+    loss, log = pc_unlabeled_loss(tensors, aux, pseudo, confidence, epoch, cfg)
+    expected = (
+        log["L_u_soft"]
+        + log["L_u_side"]
+        + cfg.hard_loss_weight * expected_ramp * log["L_u_hard"]
+    )
+    torch.testing.assert_close(loss.detach(), expected)
+    torch.testing.assert_close(log["hard_ramp"], torch.tensor(expected_ramp))
+    torch.testing.assert_close(log["hard_valid_ratio"], torch.tensor(1.0))
+    assert log["L_u_hard"] > 0
+
+    loss.backward()
+    assert tensors[3].grad is not None and tensors[3].grad.abs().sum() > 0
+
+
+def test_hard_loss_is_differentiable_zero_when_no_pseudo_pixel_is_reliable():
+    cfg = DinoPCHBMConfig()
+    tensors = [torch.zeros(1, 1, 8, 8, requires_grad=True) for _ in range(5)]
+    pseudo = torch.full((1, 1, 8, 8), 0.5)
+    confidence = torch.ones_like(pseudo)
+    aux = {"z_main": tensors[3], "mixture_skipped": True}
+
+    loss, log = pc_unlabeled_loss(tensors, aux, pseudo, confidence, 1, cfg)
+    assert log["L_u_hard"] == 0
+    assert log["L_u_hard_weighted"] == 0
+    assert log["hard_valid_ratio"] == 0
+    loss.backward()
+    assert tensors[3].grad is not None and torch.isfinite(tensors[3].grad).all()
+
+
+def test_hard_pseudo_can_be_disabled_for_ablation():
+    cfg = DinoPCHBMConfig(use_hard_pseudo=False)
+    tensors = [torch.zeros(1, 1, 8, 8, requires_grad=True) for _ in range(5)]
+    pseudo = torch.full((1, 1, 8, 8), 0.9)
+    confidence = torch.ones_like(pseudo)
+    aux = {"z_main": tensors[3], "mixture_skipped": True}
+
+    loss, log = pc_unlabeled_loss(tensors, aux, pseudo, confidence, 1, cfg)
+    torch.testing.assert_close(loss.detach(), log["L_u_soft"] + log["L_u_side"])
+    assert log["L_u_hard"] == 0
+    assert log["hard_ramp"] == 0
+
+
+def test_unlabeled_total_includes_hard_and_feature_distillation_before_lambda_u():
+    cfg = DinoPCHBMConfig(lambda_u=0.37)
+    outputs = [torch.randn(1, 1, 8, 8, requires_grad=True) for _ in range(5)]
+    student_p3 = torch.randn(1, 4, 4, 4, requires_grad=True)
+    student_p2 = torch.randn(1, 4, 4, 4, requires_grad=True)
+    aux = {
+        "z_main": outputs[3],
+        "mixture_skipped": True,
+        "features": {"p3": student_p3, "p2": student_p2},
+    }
+    teacher_features = {
+        "p3_corr": torch.randn_like(student_p3),
+        "p2_refined": torch.randn_like(student_p2),
+    }
+    pseudo = torch.full((1, 1, 8, 8), 0.9)
+    confidence = torch.ones_like(pseudo)
+
+    loss, log = pc_unlabeled_loss(
+        outputs,
+        aux,
+        pseudo,
+        confidence,
+        2,
+        cfg,
+        teacher_features=teacher_features,
+    )
+    expected = cfg.lambda_u * (
+        log["L_u_soft"]
+        + log["L_u_hard_weighted"]
+        + log["L_u_side"]
+        + log["L_u_feature"]
+    )
+    torch.testing.assert_close(loss.detach(), expected)
+    torch.testing.assert_close(log["loss_unlabeled"], loss.detach())
+    assert log["L_u_hard"] > 0
+    assert log["L_u_feature"] > 0
+
+    loss.backward()
+    assert outputs[3].grad is not None and outputs[3].grad.abs().sum() > 0
+    assert student_p3.grad is not None and student_p3.grad.abs().sum() > 0
+    assert student_p2.grad is not None and student_p2.grad.abs().sum() > 0
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    (
+        {"hard_loss_weight": -1.0},
+        {"pseudo_hard_ramp_epochs": 0},
+        {"pseudo_bg_threshold": 0.5},
+        {"pseudo_fg_threshold": 0.5},
+    ),
+)
+def test_hard_pseudo_config_rejects_invalid_values(kwargs):
+    with pytest.raises(ValueError):
+        DinoPCHBMConfig(**kwargs)
 
 
 def test_unlabeled_loss_accepts_ddp_cloned_main_logit():

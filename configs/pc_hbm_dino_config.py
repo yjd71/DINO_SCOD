@@ -128,7 +128,7 @@ class DinoPCHBMConfig:
 
     # Unlabeled branch.
     lambda_u: float = 1.0
-    use_hard_pseudo: bool = False
+    use_hard_pseudo: bool = True
     hard_loss_weight: float = 2.0
     pseudo_fg_threshold: float = 0.70
     pseudo_bg_threshold: float = 0.30
@@ -174,6 +174,12 @@ class DinoPCHBMConfig:
             raise ValueError("teacher_only_full_start_epoch must leave a parent-only warmup.")
         if self.feature_distill_p3_weight < 0 or self.feature_distill_p2_weight < 0:
             raise ValueError("Feature distillation weights must be non-negative.")
+        if self.hard_loss_weight < 0:
+            raise ValueError("hard_loss_weight must be non-negative.")
+        if self.pseudo_hard_ramp_epochs < 1:
+            raise ValueError("pseudo_hard_ramp_epochs must be at least one.")
+        if not 0.0 <= self.pseudo_bg_threshold < 0.5 < self.pseudo_fg_threshold <= 1.0:
+            raise ValueError("Pseudo thresholds must satisfy 0 <= bg < 0.5 < fg <= 1.")
         if self.mixture_schedule_end_epoch < self.mixture_schedule_start_epoch:
             raise ValueError("Invalid mixture annealing interval.")
 

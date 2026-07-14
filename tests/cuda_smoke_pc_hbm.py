@@ -421,8 +421,9 @@ def run_raw_student_unlabeled_scenario(
             return_aux=True,
         )
     pseudo = prepare_pseudo_targets(teacher_aux, config, strict=True)
-    if any(name.startswith("hard_") for name in pseudo):
-        raise AssertionError("Teacher-only pseudo targets must not contain hard supervision")
+    for name in ("hard_target", "hard_valid", "hard_weight"):
+        if name not in pseudo:
+            raise AssertionError(f"Teacher-only pseudo targets are missing {name}")
     with torch.autocast(device_type="cuda", dtype=torch.float16):
         outputs, student_aux = student(features, pc_mode="off", return_aux=True)
         loss, metrics = pc_unlabeled_loss(
@@ -436,7 +437,15 @@ def run_raw_student_unlabeled_scenario(
         )
     loss.backward()
     assert_finite_gradients(student)
-    for name in ("L_u_soft", "L_u_feat_p3", "L_u_feat_p2"):
+    for name in (
+        "L_u_soft",
+        "L_u_hard",
+        "L_u_hard_weighted",
+        "hard_ramp",
+        "hard_valid_ratio",
+        "L_u_feat_p3",
+        "L_u_feat_p2",
+    ):
         if name not in metrics or not torch.isfinite(metrics[name]):
             raise AssertionError(f"Missing or non-finite teacher-only metric: {name}")
     peak = peak_gib()
@@ -444,7 +453,7 @@ def run_raw_student_unlabeled_scenario(
     release()
     print(
         f"[PASS] student unlabeled raw: batch={BATCH_STUDENT_UNLABELED}, "
-        f"mode=off+feature_distill, peak={peak:.2f} GiB"
+        f"mode=off+hard+feature_distill, peak={peak:.2f} GiB"
     )
     return peak
 

@@ -398,6 +398,10 @@ class PCHBMPseudoTrainer:
             "loss": 0.0,
             "labeled": 0.0,
             "unlabeled": 0.0,
+            "L_u_hard": 0.0,
+            "L_u_hard_weighted": 0.0,
+            "hard_valid_ratio": 0.0,
+            "hard_ramp": 0.0,
             "confidence": 0.0,
             "confidence_max": 0.0,
             "confidence_positive_fraction": 0.0,
@@ -508,6 +512,10 @@ class PCHBMPseudoTrainer:
             totals["loss"] += total_value
             totals["labeled"] += l_loss_value
             totals["unlabeled"] += u_loss_value
+            totals["L_u_hard"] += float(u_log["L_u_hard"])
+            totals["L_u_hard_weighted"] += float(u_log["L_u_hard_weighted"])
+            totals["hard_valid_ratio"] += float(u_log["hard_valid_ratio"])
+            totals["hard_ramp"] += float(u_log["hard_ramp"])
             totals["confidence"] += confidence_value
             totals["confidence_max"] += float(u_log.get("pseudo_conf_max", 0.0))
             totals["confidence_positive_fraction"] += float(
@@ -520,6 +528,7 @@ class PCHBMPseudoTrainer:
             progress.set_postfix(
                 loss=f"{total_value:.4f}",
                 conf=f"{confidence_value:.3e}",
+                hard=f"{float(u_log['L_u_hard']):.3e}",
             )
             del u_features, u_outputs, u_aux, pseudo, u_imgs, u_loss, u_log
 
@@ -635,6 +644,9 @@ class PCHBMPseudoTrainer:
                 print(
                     f">>> TS PC-HBM epoch {epoch}/{self.cfg.epochs}: "
                     f"loss={metrics['loss']:.6f}, confidence={metrics['confidence']:.3e}, "
+                    f"L_u_hard={metrics.get('L_u_hard', 0.0):.6f}, "
+                    f"hard_valid={metrics.get('hard_valid_ratio', 0.0):.3%}, "
+                    f"hard_ramp={metrics.get('hard_ramp', 0.0):.3f}, "
                     f"confidence_max={metrics['confidence_max']:.3e}, "
                     f"confidence_positive={metrics['confidence_positive_fraction']:.3%}, "
                     f"lr={lr:.3e}, end_time={_current_local_timestamp()}",

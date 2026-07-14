@@ -13,7 +13,7 @@ Teacher–Student 入口仍使用 `teacher_only` 协议。原始 Base、TS、pse
   `--baseline-checkpoint` 选择性 warm-start legacy Decoder。
 - TS 标签分支和 Student 无标签分支都走原始 `off` 路径。只有 Teacher 无标签分支
   使用 PC-HBM，并用纠正后的概率、P3 和 P2 特征蒸馏 raw Student。
-- 无标签训练只有 soft pseudo loss，不生成 hard target 或 hard loss。
+- 无标签训练同时使用置信度加权 soft pseudo loss 与 `L_u_hard`：`p_final>=0.5` 二值化，仅保留 `p_final>=0.70` 的可靠前景和 `p_final<=0.30` 的可靠背景；hard loss 默认权重为 2.0，并在 TS 前 3 个 epoch 线性升温。P3/P2 特征蒸馏保持启用。
 - TS 最终导出 `student_raw.pth`，其中没有 `pc_hbm.*`，推理不需要 memory。
 
 标签数据仍用于 PC-HBM 监督和 labeled-only memory，但标签样本的纠正特征和纠正预测

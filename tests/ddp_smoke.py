@@ -433,7 +433,7 @@ def main() -> None:
         )
         pseudo = torch.sigmoid(unlabeled_aux["z_main"].detach())
         confidence = torch.ones_like(pseudo)
-        unlabeled_loss, _ = pc_unlabeled_loss(
+        unlabeled_loss, unlabeled_log = pc_unlabeled_loss(
             unlabeled_outputs,
             unlabeled_aux,
             pseudo,
@@ -447,6 +447,9 @@ def main() -> None:
         )
         if not torch.isfinite(unlabeled_loss):
             raise AssertionError("Non-finite TS Student unlabeled loss.")
+        for name in ("L_u_hard", "L_u_hard_weighted", "hard_ramp"):
+            if name not in unlabeled_log or not torch.isfinite(unlabeled_log[name]):
+                raise AssertionError(f"Missing or non-finite TS hard metric: {name}")
         unlabeled_loss.backward()
         _assert_allreduce_consistent(
             _gradient_checksum(raw_ddp.module), name="TS accumulated gradients"
