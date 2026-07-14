@@ -50,7 +50,7 @@ class _CheapTransformerBlock(nn.Module):
 
 
 class _PCHBMDDPSmokeModule(nn.Module):
-    """Expose Base modes or raw teacher-only Student branches through DDP."""
+    """Expose Base modes and both TS training designs through DDP."""
 
     def __init__(self, config: DinoPCHBMConfig, *, teacher_only: bool = False) -> None:
         super().__init__()
@@ -125,8 +125,8 @@ class _PCHBMDDPSmokeModule(nn.Module):
                 pc_aux["route"]["top_img_valid"],
             )
 
-        # Full uses P1/mixture while student_core intentionally stops after
-        # P2-BRA and exposes z_main as its supervised output.
+        # Full uses P1/mixture while student_core executes P1-PRA, skips the
+        # mixture, and exposes z_main as its supervised output.
         if mode == "full":
             loss = loss + aux["z_final"].float().square().mean()
         return loss
@@ -151,6 +151,20 @@ def _smoke_config() -> DinoPCHBMConfig:
         p1_max_tokens=1,
         query_chunk_size=16,
     )
+
+
+def _force_dense_refinement_queries(decoder: Decoder) -> None:
+    """Select every P2/P1 query so the joint smoke has a real valid overlap."""
+
+    if decoder.pc_hbm is None:
+        raise AssertionError("Dense refinement queries require an attached PC-HBM engine.")
+    for boundary_head, token_count in (
+        (decoder.pc_hbm.p2_bra.boundary_head, 28 * 28),
+        (decoder.pc_hbm.p1_pra.boundary_head, 98 * 98),
+    ):
+        boundary_head.top_ratio = 1.0
+        boundary_head.min_tokens = token_count
+        boundary_head.max_tokens = token_count
 
 
 def _build_ready_memory(config: DinoPCHBMConfig) -> PCMemory:
@@ -289,6 +303,88 @@ def _assert_finite_gradient_group(
         raise AssertionError(f"{name} must {state} gradients in this Base stage.")
     if not all(torch.isfinite(gradient).all() for gradient in gradients):
         raise AssertionError(f"{name} received non-finite gradients.")
+
+
+def _assert_joint_p1_finite_gradients(
+    module: _PCHBMDDPSmokeModule,
+) -> None:
+    """Require finite gradients for the P1 attention and all raw heads."""
+
+    prefixes = {
+        "q_proj": "pc_hbm.p1_pra.q_proj.",
+        "k_proj": "pc_hbm.p1_pra.k_proj.",
+        "v_proj": "pc_hbm.p1_pra.v_proj.",
+        "gate": "pc_hbm.p1_pra.g_head.",
+        "residual": "pc_hbm.p1_pra.r_head.",
+        "offset": "pc_hbm.p1_pra.o_head.",
+        "suppression": "pc_hbm.p1_pra.sup_head.",
+    }
+    named_parameters = dict(module.student.named_parameters())
+    for name, prefix in prefixes.items():
+        gradients = [
+            parameter.grad
+            for parameter_name, parameter in named_parameters.items()
+            if parameter_name.startswith(prefix) and parameter.grad is not None
+        ]
+        if not gradients:
+            raise AssertionError(
+                f"Joint student_core P1 {name} parameters received no gradient."
+            )
+        if not all(torch.isfinite(gradient).all() for gradient in gradients):
+            raise AssertionError(
+                f"Joint student_core P1 {name} received non-finite gradients."
+            )
+        if name not in {"q_proj", "k_proj", "v_proj"} and not any(
+            gradient.detach().abs().sum().item() > 0.0
+            for gradient in gradients
+        ):
+            raise AssertionError(
+                f"Joint P1 {name} distillation gradient was identically zero."
+            )
+
+
+def _clone_joint_teacher_features(aux: Mapping[str, object]) -> dict[str, object]:
+    """Clone real teacher_pseudo P3/P2/P1 targets outside inference mode."""
+
+    distill = aux.get("distill_features")
+    p1 = aux.get("p1_pra")
+    if not isinstance(distill, Mapping) or not isinstance(p1, Mapping):
+        raise AssertionError("Teacher teacher_pseudo must expose P3/P2 and P1 targets.")
+
+    p3 = distill.get("p3_corr")
+    p2 = distill.get("p2_refined")
+    if not torch.is_tensor(p3) or not torch.is_tensor(p2):
+        raise AssertionError("Teacher teacher_pseudo is missing corrected P3/P2 targets.")
+
+    p1_fields = (
+        "B1",
+        "G1_raw_map",
+        "R1_map",
+        "O1_map",
+        "R_sup_map",
+        "valid1_map",
+    )
+    missing = [name for name in p1_fields if not torch.is_tensor(p1.get(name))]
+    if missing:
+        raise AssertionError(f"Teacher teacher_pseudo is missing P1 targets: {missing}")
+
+    # The clone operations intentionally happen after inference_mode exits so
+    # these targets are ordinary tensors that can safely participate in the
+    # Student autograd graph.  Small deterministic offsets keep every P1 loss
+    # live even though the zero-initialized Teacher and Student start equal.
+    p1_targets = {
+        name: p1[name].detach().clone()
+        for name in p1_fields
+    }
+    p1_targets["B1"] = (0.9 * p1_targets["B1"] + 0.05).clamp(0.0, 1.0)
+    for name in ("G1_raw_map", "R1_map", "O1_map", "R_sup_map"):
+        p1_targets[name] = p1_targets[name] + 0.01
+
+    return {
+        "p3_corr": p3.detach().clone() + 0.01,
+        "p2_refined": p2.detach().clone() + 0.01,
+        "p1": p1_targets,
+    }
 
 
 def _assert_allreduce_consistent(
@@ -468,11 +564,151 @@ def main() -> None:
             _parameter_checksum(raw_ddp.module), name="TS raw Student parameters"
         )
 
+        # Joint TS keeps PC-HBM on both Student and Teacher.  Its labeled
+        # branch runs full including P1/mixture; the unlabeled branch runs the
+        # extended student_core through P1-PRA but stops before mixture.  The
+        # two synchronized backwards share one optimizer step.
+        torch.manual_seed(141421)
+        joint_model = _PCHBMDDPSmokeModule(config)
+        _force_dense_refinement_queries(joint_model.student)
+        joint_ddp = DDP(joint_model, find_unused_parameters=True)
+        joint_optimizer = torch.optim.SGD(joint_ddp.parameters(), lr=1e-5)
+        joint_teacher = _PCHBMDDPSmokeModule(config).student
+        _force_dense_refinement_queries(joint_teacher)
+        joint_teacher.load_state_dict(
+            joint_ddp.module.student.state_dict(), strict=True
+        )
+        joint_teacher.eval().requires_grad_(False)
+
+        joint_optimizer.zero_grad(set_to_none=True)
+        joint_labeled_loss = joint_ddp(
+            _features(rank, 20),
+            memory,
+            branch="student_labeled",
+            epoch=13,
+            query_image_ids=[f"joint-labeled-query-rank-{rank}"],
+        )
+        if not torch.isfinite(joint_labeled_loss):
+            raise AssertionError("Non-finite joint Student labeled/full loss.")
+        joint_labeled_loss.backward()
+
+        joint_features = _features(rank, 21)
+        with torch.inference_mode():
+            teacher_outputs, teacher_aux = joint_teacher(
+                joint_features,
+                memory=memory,
+                pc_mode="teacher_pseudo",
+                epoch=13,
+                return_aux=True,
+                query_image_ids=[f"joint-unlabeled-query-rank-{rank}"],
+            )
+        if len(teacher_outputs) != 5:
+            raise AssertionError("Teacher teacher_pseudo changed the five-output contract.")
+        if (
+            teacher_aux.get("forward_mode") != "teacher_pseudo"
+            or teacher_aux.get("mixture") is None
+            or teacher_aux.get("z_final") is None
+            or teacher_aux.get("p_final") is None
+        ):
+            raise AssertionError("Teacher teacher_pseudo must execute P1 and mixture.")
+
+        pseudo_source = teacher_aux["p_final"]
+        if not torch.is_tensor(pseudo_source):
+            raise AssertionError("Teacher teacher_pseudo must expose probability p_final.")
+        pseudo = pseudo_source.detach().clone()
+        confidence = torch.ones_like(pseudo)
+        teacher_features = _clone_joint_teacher_features(teacher_aux)
+
+        joint_outputs, joint_aux = joint_ddp(
+            joint_features,
+            memory,
+            branch="student_unlabeled",
+            epoch=13,
+            query_image_ids=[f"joint-unlabeled-query-rank-{rank}"],
+        )
+        if len(joint_outputs) != 5:
+            raise AssertionError("Joint student_core changed the five-output contract.")
+        if joint_aux.get("forward_mode") != "student_core":
+            raise AssertionError("Joint unlabeled branch must use student_core.")
+        if not isinstance(joint_aux.get("p1_pra"), Mapping):
+            raise AssertionError("Joint student_core must execute P1-PRA exactly once.")
+        if (
+            joint_aux.get("mixture") is not None
+            or not joint_aux.get("mixture_skipped")
+            or joint_aux.get("z_final") is not None
+            or joint_aux.get("p_final") is not None
+        ):
+            raise AssertionError(
+                "Joint student_core must stop after P1-PRA and skip mixture outputs."
+            )
+        student_valid1 = joint_aux["p1_pra"].get("valid1_map")
+        teacher_valid1 = teacher_features["p1"]["valid1_map"]
+        if (
+            not torch.is_tensor(student_valid1)
+            or not torch.is_tensor(teacher_valid1)
+            or not bool((student_valid1 > 0.5).any())
+            or not bool((teacher_valid1 > 0.5).any())
+        ):
+            raise AssertionError(
+                "Joint smoke requires non-empty Student/Teacher P1 valid intersections."
+            )
+
+        joint_unlabeled_loss, joint_unlabeled_log = pc_unlabeled_loss(
+            joint_outputs,
+            joint_aux,
+            pseudo,
+            confidence,
+            epoch=1,
+            config=config,
+            teacher_features=teacher_features,
+        )
+        if not torch.isfinite(joint_unlabeled_loss):
+            raise AssertionError("Non-finite joint Student unlabeled loss.")
+        p1_log_names = (
+            "L_u_feat_p1_B1",
+            "L_u_feat_p1_G1",
+            "L_u_feat_p1_R1",
+            "L_u_feat_p1_O1",
+            "L_u_feat_p1_R_sup",
+            "L_u_feat_p1",
+            "L_u_feature",
+        )
+        for name in p1_log_names:
+            value = joint_unlabeled_log.get(name)
+            if not torch.is_tensor(value) or not torch.isfinite(value):
+                raise AssertionError(
+                    f"Missing or non-finite joint P1 distillation metric: {name}"
+                )
+        if joint_unlabeled_log["L_u_feat_p1"].item() <= 0.0:
+            raise AssertionError("Joint P1 distillation was not exercised.")
+
+        joint_unlabeled_loss.backward()
+        _assert_joint_p1_finite_gradients(joint_ddp.module)
+        _assert_allreduce_consistent(
+            _gradient_checksum(joint_ddp.module),
+            name="TS joint accumulated gradients",
+        )
+        joint_optimizer.step()
+        update_ema_module(
+            joint_ddp.module.student,
+            joint_teacher,
+            momentum=0.995,
+        )
+        _assert_allreduce_consistent(
+            _parameter_checksum(joint_ddp.module),
+            name="TS joint Student parameters",
+        )
+        _assert_allreduce_consistent(
+            _parameter_checksum(joint_teacher),
+            name="TS joint Teacher EMA parameters",
+        )
+
         dist.barrier()
         if rank == 0:
             print(
                 "DDP PC-HBM smoke passed: 2 ranks/Gloo; "
-                "Base off,parent_only,full; TS raw/off double backward and selective EMA; "
+                "Base off,parent_only,full; TS raw/off and joint full+student_core/P1 "
+                "double backward with EMA; "
                 "all-reduce checksums consistent.",
                 flush=True,
             )

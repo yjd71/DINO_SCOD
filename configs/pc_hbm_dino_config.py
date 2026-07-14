@@ -135,6 +135,7 @@ class DinoPCHBMConfig:
     pseudo_hard_ramp_epochs: int = 3
     feature_distill_p3_weight: float = 0.05
     feature_distill_p2_weight: float = 0.10
+    feature_distill_p1_weight: float = 0.05
 
     # Optimization.
     use_amp: bool = True
@@ -172,7 +173,11 @@ class DinoPCHBMConfig:
             raise ValueError("Invalid parent/full PC epoch schedule.")
         if self.teacher_only_full_start_epoch < 2:
             raise ValueError("teacher_only_full_start_epoch must leave a parent-only warmup.")
-        if self.feature_distill_p3_weight < 0 or self.feature_distill_p2_weight < 0:
+        if (
+            self.feature_distill_p3_weight < 0
+            or self.feature_distill_p2_weight < 0
+            or self.feature_distill_p1_weight < 0
+        ):
             raise ValueError("Feature distillation weights must be non-negative.")
         if self.hard_loss_weight < 0:
             raise ValueError("hard_loss_weight must be non-negative.")

@@ -16,11 +16,75 @@ import Model.ts_model as ts_model_module
 from train_ts_model_pseudo_pc_hbm import parse_args, validate_training_args
 
 
-def _teacher_aux_in_inference_mode():
+class _TinyTeacherStudent(nn.Module):
+    def __init__(self, legacy_value, pc_value):
+        super().__init__()
+        self.legacy = nn.Linear(1, 1, bias=False)
+        self.pc_hbm = nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            self.legacy.weight.fill_(legacy_value)
+            self.pc_hbm.weight.fill_(pc_value)
+
+
+def _fingerprint_contract_trainer(training_design, teacher):
+    trainer = object.__new__(PCHBMPseudoTrainer)
+    trainer.training_design = training_design
+    trainer.core_model = SimpleNamespace(teacher=teacher)
+    trainer._teacher_pc_fingerprint = None
+    trainer._capture_teacher_pc_fingerprint()
+    return trainer
+
+
+def test_teacher_only_pc_fingerprint_rejects_real_state_change():
+    teacher = _TinyTeacherStudent(legacy_value=1.0, pc_value=2.0)
+    trainer = _fingerprint_contract_trainer("teacher_only", teacher)
+
+    trainer._validate_teacher_pc_contract()
+    with torch.no_grad():
+        teacher.pc_hbm.weight.add_(1.0)
+
+    with pytest.raises(RuntimeError, match="teacher-only TS"):
+        trainer._validate_teacher_pc_contract()
+
+
+def test_joint_pc_fingerprint_allows_intentional_full_ema_update():
+    student = _TinyTeacherStudent(legacy_value=3.0, pc_value=5.0)
+    teacher = _TinyTeacherStudent(legacy_value=1.0, pc_value=2.0)
+    trainer = _fingerprint_contract_trainer("joint", teacher)
+    before = ts_trainer.module_fingerprint(teacher.pc_hbm)
+
+    ts_trainer.update_ema_module(
+        student,
+        teacher,
+        momentum=0.5,
+        shared_only=False,
+    )
+
+    assert ts_trainer.module_fingerprint(teacher.pc_hbm) != before
+    trainer._validate_teacher_pc_contract()
+
+
+def test_teacher_only_fingerprint_uses_post_resume_teacher_state():
+    teacher = _TinyTeacherStudent(legacy_value=1.0, pc_value=2.0)
+    trainer = _fingerprint_contract_trainer("teacher_only", teacher)
+    pre_resume_fingerprint = trainer._teacher_pc_fingerprint
+
+    # Simulate load_training_resume restoring a different frozen EMA Teacher.
+    with torch.no_grad():
+        teacher.pc_hbm.weight.fill_(7.0)
+    trainer._capture_teacher_pc_fingerprint()
+
+    assert trainer._teacher_pc_fingerprint != pre_resume_fingerprint
+    trainer._validate_teacher_pc_contract()
+
+
+def _teacher_aux_in_inference_mode(*, include_p1=False):
     with torch.inference_mode():
-        return {
+        aux = {
             "p_final": torch.rand(2, 1, 98, 98),
             "z_main": torch.randn(2, 1, 98, 98),
+            "pc_active": True,
+            "fallback_reason": None,
             "pc_hbm": {
                 "C23_map": torch.rand(2, 1, 28, 28),
                 "route_entropy_norm": torch.rand(2),
@@ -31,6 +95,16 @@ def _teacher_aux_in_inference_mode():
                 "p2_refined": torch.randn(2, 128, 28, 28),
             },
         }
+        if include_p1:
+            aux["p1_pra"] = {
+                "B1": torch.rand(2, 1, 98, 98),
+                "G1_raw_map": torch.randn(2, 1, 98, 98),
+                "R1_map": torch.randn(2, 128, 98, 98),
+                "O1_map": torch.randn(2, 2, 98, 98),
+                "R_sup_map": torch.randn(2, 1, 98, 98),
+                "valid1_map": torch.randint(0, 2, (2, 1, 98, 98)).float(),
+            }
+        return aux
 
 
 def test_teacher_targets_are_cloned_out_of_inference_mode():
@@ -50,6 +124,82 @@ def test_teacher_targets_are_cloned_out_of_inference_mode():
     )
     assert all(not tensor.is_inference() for tensor in tensors)
     assert all(tensor.grad_fn is None for tensor in tensors)
+
+
+def test_joint_teacher_p1_targets_are_cloned_and_nested_for_distillation():
+    aux = _teacher_aux_in_inference_mode(include_p1=True)
+
+    cloned = PCHBMPseudoTrainer._clone_teacher_target_aux(
+        aux,
+        training_design="joint",
+    )
+
+    p1 = cloned["distill_features"]["p1"]
+    assert set(p1) == {
+        "B1",
+        "G1_raw_map",
+        "R1_map",
+        "O1_map",
+        "R_sup_map",
+        "valid1_map",
+    }
+    assert all(not tensor.is_inference() for tensor in p1.values())
+    assert all(tensor.grad_fn is None for tensor in p1.values())
+    assert all(
+        p1[name].data_ptr() != aux["p1_pra"][name].data_ptr()
+        for name in p1
+    )
+
+
+def test_teacher_only_targets_do_not_require_or_export_p1():
+    cloned = PCHBMPseudoTrainer._clone_teacher_target_aux(
+        _teacher_aux_in_inference_mode(),
+        training_design="teacher_only",
+    )
+
+    assert "p1" not in cloned["distill_features"]
+
+
+def test_joint_teacher_targets_require_every_p1_tensor():
+    aux = _teacher_aux_in_inference_mode(include_p1=True)
+    del aux["p1_pra"]["O1_map"]
+
+    with pytest.raises(KeyError, match="p1_pra.O1_map"):
+        PCHBMPseudoTrainer._clone_teacher_target_aux(
+            aux,
+            training_design="joint",
+        )
+
+
+def _ts_model_for_teacher_aux(aux, training_design):
+    class FakeTeacher(nn.Module):
+        def forward(self, features, **kwargs):
+            return (torch.zeros(1),) * 5, aux
+
+    model = object.__new__(ts_model_module.TSModel)
+    nn.Module.__init__(model)
+    model.training_design = training_design
+    model.teacher = FakeTeacher()
+    return model
+
+
+@pytest.mark.parametrize("training_design", ("teacher_only", "joint"))
+def test_teacher_pseudo_always_requires_p3_p2_targets(training_design):
+    aux = _teacher_aux_in_inference_mode(include_p1=training_design == "joint")
+    del aux["distill_features"]["p3_corr"]
+    model = _ts_model_for_teacher_aux(aux, training_design)
+
+    with pytest.raises(RuntimeError, match="P3/P2"):
+        model.teacher_pseudo([torch.zeros(1)], memory=object(), epoch=31)
+
+
+def test_joint_teacher_pseudo_requires_complete_p1_targets():
+    aux = _teacher_aux_in_inference_mode(include_p1=True)
+    del aux["p1_pra"]["R_sup_map"]
+    model = _ts_model_for_teacher_aux(aux, "joint")
+
+    with pytest.raises(RuntimeError, match="complete P1"):
+        model.teacher_pseudo([torch.zeros(1)], memory=object(), epoch=31)
 
 
 def test_ts_decoder_epoch_continues_after_base_schedule():
@@ -163,6 +313,12 @@ def test_train_prints_start_and_end_time_for_every_epoch(monkeypatch, capsys):
         "confidence": 0.125,
         "confidence_max": 0.25,
         "confidence_positive_fraction": 0.5,
+        "L_u_feat_p1": 0.03125,
+        "L_u_feat_p1_B1": 0.01,
+        "L_u_feat_p1_G1": 0.02,
+        "L_u_feat_p1_R1": 0.03,
+        "L_u_feat_p1_O1": 0.04,
+        "L_u_feat_p1_R_sup": 0.05,
     }
     trainer._save_epoch = lambda epoch, metrics: None
     trainer._export_final_memory = lambda: None
@@ -184,6 +340,12 @@ def test_train_prints_start_and_end_time_for_every_epoch(monkeypatch, capsys):
     output = capsys.readouterr().out
     assert "epoch 1/2: start_time=07-13 01:00:00" in output
     assert "epoch 1/2: loss=1.250000" in output
+    assert "L_u_feat_p1=0.031250" in output
+    assert "P1_B1=1.000e-02" in output
+    assert "P1_G1=2.000e-02" in output
+    assert "P1_R1=3.000e-02" in output
+    assert "P1_O1=4.000e-02" in output
+    assert "P1_R_sup=5.000e-02" in output
     assert "end_time=07-13 01:05:00" in output
     assert "epoch 2/2: start_time=07-13 01:05:01" in output
     assert "epoch 2/2: loss=1.250000" in output
@@ -203,6 +365,11 @@ def test_ts_resume_rejects_missing_or_different_pc_config():
     incompatible["memory_schema_version"] += 1
     with pytest.raises(RuntimeError, match="memory_schema_version"):
         trainer._validate_resume_config(incompatible)
+
+    legacy = dict(saved)
+    legacy.pop("feature_distill_p1_weight")
+    with pytest.raises(RuntimeError, match="feature_distill_p1_weight"):
+        trainer._validate_resume_config(legacy)
 
 
 def test_wrap_distributed_forwards_optional_unused_parameter_flag(monkeypatch):

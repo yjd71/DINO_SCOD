@@ -419,11 +419,31 @@ class DinoPCHBMEngine(nn.Module):
         slim.pop('features', None)
         pc_aux = slim.get('pc_hbm')
         if isinstance(pc_aux, dict):
-            keep = {
-                'C23_map', 'gate_pc_map', 'route_entropy', 'route_entropy_norm',
-                'pc_maps', 'injection_scale', 'query_valid',
-            }
+            if mode == 'student_core':
+                keep = {'p3_corr'}
+            else:
+                keep = {
+                    'C23_map', 'gate_pc_map', 'route_entropy', 'route_entropy_norm',
+                    'pc_maps', 'injection_scale', 'query_valid',
+                }
             slim['pc_hbm'] = {key: value for key, value in pc_aux.items() if key in keep}
+        if mode == 'student_core':
+            p2_aux = slim.get('p2_bra')
+            if isinstance(p2_aux, dict):
+                slim['p2_bra'] = {
+                    key: value
+                    for key, value in p2_aux.items()
+                    if key == 'p2_refined'
+                }
+            p1_aux = slim.get('p1_pra')
+            if isinstance(p1_aux, dict):
+                p1_keep = {
+                    'B1', 'G1_raw_map', 'R1_map', 'O1_map', 'R_sup_map',
+                    'valid1_map',
+                }
+                slim['p1_pra'] = {
+                    key: value for key, value in p1_aux.items() if key in p1_keep
+                }
         mixture = slim.get('mixture')
         if isinstance(mixture, dict) and mode == 'teacher_pseudo':
             keep = {'pi', 'z_final', 'p_final', 'Mask_corr'}

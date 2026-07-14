@@ -111,6 +111,58 @@ def test_decoder_pc_modes_have_stable_outputs_and_aux_schema(
     if mode == "teacher_pseudo":
         assert aux["distill_features"]["p3_corr"].shape == (1, 128, 28, 28)
         assert aux["distill_features"]["p2_refined"].shape == (1, 128, 28, 28)
+    if mode == "student_core":
+        assert aux["forward_mode"] == "student_core"
+        assert aux["z_final"] is None
+        assert aux["p_final"] is None
+        assert aux["mixture"] is None
+        assert aux["mixture_skipped"] is True
+        assert "features" not in aux
+        assert set(aux["pc_hbm"]) == {"p3_corr"}
+        assert aux["pc_hbm"]["p3_corr"].shape == (1, 128, 28, 28)
+        assert set(aux["p2_bra"]) == {"p2_refined"}
+        assert aux["p2_bra"]["p2_refined"].shape == (1, 128, 28, 28)
+        assert set(aux["p1_pra"]) == {
+            "B1",
+            "G1_raw_map",
+            "R1_map",
+            "O1_map",
+            "R_sup_map",
+            "valid1_map",
+        }
+
+
+def test_student_core_runs_p1_once_and_never_runs_mixture(
+    decoder_inputs, monkeypatch
+):
+    model, features, memory = decoder_inputs
+    calls = {"p1": 0, "mixture": 0}
+    original_forward_p1 = model.pc_hbm.forward_p1
+    original_forward_mixture = model.pc_hbm.forward_mixture
+
+    def counted_forward_p1(*args, **kwargs):
+        calls["p1"] += 1
+        return original_forward_p1(*args, **kwargs)
+
+    def counted_forward_mixture(*args, **kwargs):
+        calls["mixture"] += 1
+        return original_forward_mixture(*args, **kwargs)
+
+    monkeypatch.setattr(model.pc_hbm, "forward_p1", counted_forward_p1)
+    monkeypatch.setattr(model.pc_hbm, "forward_mixture", counted_forward_mixture)
+
+    _, aux = model(
+        features,
+        memory=memory,
+        pc_mode="student_core",
+        epoch=11,
+        return_aux=True,
+        query_image_ids=["query"],
+    )
+
+    assert calls == {"p1": 1, "mixture": 0}
+    assert aux["p1_pra"] is not None
+    assert aux["mixture"] is None
 
 
 def test_missing_or_incompatible_memory_returns_explicit_baseline_fallback(

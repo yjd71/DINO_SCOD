@@ -1,7 +1,7 @@
 # RSBL DINO PC-HBM
 
 `train_base_model_pc_hbm.py` 默认使用 `two_stage` 完成整个预热流程；后续
-Teacher–Student 入口仍使用 `teacher_only` 协议。原始 Base、TS、pseudo、SAM trainer
+Teacher–Student 入口默认仍使用 `teacher_only` 协议，也保留显式 `joint` 协议。原始 Base、TS、pseudo、SAM trainer
 均不受影响。
 
 ## Two-stage Base 与 Teacher-only TS 数据流
@@ -15,6 +15,13 @@ Teacher–Student 入口仍使用 `teacher_only` 协议。原始 Base、TS、pse
   使用 PC-HBM，并用纠正后的概率、P3 和 P2 特征蒸馏 raw Student。
 - 无标签训练同时使用置信度加权 soft pseudo loss 与 `L_u_hard`：`p_final>=0.5` 二值化，仅保留 `p_final>=0.70` 的可靠前景和 `p_final<=0.30` 的可靠背景；hard loss 默认权重为 2.0，并在 TS 前 3 个 epoch 线性升温。P3/P2 特征蒸馏保持启用。
 - TS 最终导出 `student_raw.pth`，其中没有 `pc_hbm.*`，推理不需要 memory。
+
+`joint` 协议下，Student 标签分支使用 `full`（包含 P1-PRA 和 mixture）；
+Student 无标签分支使用 `student_core`，执行 P3 correction、P2-BRA 和
+P1-PRA 后立即停止，不执行 mixture，soft/hard pseudo 主监督始终只作用于
+`z_main`。P3/P2 使用 corrected Student 对齐 corrected Teacher；P1 额外蒸馏
+`B1/G1_raw/R1/O1/R_sup`，总特征项默认为
+`0.05*L_feat_p3 + 0.10*L_feat_p2 + 0.05*L_feat_p1`。
 
 标签数据仍用于 PC-HBM 监督和 labeled-only memory，但标签样本的纠正特征和纠正预测
 不会进入 Student 或最终输出。Base 与 TS 必须使用同一个 labeled split：省略
@@ -90,6 +97,9 @@ conda run -n yjd python -m torch.distributed.run \
 `--student-checkpoint` 时，raw Student 从 enhancer checkpoint 的非 PC 权重初始化。
 Teacher legacy 参数按名称跟随 Student EMA，Teacher `pc_hbm.*` 始终冻结。
 
+`--training-design joint` 保留 joint Student 的 PC-HBM 参数与推理语义：兼容
+memory 时推理仍运行 `full` 并返回 `z_final`。
+
 TS resume：
 
 ```bash
@@ -133,6 +143,6 @@ conda run -n yjd python -m torch.distributed.run --standalone --nproc_per_node=2
 部分 Windows PyTorch 构建即使完成 rendezvous 仍不提供可用 Gloo device；这种情况下
 CPU/Gloo smoke 必须在 Linux 训练服务器执行。CUDA smoke 固定覆盖 Base batch 16
 真实 joint labeled full backward（同时检查 legacy 与 PC-HBM finite gradients）、
-Teacher batch 32 inference、Student labeled batch 32 raw backward，
-以及 Student unlabeled batch 32 raw soft/feature-distillation backward；OOM 时只按脚本中锁定的
+Teacher batch 32 inference、Teacher-only Student labeled/unlabeled raw backward，
+以及 joint Student unlabeled batch 32 `student_core+P1` 蒸馏 backward；OOM 时只按脚本中锁定的
 chunk/token/top-K 顺序降容量，不降低 batch size。

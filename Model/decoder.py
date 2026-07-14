@@ -401,11 +401,16 @@ class Decoder(nn.Module):
         z_main, p1_98 = self._predict_side(
             t1, torch.sigmoid(m2), self.seg_head_1, token_hw, output_hw
         )
-        use_final_refinement = pc_mode in {'full', 'teacher_pseudo'} and p2_aux is not None
-        if use_final_refinement:
+        run_p1 = pc_mode in {'student_core', 'full', 'teacher_pseudo'} and p2_aux is not None
+        run_mixture = pc_mode in {'full', 'teacher_pseudo'} and p2_aux is not None
+        if run_p1:
             p1_aux = self.pc_hbm.forward_p1(
                 p1=p1_98, z_main=z_main, p2_aux=p2_aux
             )
+        else:
+            p1_aux = None
+
+        if run_mixture:
             mix_aux = self.pc_hbm.forward_mixture(
                 z_main=z_main,
                 p1_aux=p1_aux,
@@ -416,7 +421,6 @@ class Decoder(nn.Module):
             z_final = mix_aux['z_final']
             p_final = mix_aux['p_final']
         else:
-            p1_aux = None
             mix_aux = None
             if pc_mode == 'student_core':
                 z_final = None
@@ -447,7 +451,7 @@ class Decoder(nn.Module):
             'p2_bra': p2_aux,
             'p1_pra': p1_aux,
             'mixture': mix_aux,
-            'mixture_skipped': not use_final_refinement,
+            'mixture_skipped': not run_mixture,
             'forward_mode': pc_mode,
             'distill_features': distill_features,
             'features': {

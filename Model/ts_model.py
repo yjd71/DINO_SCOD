@@ -88,14 +88,30 @@ class TSModel(nn.Module):
             raise RuntimeError(
                 f'Teacher PC-HBM path is inactive: {aux.get("fallback_reason")}'
             )
-        if self.training_design == 'teacher_only':
-            distill_features = aux.get('distill_features')
-            if not isinstance(distill_features, dict) or not all(
-                torch.is_tensor(distill_features.get(key))
-                for key in ('p3_corr', 'p2_refined')
+        distill_features = aux.get('distill_features')
+        if not isinstance(distill_features, dict) or not all(
+            torch.is_tensor(distill_features.get(key))
+            for key in ('p3_corr', 'p2_refined')
+        ):
+            raise RuntimeError(
+                'Teacher PC-HBM path did not return P3/P2 distillation features.'
+            )
+        if self.training_design == 'joint':
+            p1_aux = aux.get('p1_pra')
+            required_p1_targets = (
+                'B1',
+                'G1_raw_map',
+                'R1_map',
+                'O1_map',
+                'R_sup_map',
+                'valid1_map',
+            )
+            if not isinstance(p1_aux, dict) or not all(
+                torch.is_tensor(p1_aux.get(key)) for key in required_p1_targets
             ):
                 raise RuntimeError(
-                    'Teacher PC-HBM path did not return P3/P2 distillation features.'
+                    'Joint Teacher PC-HBM path did not return complete P1 '
+                    'distillation targets.'
                 )
         return aux
 

@@ -97,7 +97,9 @@ class PCHBMPseudoTrainer:
         self.device = torch.device(cfg.device)
         self.core_model = unwrap_model(model)
         self._validate_model_contract()
-        self._teacher_pc_fingerprint = module_fingerprint(self.core_model.teacher.pc_hbm)
+        # Captured after any resume state has been restored. Until then the
+        # constructor's Teacher is not necessarily the epoch being resumed.
+        self._teacher_pc_fingerprint = None
 
         # The published TS protocol fixes both physical batches at 32.  DDP
         # partitions data across ranks but does not change the per-rank batch.
@@ -246,7 +248,8 @@ class PCHBMPseudoTrainer:
             )
             self._validate_resume_config(checkpoint.get("pc_cfg"))
             self.current_epoch = int(checkpoint["epoch"]) + 1
-            self._freeze_teacher()
+        self._freeze_teacher()
+        self._capture_teacher_pc_fingerprint()
 
     def _validate_model_contract(self):
         if getattr(self.core_model, "pc_cfg", None) is None:
@@ -292,6 +295,30 @@ class PCHBMPseudoTrainer:
     def _freeze_teacher(self):
         self.core_model.teacher.eval()
         self.core_model.teacher.requires_grad_(False)
+
+    def _capture_teacher_pc_fingerprint(self):
+        """Capture the post-resume PC baseline required by teacher-only TS."""
+
+        # Teacher-only keeps the enhancer immutable and updates only shared
+        # legacy weights by EMA. Joint deliberately EMA-updates the complete
+        # Teacher, including ``pc_hbm.*``, so it has no fixed PC fingerprint.
+        self._teacher_pc_fingerprint = (
+            module_fingerprint(self.core_model.teacher.pc_hbm)
+            if self.training_design == "teacher_only"
+            else None
+        )
+
+    def _validate_teacher_pc_contract(self):
+        """Enforce PC immutability only for the teacher-only protocol."""
+
+        if self.training_design != "teacher_only":
+            return
+        if self._teacher_pc_fingerprint is None:
+            raise RuntimeError("Teacher-only PC-HBM fingerprint was not initialized")
+        if module_fingerprint(self.core_model.teacher.pc_hbm) != self._teacher_pc_fingerprint:
+            raise RuntimeError(
+                "Frozen Teacher PC-HBM parameters or buffers changed during teacher-only TS"
+            )
 
     def _distributed_sampler(self, dataset):
         if not self.distributed:
@@ -345,8 +372,15 @@ class PCHBMPseudoTrainer:
         return compat_meta
 
     @staticmethod
-    def _clone_teacher_target_aux(aux: Mapping[str, Any]) -> dict[str, Any]:
-        """Keep only confidence inputs and clone them outside inference mode."""
+    def _clone_teacher_target_aux(
+        aux: Mapping[str, Any],
+        *,
+        training_design: str = "teacher_only",
+    ) -> dict[str, Any]:
+        """Keep required pseudo targets and clone them outside inference mode."""
+
+        if training_design not in {"teacher_only", "joint"}:
+            raise ValueError(f"Unsupported PC-HBM training design: {training_design}")
 
         pc = aux.get("pc_hbm", {}) or {}
         mixture = aux.get("mixture", {}) or {}
@@ -360,6 +394,28 @@ class PCHBMPseudoTrainer:
                 raise RuntimeError(f"Teacher target {name} remained an inference tensor")
             return cloned
 
+        cloned_distill_features = {
+            "p3_corr": clone_tensor(
+                distill_features.get("p3_corr"), "distill_features.p3_corr"
+            ),
+            "p2_refined": clone_tensor(
+                distill_features.get("p2_refined"), "distill_features.p2_refined"
+            ),
+        }
+        if training_design == "joint":
+            p1 = aux.get("p1_pra", {}) or {}
+            cloned_distill_features["p1"] = {
+                name: clone_tensor(p1.get(name), f"p1_pra.{name}")
+                for name in (
+                    "B1",
+                    "G1_raw_map",
+                    "R1_map",
+                    "O1_map",
+                    "R_sup_map",
+                    "valid1_map",
+                )
+            }
+
         return {
             "p_final": clone_tensor(aux.get("p_final"), "p_final"),
             "z_main": clone_tensor(aux.get("z_main"), "z_main"),
@@ -370,14 +426,7 @@ class PCHBMPseudoTrainer:
                 ),
             },
             "mixture": {"pi": clone_tensor(mixture.get("pi"), "mixture.pi")},
-            "distill_features": {
-                "p3_corr": clone_tensor(
-                    distill_features.get("p3_corr"), "distill_features.p3_corr"
-                ),
-                "p2_refined": clone_tensor(
-                    distill_features.get("p2_refined"), "distill_features.p2_refined"
-                ),
-            },
+            "distill_features": cloned_distill_features,
         }
 
     def train_epoch(self):
@@ -406,6 +455,12 @@ class PCHBMPseudoTrainer:
             "confidence_max": 0.0,
             "confidence_positive_fraction": 0.0,
             "confidence_positive_count": 0.0,
+            "L_u_feat_p1_B1": 0.0,
+            "L_u_feat_p1_G1": 0.0,
+            "L_u_feat_p1_R1": 0.0,
+            "L_u_feat_p1_O1": 0.0,
+            "L_u_feat_p1_R_sup": 0.0,
+            "L_u_feat_p1": 0.0,
         }
         steps = 0
 
@@ -459,7 +514,10 @@ class PCHBMPseudoTrainer:
                         self.memory,
                         decoder_epoch,
                     )
-            teacher_target_aux = self._clone_teacher_target_aux(teacher_aux)
+            teacher_target_aux = self._clone_teacher_target_aux(
+                teacher_aux,
+                training_design=self.training_design,
+            )
             del teacher_aux
             pseudo = prepare_pseudo_targets(
                 teacher_target_aux,
@@ -468,8 +526,9 @@ class PCHBMPseudoTrainer:
             )
             del teacher_target_aux
 
-            # 3) Student core deliberately skips P1-PRA/mixture.  This second
-            # backward is synchronized normally; no DDP no_sync is used.
+            # 3) Joint Student core executes P1-PRA for distillation but still
+            # skips mixture.  This second backward is synchronized normally;
+            # no DDP no_sync is used.
             with self._autocast():
                 u_outputs, u_aux = self.model(
                     branch="student_unlabeled",
@@ -489,7 +548,8 @@ class PCHBMPseudoTrainer:
             self.scaler.scale(u_loss).backward()
 
             # 4) Exactly one optimizer step, followed by exact-name EMA and
-            # buffer copy from Student to frozen Teacher.
+            # buffer copy. The Teacher is gradient-frozen; joint updates its
+            # complete state by EMA, while teacher-only leaves PC-HBM intact.
             self.scaler.unscale_(self.optimizer)
             clip_grad_norm_(
                 self.core_model.student.parameters(),
@@ -524,18 +584,27 @@ class PCHBMPseudoTrainer:
             totals["confidence_positive_count"] += float(
                 u_log.get("pseudo_conf_positive_count", 0.0)
             )
+            for name in (
+                "L_u_feat_p1_B1",
+                "L_u_feat_p1_G1",
+                "L_u_feat_p1_R1",
+                "L_u_feat_p1_O1",
+                "L_u_feat_p1_R_sup",
+                "L_u_feat_p1",
+            ):
+                totals[name] += float(u_log.get(name, 0.0))
             steps += 1
             progress.set_postfix(
                 loss=f"{total_value:.4f}",
                 conf=f"{confidence_value:.3e}",
                 hard=f"{float(u_log['L_u_hard']):.3e}",
+                p1=f"{float(u_log.get('L_u_feat_p1', 0.0)):.3e}",
             )
             del u_features, u_outputs, u_aux, pseudo, u_imgs, u_loss, u_log
 
         if steps == 0:
             raise RuntimeError("PC-HBM TS epoch completed without optimizer steps")
-        if module_fingerprint(self.core_model.teacher.pc_hbm) != self._teacher_pc_fingerprint:
-            raise RuntimeError("Frozen Teacher PC-HBM parameters or buffers changed during TS")
+        self._validate_teacher_pc_contract()
         means = {
             name: reduce_mean(value / steps, self.device)
             for name, value in totals.items()
@@ -645,6 +714,12 @@ class PCHBMPseudoTrainer:
                     f">>> TS PC-HBM epoch {epoch}/{self.cfg.epochs}: "
                     f"loss={metrics['loss']:.6f}, confidence={metrics['confidence']:.3e}, "
                     f"L_u_hard={metrics.get('L_u_hard', 0.0):.6f}, "
+                    f"L_u_feat_p1={metrics.get('L_u_feat_p1', 0.0):.6f}, "
+                    f"P1_B1={metrics.get('L_u_feat_p1_B1', 0.0):.3e}, "
+                    f"P1_G1={metrics.get('L_u_feat_p1_G1', 0.0):.3e}, "
+                    f"P1_R1={metrics.get('L_u_feat_p1_R1', 0.0):.3e}, "
+                    f"P1_O1={metrics.get('L_u_feat_p1_O1', 0.0):.3e}, "
+                    f"P1_R_sup={metrics.get('L_u_feat_p1_R_sup', 0.0):.3e}, "
                     f"hard_valid={metrics.get('hard_valid_ratio', 0.0):.3%}, "
                     f"hard_ramp={metrics.get('hard_ramp', 0.0):.3f}, "
                     f"confidence_max={metrics['confidence_max']:.3e}, "

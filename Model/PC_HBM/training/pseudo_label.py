@@ -9,7 +9,17 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from .losses import zero_like_loss
+from .losses import probability_bce, zero_like_loss
+
+
+_P1_DISTILL_FIELDS = (
+    "B1",
+    "G1_raw_map",
+    "R1_map",
+    "O1_map",
+    "R_sup_map",
+    "valid1_map",
+)
 
 
 def build_pc_confidence(aux: Mapping[str, Any], *, strict: bool = True) -> torch.Tensor:
@@ -114,6 +124,18 @@ def prepare_pseudo_targets(
             if not torch.is_tensor(value):
                 raise KeyError(f"teacher_aux['distill_features']['{name}'] is required")
             cloned_features[name] = value.detach().clone()
+        p1_features = distill_features.get("p1")
+        if p1_features is not None:
+            if not isinstance(p1_features, Mapping):
+                raise TypeError("teacher_aux['distill_features']['p1'] must be a mapping")
+            cloned_features["p1"] = {}
+            for name in _P1_DISTILL_FIELDS:
+                value = p1_features.get(name)
+                if not torch.is_tensor(value):
+                    raise KeyError(
+                        f"teacher_aux['distill_features']['p1']['{name}'] is required"
+                    )
+                cloned_features["p1"][name] = value.detach().clone()
 
     return {
         "p_soft": p_soft,
@@ -226,6 +248,169 @@ def confidence_weighted_feature_cosine_loss(
     return (distance * weight).sum() / weight.sum().clamp_min(eps)
 
 
+def confidence_weighted_probability_bce(
+    student_probability: torch.Tensor,
+    teacher_probability: torch.Tensor,
+    confidence: torch.Tensor,
+    eps: float = 1.0e-6,
+) -> torch.Tensor:
+    """AMP-safe probability BCE normalized by real confidence weight."""
+
+    _validate_distill_map_pair(
+        student_probability,
+        teacher_probability,
+        name="P1 boundary",
+    )
+    if student_probability.shape[1] != 1:
+        raise ValueError("P1 boundary probability must have exactly one channel")
+    weight = _resize_confidence(
+        confidence,
+        student_probability,
+        name="P1 boundary confidence",
+    )
+    per_element = probability_bce(
+        student_probability,
+        teacher_probability.detach(),
+        reduction="none",
+    )
+    weight = weight.to(device=per_element.device, dtype=per_element.dtype)
+    return (per_element * weight).sum() / weight.sum().clamp_min(eps)
+
+
+def confidence_weighted_smooth_l1_loss(
+    student_map: torch.Tensor,
+    teacher_map: torch.Tensor,
+    confidence: torch.Tensor,
+    student_valid: torch.Tensor,
+    teacher_valid: torch.Tensor,
+    eps: float = 1.0e-6,
+) -> torch.Tensor:
+    """FP32 Smooth-L1 on the Teacher/Student valid-query intersection."""
+
+    _validate_distill_map_pair(student_map, teacher_map, name="P1 correction")
+    weight = _resize_confidence(
+        confidence,
+        student_map,
+        name="P1 correction confidence",
+    )
+    student_valid = _resize_valid_map(student_valid, student_map, "Student valid1_map")
+    teacher_valid = _resize_valid_map(teacher_valid, student_map, "Teacher valid1_map")
+    valid_intersection = (student_valid > 0.5) & (teacher_valid > 0.5)
+    weight = weight * valid_intersection.to(dtype=weight.dtype)
+
+    with torch.autocast(device_type=student_map.device.type, enabled=False):
+        per_element = F.smooth_l1_loss(
+            student_map.float(),
+            teacher_map.detach().to(device=student_map.device, dtype=torch.float32),
+            reduction="none",
+        )
+        expanded_weight = weight.float().expand(
+            -1, student_map.shape[1], -1, -1
+        )
+        return (per_element * expanded_weight).sum() / expanded_weight.sum().clamp_min(eps)
+
+
+def _validate_distill_map_pair(
+    student: torch.Tensor,
+    teacher: torch.Tensor,
+    *,
+    name: str,
+) -> None:
+    if not torch.is_tensor(student) or not torch.is_tensor(teacher):
+        raise TypeError(f"{name} Student and Teacher values must be tensors")
+    if student.ndim != 4 or teacher.ndim != 4:
+        raise ValueError(f"{name} Student and Teacher values must be [B,C,H,W]")
+    if student.shape != teacher.shape:
+        raise ValueError(
+            f"{name} Student/Teacher shapes must match, got "
+            f"{tuple(student.shape)} and {tuple(teacher.shape)}"
+        )
+    if not student.is_floating_point() or not teacher.is_floating_point():
+        raise TypeError(f"{name} Student and Teacher values must be floating point")
+
+
+def _resize_confidence(
+    confidence: torch.Tensor,
+    reference: torch.Tensor,
+    *,
+    name: str,
+) -> torch.Tensor:
+    if not torch.is_tensor(confidence):
+        raise TypeError(f"{name} must be a tensor")
+    if confidence.ndim != 4 or confidence.shape[1] != 1:
+        raise ValueError(f"{name} must have shape [B,1,H,W]")
+    if confidence.shape[0] != reference.shape[0]:
+        raise ValueError(f"{name} batch dimension must match the distillation map")
+    weight = confidence.detach().float().to(reference.device)
+    if weight.shape[-2:] != reference.shape[-2:]:
+        weight = F.interpolate(
+            weight,
+            size=reference.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+    return weight.clamp(0.0, 1.0)
+
+
+def _resize_valid_map(
+    valid: torch.Tensor,
+    reference: torch.Tensor,
+    name: str,
+) -> torch.Tensor:
+    if not torch.is_tensor(valid):
+        raise TypeError(f"{name} must be a tensor")
+    if valid.ndim != 4 or valid.shape[1] != 1:
+        raise ValueError(f"{name} must have shape [B,1,H,W]")
+    if valid.shape[0] != reference.shape[0]:
+        raise ValueError(f"{name} batch dimension must match the distillation map")
+    valid = valid.detach().float().to(reference.device)
+    if valid.shape[-2:] != reference.shape[-2:]:
+        valid = F.interpolate(valid, size=reference.shape[-2:], mode="nearest")
+    return valid
+
+
+def _p1_distillation_losses(
+    student_p1: Mapping[str, Any],
+    teacher_p1: Mapping[str, Any],
+    confidence: torch.Tensor,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    if not isinstance(student_p1, Mapping) or not isinstance(teacher_p1, Mapping):
+        raise KeyError(
+            "student_core P1 distillation requires Student aux['p1_pra'] and "
+            "Teacher features['p1'] mappings"
+        )
+    missing_student = [name for name in _P1_DISTILL_FIELDS if not torch.is_tensor(student_p1.get(name))]
+    missing_teacher = [name for name in _P1_DISTILL_FIELDS if not torch.is_tensor(teacher_p1.get(name))]
+    if missing_student or missing_teacher:
+        raise KeyError(
+            "student_core P1 distillation is missing "
+            f"Student={missing_student}, Teacher={missing_teacher}"
+        )
+
+    valid_student = student_p1["valid1_map"]
+    valid_teacher = teacher_p1["valid1_map"]
+    terms = {
+        "B1": confidence_weighted_probability_bce(
+            student_p1["B1"], teacher_p1["B1"], confidence
+        ),
+    }
+    for log_name, field_name in (
+        ("G1_raw", "G1_raw_map"),
+        ("R1", "R1_map"),
+        ("O1", "O1_map"),
+        ("R_sup", "R_sup_map"),
+    ):
+        terms[log_name] = confidence_weighted_smooth_l1_loss(
+            student_p1[field_name],
+            teacher_p1[field_name],
+            confidence,
+            valid_student,
+            valid_teacher,
+        )
+    total = sum(terms.values()) / float(len(terms))
+    return total, terms
+
+
 def pc_unlabeled_loss(
     outputs: Sequence[torch.Tensor],
     aux: Mapping[str, Any],
@@ -234,9 +419,9 @@ def pc_unlabeled_loss(
     epoch: int,
     config: Any,
     *,
-    teacher_features: Mapping[str, torch.Tensor] | None = None,
+    teacher_features: Mapping[str, Any] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Supervise raw Student logits and optional P3/P2 raw features."""
+    """Supervise Student logits and mode-specific P3/P2/P1 features."""
 
     if not isinstance(outputs, (tuple, list)) or len(outputs) != 5:
         raise ValueError("Student outputs must be (m4, m3, m2, z_main, global_logit)")
@@ -292,14 +477,41 @@ def pc_unlabeled_loss(
 
     l_feat_p3 = zero
     l_feat_p2 = zero
+    l_feat_p1 = zero
+    p1_terms = {
+        "B1": zero,
+        "G1": zero,
+        "R1": zero,
+        "O1": zero,
+        "R_sup": zero,
+    }
     if teacher_features is not None:
         if not isinstance(teacher_features, Mapping):
             raise TypeError("teacher_features must be a mapping")
-        student_features = aux.get("features")
-        if not isinstance(student_features, Mapping):
-            raise KeyError("Student aux['features'] is required for feature distillation")
-        p3_student = student_features.get("p3")
-        p2_student = student_features.get("p2")
+        student_mode = str(aux.get("forward_mode", "off"))
+        if student_mode == "off":
+            student_features = aux.get("features")
+            if not isinstance(student_features, Mapping):
+                raise KeyError(
+                    "off-mode Student aux['features'] is required for feature distillation"
+                )
+            p3_student = student_features.get("p3")
+            p2_student = student_features.get("p2")
+        elif student_mode == "student_core":
+            student_pc = aux.get("pc_hbm")
+            student_p2 = aux.get("p2_bra")
+            if not isinstance(student_pc, Mapping) or not isinstance(student_p2, Mapping):
+                raise KeyError(
+                    "student_core distillation requires Student aux['pc_hbm'] and "
+                    "aux['p2_bra'] mappings"
+                )
+            p3_student = student_pc.get("p3_corr")
+            p2_student = student_p2.get("p2_refined")
+        else:
+            raise ValueError(
+                "Feature distillation supports only off or student_core Student mode, "
+                f"got {student_mode!r}"
+            )
         p3_teacher = teacher_features.get("p3_corr")
         p2_teacher = teacher_features.get("p2_refined")
         if not all(torch.is_tensor(value) for value in (p3_student, p2_student, p3_teacher, p2_teacher)):
@@ -310,10 +522,30 @@ def pc_unlabeled_loss(
         l_feat_p2 = confidence_weighted_feature_cosine_loss(
             p2_student, p2_teacher, confidence
         )
+        if student_mode == "student_core":
+            l_feat_p1, raw_p1_terms = _p1_distillation_losses(
+                aux.get("p1_pra"),
+                teacher_features.get("p1"),
+                confidence,
+            )
+            p1_terms = {
+                "B1": raw_p1_terms["B1"],
+                "G1": raw_p1_terms["G1_raw"],
+                "R1": raw_p1_terms["R1"],
+                "O1": raw_p1_terms["O1"],
+                "R_sup": raw_p1_terms["R_sup"],
+            }
 
     p3_weight = float(getattr(config, "feature_distill_p3_weight", 0.05))
     p2_weight = float(getattr(config, "feature_distill_p2_weight", 0.10))
-    l_feature = p3_weight * l_feat_p3 + p2_weight * l_feat_p2
+    p1_weight = float(getattr(config, "feature_distill_p1_weight", 0.05))
+    if p3_weight < 0.0 or p2_weight < 0.0 or p1_weight < 0.0:
+        raise ValueError("Feature distillation weights must be non-negative")
+    l_feature = (
+        p3_weight * l_feat_p3
+        + p2_weight * l_feat_p2
+        + p1_weight * l_feat_p1
+    )
     hard_loss_weight = float(getattr(config, "hard_loss_weight", 2.0))
     if hard_loss_weight < 0.0:
         raise ValueError("hard_loss_weight must be non-negative")
@@ -328,6 +560,12 @@ def pc_unlabeled_loss(
         "L_u_side": l_side.detach(),
         "L_u_feat_p3": l_feat_p3.detach(),
         "L_u_feat_p2": l_feat_p2.detach(),
+        "L_u_feat_p1_B1": p1_terms["B1"].detach(),
+        "L_u_feat_p1_G1": p1_terms["G1"].detach(),
+        "L_u_feat_p1_R1": p1_terms["R1"].detach(),
+        "L_u_feat_p1_O1": p1_terms["O1"].detach(),
+        "L_u_feat_p1_R_sup": p1_terms["R_sup"].detach(),
+        "L_u_feat_p1": l_feat_p1.detach(),
         "L_u_feature": l_feature.detach(),
         "hard_ramp": z_student.new_tensor(hard_ramp).detach(),
         "hard_valid_ratio": hard_targets["hard_valid"]
@@ -351,7 +589,7 @@ def compute_pc_hbm_unlabeled_loss(
     epoch: int,
     outputs: Sequence[torch.Tensor] | None = None,
     *,
-    teacher_features: Mapping[str, torch.Tensor] | None = None,
+    teacher_features: Mapping[str, Any] | None = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Reference-name wrapper; ``outputs`` is required for side supervision."""
 
@@ -387,6 +625,8 @@ def _nested_get(mapping, key, default=None):
 __all__ = [
     "build_pc_confidence",
     "confidence_weighted_feature_cosine_loss",
+    "confidence_weighted_probability_bce",
+    "confidence_weighted_smooth_l1_loss",
     "compute_pc_hbm_unlabeled_loss",
     "pc_unlabeled_loss",
     "prepare_pseudo_targets",

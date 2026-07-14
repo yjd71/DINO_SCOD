@@ -256,6 +256,23 @@ def assert_decoder_group_received_gradients(
         raise AssertionError(f"{name} received non-finite gradients")
 
 
+def assert_p1_distillation_gradients(decoder: Decoder) -> None:
+    """Require every trainable P1-PRA output family to receive a finite grad."""
+
+    p1 = decoder.pc_hbm.p1_pra
+    groups = {
+        "P1 query projection": p1.q_proj,
+        "P1 key projection": p1.k_proj,
+        "P1 value projection": p1.v_proj,
+        "P1 gate head": p1.g_head,
+        "P1 residual head": p1.r_head,
+        "P1 offset head": p1.o_head,
+        "P1 suppression head": p1.sup_head,
+    }
+    for name, module in groups.items():
+        assert_module_received_gradients(module, name)
+
+
 def peak_gib() -> float:
     torch.cuda.synchronize()
     return torch.cuda.max_memory_allocated() / (1024 ** 3)
@@ -295,7 +312,14 @@ def run_training_scenario(
         if not aux.get("pc_active", False):
             raise AssertionError(f"{label}: PC path unexpectedly inactive: {aux.get('fallback_reason')}")
         if pc_mode == "student_core" and not aux.get("mixture_skipped", False):
-            raise AssertionError("Student core must skip P1/mixture")
+            raise AssertionError("Student core must skip mixture")
+        if pc_mode == "full":
+            if not isinstance(aux.get("p1_pra"), dict):
+                raise AssertionError(f"{label}: full mode did not execute P1-PRA")
+            if not isinstance(aux.get("mixture"), dict):
+                raise AssertionError(f"{label}: full mode did not execute mixture")
+            if not all(torch.is_tensor(aux.get(name)) for name in ("z_final", "p_final")):
+                raise AssertionError(f"{label}: full mode is missing final prediction tensors")
         loss, metrics = real_training_loss(
             outputs,
             aux,
@@ -374,6 +398,103 @@ def _raw_student_from_enhancer(model: BaseModel) -> Decoder:
         strict=True,
     )
     return student.cuda()
+
+
+def _joint_student_from_enhancer(
+    model: BaseModel,
+    config: DinoPCHBMConfig,
+) -> Decoder:
+    student = Decoder(pc_cfg=config)
+    student.load_state_dict(model.decoder.state_dict(), strict=True)
+    return student.cuda()
+
+
+def _clone_joint_teacher_target_aux(aux: dict[str, Any]) -> dict[str, Any]:
+    """Mirror the joint Trainer target schema outside ``inference_mode``."""
+
+    pc = aux.get("pc_hbm", {}) or {}
+    mixture = aux.get("mixture", {}) or {}
+    distill = aux.get("distill_features", {}) or {}
+    p1 = aux.get("p1_pra", {}) or {}
+
+    def clone_tensor(value: Any, name: str) -> torch.Tensor:
+        if not torch.is_tensor(value):
+            raise AssertionError(f"Joint Teacher aux is missing {name}")
+        cloned = value.detach().clone()
+        if cloned.is_inference():
+            raise AssertionError(f"Joint Teacher target {name} remained an inference tensor")
+        if not torch.isfinite(cloned).all():
+            raise AssertionError(f"Joint Teacher target {name} contains non-finite values")
+        return cloned
+
+    return {
+        "p_final": clone_tensor(aux.get("p_final"), "p_final"),
+        "z_main": clone_tensor(aux.get("z_main"), "z_main"),
+        "pc_hbm": {
+            "C23_map": clone_tensor(pc.get("C23_map"), "pc_hbm.C23_map"),
+            "route_entropy_norm": clone_tensor(
+                pc.get("route_entropy_norm"), "pc_hbm.route_entropy_norm"
+            ),
+        },
+        "mixture": {"pi": clone_tensor(mixture.get("pi"), "mixture.pi")},
+        "distill_features": {
+            "p3_corr": clone_tensor(
+                distill.get("p3_corr"), "distill_features.p3_corr"
+            ),
+            "p2_refined": clone_tensor(
+                distill.get("p2_refined"), "distill_features.p2_refined"
+            ),
+            "p1": {
+                name: clone_tensor(p1.get(name), f"p1_pra.{name}")
+                for name in (
+                    "B1",
+                    "G1_raw_map",
+                    "R1_map",
+                    "O1_map",
+                    "R_sup_map",
+                    "valid1_map",
+                )
+            },
+        },
+    }
+
+
+def _prime_joint_student_p1_heads(student: Decoder) -> None:
+    """Emulate a warmed P1 enhancer so gradients propagate through q/k/v."""
+
+    p1 = student.pc_hbm.p1_pra
+    with torch.no_grad():
+        for index, head in enumerate((p1.g_head, p1.r_head, p1.o_head, p1.sup_head), 1):
+            head.weight.normal_(mean=0.0, std=1.0e-2)
+            if head.bias is not None:
+                head.bias.fill_(float(index) * 1.0e-2)
+
+
+def _assert_student_core_p1_contract(outputs, aux: dict[str, Any]) -> None:
+    if aux.get("forward_mode") != "student_core":
+        raise AssertionError("Joint unlabeled Student did not run student_core")
+    if not isinstance(aux.get("p1_pra"), dict):
+        raise AssertionError("student_core did not execute P1-PRA")
+    if aux.get("mixture") is not None or not aux.get("mixture_skipped", False):
+        raise AssertionError("student_core must skip Adaptive Mixture")
+    if aux.get("z_final") is not None or aux.get("p_final") is not None:
+        raise AssertionError("student_core main supervision must not expose z_final/p_final")
+    if outputs[3].shape != aux["z_main"].shape:
+        raise AssertionError("student_core outputs[3] must remain the z_main prediction")
+    for branch, fields in (
+        ("pc_hbm", ("p3_corr",)),
+        ("p2_bra", ("p2_refined",)),
+        (
+            "p1_pra",
+            ("B1", "G1_raw_map", "R1_map", "O1_map", "R_sup_map", "valid1_map"),
+        ),
+    ):
+        values = aux.get(branch)
+        if not isinstance(values, dict):
+            raise AssertionError(f"student_core aux is missing {branch}")
+        missing = [name for name in fields if not torch.is_tensor(values.get(name))]
+        if missing:
+            raise AssertionError(f"student_core aux {branch} is missing {missing}")
 
 
 def run_raw_student_labeled_scenario(
@@ -458,6 +579,134 @@ def run_raw_student_unlabeled_scenario(
     return peak
 
 
+def run_joint_student_labeled_scenario(
+    model: BaseModel,
+    memory: PCMemory,
+    config: DinoPCHBMConfig,
+) -> float:
+    student = _joint_student_from_enhancer(model, config)
+    try:
+        return run_training_scenario(
+            "student labeled joint",
+            student,
+            model,
+            memory,
+            config,
+            batch_size=BATCH_STUDENT_LABELED,
+            pc_mode="full",
+            epoch=30,
+        )
+    finally:
+        del student
+        release()
+
+
+def run_joint_student_unlabeled_scenario(
+    model: BaseModel,
+    memory: PCMemory,
+    config: DinoPCHBMConfig,
+) -> float:
+    """Run corrected-to-corrected P3/P2/P1 distillation at physical batch 32."""
+
+    teacher = Decoder(pc_cfg=config)
+    teacher.load_state_dict(model.decoder.state_dict(), strict=True)
+    teacher.requires_grad_(False).eval().cuda()
+    torch.cuda.reset_peak_memory_stats()
+    features = extract_features(model, BATCH_STUDENT_UNLABELED, config)
+    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16):
+        _, teacher_aux = teacher(
+            features,
+            memory=memory,
+            pc_mode="teacher_pseudo",
+            epoch=30,
+            return_aux=True,
+        )
+        if not isinstance(teacher_aux.get("p1_pra"), dict):
+            raise AssertionError("Joint Teacher did not execute P1-PRA")
+        if not isinstance(teacher_aux.get("mixture"), dict):
+            raise AssertionError("Joint Teacher did not execute Adaptive Mixture")
+
+    # Clone only after leaving inference_mode, exactly as the real Trainer does.
+    teacher_target_aux = _clone_joint_teacher_target_aux(teacher_aux)
+    del teacher_aux, teacher
+    release()
+    pseudo = prepare_pseudo_targets(teacher_target_aux, config, strict=True)
+    del teacher_target_aux
+    confidence = pseudo["confidence"]
+    if not torch.isfinite(confidence).all():
+        raise AssertionError("Joint Teacher confidence contains non-finite values")
+    if not bool((confidence > 0).any()):
+        raise AssertionError("Joint Teacher confidence has no positive pixels")
+    teacher_features = pseudo.get("distill_features")
+    if not isinstance(teacher_features, dict) or not isinstance(
+        teacher_features.get("p1"), dict
+    ):
+        raise AssertionError("Joint pseudo target is missing nested teacher_features['p1']")
+
+    student = _joint_student_from_enhancer(model, config).train()
+    _prime_joint_student_p1_heads(student)
+    student.zero_grad(set_to_none=True)
+    with torch.autocast(device_type="cuda", dtype=torch.float16):
+        outputs, student_aux = student(
+            features,
+            memory=memory,
+            pc_mode="student_core",
+            epoch=30,
+            return_aux=True,
+        )
+        if not student_aux.get("pc_active", False):
+            raise AssertionError(
+                "Joint Student PC path unexpectedly inactive: "
+                f"{student_aux.get('fallback_reason')}"
+            )
+        _assert_student_core_p1_contract(outputs, student_aux)
+        loss, metrics = pc_unlabeled_loss(
+            outputs,
+            student_aux,
+            pseudo["p_soft"],
+            confidence,
+            epoch=1,
+            config=config,
+            teacher_features=teacher_features,
+        )
+    if not torch.isfinite(loss):
+        raise AssertionError("Joint Student unlabeled loss is non-finite")
+    loss.backward()
+    assert_finite_gradients(student)
+    assert_p1_distillation_gradients(student)
+    for name in (
+        "L_u_soft",
+        "L_u_hard",
+        "L_u_side",
+        "L_u_feat_p3",
+        "L_u_feat_p2",
+        "L_u_feat_p1_B1",
+        "L_u_feat_p1_G1",
+        "L_u_feat_p1_R1",
+        "L_u_feat_p1_O1",
+        "L_u_feat_p1_R_sup",
+        "L_u_feat_p1",
+        "L_u_feature",
+        "pseudo_conf_mean",
+        "pseudo_conf_max",
+    ):
+        value = metrics.get(name)
+        if not torch.is_tensor(value) or not torch.isfinite(value):
+            raise AssertionError(f"Missing or non-finite joint unlabeled metric: {name}")
+    if not bool(metrics["L_u_feat_p1"] > 0):
+        raise AssertionError("Joint P1 distillation did not produce a positive loss")
+
+    peak = peak_gib()
+    del loss, metrics, outputs, student_aux, teacher_features, confidence, pseudo
+    del features, student
+    release()
+    print(
+        f"[PASS] student unlabeled joint: batch={BATCH_STUDENT_UNLABELED}, "
+        f"mode=student_core+P1/no-mixture, peak={peak:.2f} GiB"
+    )
+    return peak
+
+
 def run_attempt(name: str, overrides: dict[str, int], seed: int) -> dict[str, float]:
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -479,6 +728,12 @@ def run_attempt(name: str, overrides: dict[str, int], seed: int) -> dict[str, fl
         "teacher_b32": run_teacher_scenario(model, memory, config),
         "student_labeled_raw_b32": run_raw_student_labeled_scenario(model, config),
         "student_unlabeled_raw_b32": run_raw_student_unlabeled_scenario(
+            model, memory, config
+        ),
+        "student_labeled_joint_b32": run_joint_student_labeled_scenario(
+            model, memory, config
+        ),
+        "student_unlabeled_joint_b32": run_joint_student_unlabeled_scenario(
             model, memory, config
         ),
     }
