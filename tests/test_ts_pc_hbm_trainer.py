@@ -169,10 +169,10 @@ def test_train_prints_start_and_end_time_for_every_epoch(monkeypatch, capsys):
 
     timestamps = iter(
         (
-            "2026-07-13T01:00:00+08:00",
-            "2026-07-13T01:05:00+08:00",
-            "2026-07-13T01:05:01+08:00",
-            "2026-07-13T01:10:00+08:00",
+            "07-13 01:00:00",
+            "07-13 01:05:00",
+            "07-13 01:05:01",
+            "07-13 01:10:00",
         )
     )
     monkeypatch.setattr(ts_trainer, "_current_local_timestamp", lambda: next(timestamps))
@@ -182,12 +182,12 @@ def test_train_prints_start_and_end_time_for_every_epoch(monkeypatch, capsys):
     trainer.train()
 
     output = capsys.readouterr().out
-    assert "epoch 1/2: start_time=2026-07-13T01:00:00+08:00" in output
+    assert "epoch 1/2: start_time=07-13 01:00:00" in output
     assert "epoch 1/2: loss=1.250000" in output
-    assert "end_time=2026-07-13T01:05:00+08:00" in output
-    assert "epoch 2/2: start_time=2026-07-13T01:05:01+08:00" in output
+    assert "end_time=07-13 01:05:00" in output
+    assert "epoch 2/2: start_time=07-13 01:05:01" in output
     assert "epoch 2/2: loss=1.250000" in output
-    assert "end_time=2026-07-13T01:10:00+08:00" in output
+    assert "end_time=07-13 01:10:00" in output
 
 
 def test_ts_resume_rejects_missing_or_different_pc_config():
@@ -252,21 +252,20 @@ def test_wrap_distributed_keeps_legacy_false_default(monkeypatch):
     assert captured["find_unused_parameters"] is False
 
 
-def test_ts_cli_defaults_to_teacher_only_and_accepts_teacher_alias(monkeypatch):
+def test_ts_cli_defaults_to_teacher_only_and_sampled_images_fallback(monkeypatch):
     monkeypatch.setattr(
         "sys.argv",
         [
             "train_ts_model_pseudo_pc_hbm.py",
             "--teacher-pc-checkpoint",
             "teacher.pth",
-            "--labeled-indices-pt",
-            "split.pt",
         ],
     )
     args = parse_args()
     validate_training_args(args)
     assert args.training_design == "teacher_only"
     assert args.teacher_pc_checkpoint == "teacher.pth"
+    assert args.labeled_indices_pt is None
 
 
 def test_ts_cli_keeps_base_pc_checkpoint_as_alias(monkeypatch):
@@ -286,14 +285,6 @@ def test_ts_cli_keeps_base_pc_checkpoint_as_alias(monkeypatch):
 @pytest.mark.parametrize(
     "args, message",
     [
-        (
-            SimpleNamespace(
-                training_design="teacher_only",
-                labeled_indices_pt=None,
-                allow_legacy_pc_init=False,
-            ),
-            "labeled-indices-pt",
-        ),
         (
             SimpleNamespace(
                 training_design="teacher_only",

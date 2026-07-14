@@ -12,7 +12,6 @@ import os
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -47,15 +46,12 @@ from utils.checkpoint_pc_hbm import (
 )
 from utils.dataloader import PCLabeledTrainDataset
 from utils.distributed import is_main_process, reduce_mean, synchronize, unwrap_model
+from utils.logging_utils import current_time
 from utils.pc_memory_runner import (
     build_labeled_memory_loader,
     build_memory_compat_meta,
     rebuild_memory,
 )
-
-
-def current_time() -> str:
-    return datetime.now().strftime("%m-%d %H:%M:%S")
 
 
 def configure_teacher_only_trainability(model: nn.Module) -> tuple[str, ...]:
@@ -441,7 +437,8 @@ class BasePCHBMTrainer:
                     if self._is_scalar(value)
                 }
                 print(
-                    f"[Base PC-HBM] epoch={epoch} mode={mode} iteration={iteration} "
+                    f"{current_time()} [Base PC-HBM] epoch={epoch} mode={mode} "
+                    f"iteration={iteration} "
                     + self._format_metrics(printable)
                 )
 
@@ -462,7 +459,8 @@ class BasePCHBMTrainer:
         self._save_epoch(epoch, epoch_metrics)
         if is_main_process():
             print(
-                f"[Base PC-HBM Epoch] epoch={epoch} mode={mode} lr={used_lr:.8g} "
+                f"{current_time()} [Base PC-HBM Epoch] epoch={epoch} mode={mode} "
+                f"lr={used_lr:.8g} "
                 + self._format_metrics(epoch_metrics)
             )
         synchronize()
@@ -475,7 +473,7 @@ class BasePCHBMTrainer:
                 if self.labeled_train_set is not None
                 else "injected-loader"
             )
-            print(f"<<< Start Base PC-HBM training; labeled={sample_count}")
+            print(f"{current_time()} <<< Start Base PC-HBM training; labeled={sample_count}")
         while self.current_epoch <= int(self.cfg.epochs):
             epoch = self.current_epoch
             if self.labeled_sampler is not None:
@@ -486,7 +484,7 @@ class BasePCHBMTrainer:
         if self.training_design in {"teacher_only", "two_stage"}:
             self._finalize_teacher_enhancer()
         if is_main_process():
-            print("<<< Base PC-HBM training finished")
+            print(f"{current_time()} <<< Base PC-HBM training finished")
 
     def resume(self, path: str | os.PathLike, *, restore_rng: bool = True) -> dict[str, Any]:
         checkpoint = load_training_resume(

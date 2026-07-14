@@ -13,6 +13,7 @@ from contextlib import nullcontext
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from Model.PC_HBM.memory.pc_memory import PCMemory
 from utils.checkpoint_pc_hbm import load_decoder_compatible, load_memory_checkpoint
+from utils.logging_utils import current_time
 from utils.pc_memory_runner import module_fingerprint
 
 
@@ -237,6 +238,7 @@ if __name__ == '__main__':
         ),
     )
     model.to(cfg.device)
+    print(f'{current_time()} >>> Inference started')
     inference(
         args.datasets,
         model,
@@ -248,3 +250,4 @@ if __name__ == '__main__':
         num_workers=args.num_workers,
         amp=args.amp,
     )
+    print(f'{current_time()} >>> Inference finished; predictions saved to: {args.pred_root}')

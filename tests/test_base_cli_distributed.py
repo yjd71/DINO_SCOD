@@ -1,14 +1,22 @@
+import re
 import sys
 
 import pytest
+import torch
 
 import train_base_model_pc_hbm as base_entrypoint
 from utils import distributed
+from utils.dataloader import _load_sample_keys
+from utils.logging_utils import current_time
 
 
 def _parse_args(monkeypatch, *args):
     monkeypatch.setattr(sys, "argv", ["train_base_model_pc_hbm.py", *args])
     return base_entrypoint.parse_args()
+
+
+def test_log_time_uses_month_day_clock_format():
+    assert re.fullmatch(r"\d{2}-\d{2} \d{2}:\d{2}:\d{2}", current_time())
 
 
 def test_base_batch_size_defaults_to_config_value(monkeypatch):
@@ -21,6 +29,62 @@ def test_base_batch_size_is_explicitly_per_rank(monkeypatch):
     args = _parse_args(monkeypatch, "--batch-size", "16")
 
     assert args.batch_size == 16
+
+
+def test_two_stage_allows_sampled_images_fallback(monkeypatch):
+    args = _parse_args(monkeypatch)
+
+    assert args.training_design == "two_stage"
+    assert args.labeled_indices_pt is None
+    base_entrypoint.validate_training_args(args)
+
+
+def test_teacher_only_allows_sampled_images_fallback_with_baseline(monkeypatch):
+    args = _parse_args(
+        monkeypatch,
+        "--training-design",
+        "teacher_only",
+        "--baseline-checkpoint",
+        "baseline_decoder.pth",
+    )
+
+    assert args.labeled_indices_pt is None
+    base_entrypoint.validate_training_args(args)
+
+
+def test_teacher_only_still_requires_baseline_checkpoint(monkeypatch):
+    args = _parse_args(monkeypatch, "--training-design", "teacher_only")
+
+    with pytest.raises(ValueError, match="baseline-checkpoint"):
+        base_entrypoint.validate_training_args(args)
+
+
+def test_labeled_selection_falls_back_to_sampled_txt(tmp_path):
+    items = [
+        {"key": "TR-CAMO/camo_001", "stem": "camo_001"},
+        {"key": "TR-COD10K/cod10k_001", "stem": "cod10k_001"},
+    ]
+    sampled_txt = tmp_path / "sampled_images.txt"
+    sampled_txt.write_text("TR-CAMO/camo_001\n", encoding="utf-8")
+
+    selected = _load_sample_keys(str(sampled_txt), None, items)
+
+    assert selected == {"TR-CAMO/camo_001"}
+
+
+def test_labeled_indices_pt_overrides_sampled_txt(tmp_path):
+    items = [
+        {"key": "TR-CAMO/camo_001", "stem": "camo_001"},
+        {"key": "TR-COD10K/cod10k_001", "stem": "cod10k_001"},
+    ]
+    sampled_txt = tmp_path / "sampled_images.txt"
+    sampled_txt.write_text("TR-CAMO/camo_001\n", encoding="utf-8")
+    indices_pt = tmp_path / "labeled_indices.pt"
+    torch.save(["TR-COD10K/cod10k_001"], indices_pt)
+
+    selected = _load_sample_keys(str(sampled_txt), str(indices_pt), items)
+
+    assert selected == {"TR-COD10K/cod10k_001"}
 
 
 @pytest.mark.parametrize("value", ["0", "-1", "not-an-integer"])

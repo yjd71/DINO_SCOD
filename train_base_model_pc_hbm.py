@@ -67,7 +67,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=2025)
     parser.add_argument("--deterministic", action="store_true")
-    parser.add_argument("--labeled-indices-pt", default=None)
+    parser.add_argument(
+        "--labeled-indices-pt",
+        default=None,
+        help=(
+            "Optional stable labeled-key/index file. When omitted, use "
+            "Config.train_sample_txt (by default ./Dataset/COD/sampled_images.txt)."
+        ),
+    )
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument(
         "--batch-size",
@@ -94,10 +101,6 @@ def parse_args() -> argparse.Namespace:
 def validate_training_args(args: argparse.Namespace) -> None:
     """Reject incompatible initialization contracts before model construction."""
 
-    if args.training_design in {"teacher_only", "two_stage"} and not args.labeled_indices_pt:
-        raise ValueError(
-            f"--labeled-indices-pt is required for --training-design {args.training_design}"
-        )
     if args.training_design == "teacher_only":
         if not args.baseline_checkpoint:
             raise ValueError(

@@ -4,6 +4,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import cv2
 from tqdm import tqdm
+from utils.logging_utils import current_time
 from utils.metrics import EvaluationMetricsV2
 import pickle as pkl
 import argparse
@@ -168,7 +169,7 @@ if __name__ == '__main__':
     args = parse_args()
     cfg = Config()
 
-    print(f'Evaluating...')
+    print(f'{current_time()} >>> Evaluating...')
     metric_rows = []
     for dataset in args.datasets:
         metric_dic = evaluate(
@@ -186,4 +187,4 @@ if __name__ == '__main__':
     with open(txt_path, 'w', encoding='utf-8') as f:
         f.write(table_text + '\n')
 
-    print(f'Evaluation results saved to: {txt_path}')
+    print(f'{current_time()} >>> Evaluation results saved to: {txt_path}')

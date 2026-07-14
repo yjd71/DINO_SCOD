@@ -9,7 +9,6 @@ labels back into memory.
 from __future__ import annotations
 
 from dataclasses import asdict, is_dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -49,13 +48,14 @@ from utils.distributed import (
     synchronize,
     unwrap_model,
 )
+from utils.logging_utils import current_time
 from utils.pc_memory_runner import build_memory_compat_meta, module_fingerprint, rebuild_memory
 
 
 def _current_local_timestamp() -> str:
-    """Return an ISO-8601 local timestamp with an explicit UTC offset."""
+    """Return the local timestamp used by the epoch logs."""
 
-    return datetime.now().astimezone().isoformat(timespec="seconds")
+    return current_time()
 
 
 def validate_teacher_enhancer_checkpoint(

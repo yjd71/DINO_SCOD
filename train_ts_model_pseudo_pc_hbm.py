@@ -82,8 +82,6 @@ def parse_args():
 
 def validate_training_args(args) -> None:
     if args.training_design == "teacher_only":
-        if not args.labeled_indices_pt:
-            raise ValueError("teacher_only TS requires --labeled-indices-pt")
         if args.allow_legacy_pc_init:
             raise ValueError("--allow-legacy-pc-init is only valid with --training-design joint")
 

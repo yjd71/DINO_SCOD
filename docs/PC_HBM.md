@@ -17,8 +17,9 @@ Teacher–Student 入口仍使用 `teacher_only` 协议。原始 Base、TS、pse
 - TS 最终导出 `student_raw.pth`，其中没有 `pc_hbm.*`，推理不需要 memory。
 
 标签数据仍用于 PC-HBM 监督和 labeled-only memory，但标签样本的纠正特征和纠正预测
-不会进入 Student 或最终输出。Base 与 TS 必须使用同一个 `--labeled-indices-pt`；
-checkpoint 会验证 stable sample-key split fingerprint。
+不会进入 Student 或最终输出。Base 与 TS 必须使用同一个 labeled split：省略
+`--labeled-indices-pt` 时，两者都读取 `./Dataset/COD/sampled_images.txt`；显式传入 `.pt`
+时，该文件覆盖 txt 选择。checkpoint 会验证 stable sample-key split fingerprint。
 
 ## Base enhancer
 
@@ -26,7 +27,6 @@ PowerShell 单卡：
 
 ```powershell
 conda run -n yjd python train_base_model_pc_hbm.py `
-  --labeled-indices-pt ./data/labeled_indices.pt `
   --output-dir ./results/base_teacher_enhancer `
   --batch-size 16 `
   --epochs 30
@@ -38,7 +38,6 @@ Linux/Bash 双卡：
 conda run -n yjd python -m torch.distributed.run \
   --standalone --nproc_per_node=2 \
   train_base_model_pc_hbm.py \
-  --labeled-indices-pt ./data/labeled_indices.pt \
   --output-dir ./results/base_teacher_enhancer \
   --batch-size 16 \
   --epochs 30
@@ -54,6 +53,9 @@ conda run -n yjd python -m torch.distributed.run \
 该参数只做 warm-start，不会改变 `off → parent_only → full` 的 two-stage 调度，也不会
 在后两阶段冻结 legacy Decoder。
 
+如需用 `.pt` 覆盖默认的 `sampled_images.txt`，请在 Base、TS 和 resume 命令中都追加
+同一个 `--labeled-indices-pt ./data/labeled_indices.pt`。
+
 训练结束后主要产物为：
 
 - `teacher_enhancer.pth`：完整 Teacher Decoder。
@@ -64,7 +66,6 @@ conda run -n yjd python -m torch.distributed.run \
 
 ```bash
 conda run -n yjd python train_base_model_pc_hbm.py \
-  --labeled-indices-pt ./data/labeled_indices.pt \
   --resume ./results/base_teacher_enhancer/training_resume.pth \
   --output-dir ./results/base_teacher_enhancer \
   --batch-size 16 \
@@ -81,7 +82,6 @@ conda run -n yjd python -m torch.distributed.run \
   train_ts_model_pseudo_pc_hbm.py \
   --training-design teacher_only \
   --teacher-pc-checkpoint ./results/base_teacher_enhancer/teacher_enhancer.pth \
-  --labeled-indices-pt ./data/labeled_indices.pt \
   --output-dir ./results/teacher_only_ts \
   --epochs 15
 ```
@@ -96,7 +96,6 @@ TS resume：
 conda run -n yjd python train_ts_model_pseudo_pc_hbm.py \
   --training-design teacher_only \
   --teacher-pc-checkpoint ./results/base_teacher_enhancer/teacher_enhancer.pth \
-  --labeled-indices-pt ./data/labeled_indices.pt \
   --resume ./results/teacher_only_ts/ts_pc_hbm_resume_latest.pth \
   --output-dir ./results/teacher_only_ts \
   --epochs 15
