@@ -139,6 +139,16 @@ The opt-in DINO PC-HBM training, resume, inference, compatibility, and smoke-tes
 commands are documented in [docs/PC_HBM.md](docs/PC_HBM.md). The original RSBL
 entry points remain available.
 
+### PC-BACS offline sampling
+
+The zero-parameter PC-BACS workflow builds a 40-image DINO seed, trains a
+temporary 5-epoch selector, and generates nested 41/202/404 stable-key splits.
+It does not change the model, formal Base/TS training, or inference paths. See
+[docs/PC_BACS.md](docs/PC_BACS.md) for the `yjd` commands, cache contract, and
+artifacts. Existing score caches are refused by default: use `--reuse-scores`
+for fingerprint-validated reuse, or `--rebuild-scores` for an explicit atomic
+replacement.
+
 + Pre-computed Maps: 
    + 1% Training Data: [Google Drive](https://drive.google.com/drive/folders/1Ljd9nxno9qznMyEmQKohbXD8-vRZmAmu?usp=sharing)
    + 5% Training Data: [Google Drive](https://drive.google.com/drive/folders/1tPLR9Jsnymsfv4LvDSCX3rX4_OrQOiJp?usp=sharing)

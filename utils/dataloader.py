@@ -169,6 +169,56 @@ def _collect_masks(mask_roots):
     return masks
 
 
+class SelectionPoolDataset(Dataset):
+    """Deterministic RGB-only dataset for offline PC-BACS selection.
+
+    The selection pool deliberately accepts image roots only.  It never
+    discovers or loads ground-truth masks, SAM labels, or pseudo labels, and
+    applies no random augmentation.
+    """
+
+    def __init__(self, image_roots, image_size=392):
+        self.items = _collect_images(image_roots)
+        if not self.items:
+            raise ValueError('No images found for PC-BACS selection.')
+
+        self.image_size = int(image_size)
+        if self.image_size <= 0:
+            raise ValueError(f'image_size must be positive, got {image_size!r}.')
+
+        self.transform = transforms.Compose([
+            transforms.Resize(
+                (self.image_size, self.image_size),
+                interpolation=InterpolationMode.BILINEAR,
+                antialias=True,
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+        ])
+
+    @property
+    def sample_keys(self):
+        return [item['key'] for item in self.items]
+
+    def __getitem__(self, index):
+        item = self.items[index]
+        image = cv2.imread(item['image'], flags=cv2.IMREAD_COLOR)
+        if image is None:
+            raise FileNotFoundError(
+                f"Failed to read PC-BACS selection image "
+                f"key={item['key']}, path={item['image']}."
+            )
+        image = cv2.cvtColor(image, code=cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(image, mode='RGB')
+        return item['key'], self.transform(image)
+
+    def __len__(self):
+        return len(self.items)
+
+
 class LabeledTrainDataset(Dataset):
     def __init__(self, l_image_root,  # file path: string, Original RGB Images
                        l_gt_root,  # file path: string, GT Annotations

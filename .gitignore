@@ -6,6 +6,11 @@ tests
 !tests/
 tests/*
 !tests/test_pc_hbm_shapes.py
+!tests/test_pc_bacs_score.py
+!tests/test_pc_bacs_selection.py
+!tests/test_pc_bacs_dataset.py
+!tests/test_pc_bacs_checkpoint_cli.py
+!tests/pc_bacs_smoke.py
 ./cache
 .git
 .agents
