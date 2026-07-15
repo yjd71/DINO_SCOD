@@ -11,6 +11,13 @@ tests/*
 !tests/test_pc_bacs_dataset.py
 !tests/test_pc_bacs_checkpoint_cli.py
 !tests/pc_bacs_smoke.py
+!tests/test_sampling_protocol.py
+!tests/test_bootstrap_split.py
+!tests/test_kmeans_sampling.py
+!tests/test_pc_bpus_score.py
+!tests/test_pc_bpus_prototype.py
+!tests/test_pc_bpus_greedy.py
+!tests/test_pc_bpus_cli.py
 ./cache
 .git
 .agents

@@ -22,6 +22,7 @@ from torch.utils.data import DataLoader, Dataset, Subset
 
 from configs.pc_bacs_config import PCBACSConfig
 from Model.base_model import BaseModel
+from selection.protocol import SamplingProtocol
 from utils.checkpoint_pc_hbm import (
     compute_labeled_split_fingerprint,
     extract_non_pc_decoder_state,
@@ -96,7 +97,17 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     parser.add_argument("--n-clusters", type=int, default=40)
     parser.add_argument(
-        "--target-counts", nargs="+", type=int, default=[41, 202, 404]
+        "--target-counts", nargs=3, type=int, required=True,
+        metavar=("SMALL", "MEDIUM", "LARGE"),
+    )
+    parser.add_argument(
+        "--seed-mode",
+        choices=("legacy-kmeans", "external-bootstrap"),
+        required=True,
+        help=(
+            "legacy-kmeans requires the seed split to equal the deterministic "
+            "KMeans centers; external-bootstrap accepts the shared bootstrap split."
+        ),
     )
     parser.add_argument("--dedup-threshold", type=float, default=0.98)
     parser.add_argument("--seed", type=int, default=2025)
@@ -273,6 +284,10 @@ def _validate_args(args: argparse.Namespace, config: PCBACSConfig) -> None:
             f"The repository DINO weight is missing: {DINO_WEIGHT_PATH}"
         )
     if args.build_seed_only:
+        if args.seed_mode != "legacy-kmeans":
+            raise ValueError(
+                "--build-seed-only is available only with --seed-mode legacy-kmeans."
+            )
         if args.selector_checkpoint is not None:
             raise ValueError("--build-seed-only does not accept a selector checkpoint.")
     elif args.convert_split_only:
@@ -781,6 +796,29 @@ def _require_kmeans_center_seed(
         )
 
 
+def _expected_seed_count(
+    *, seed_mode: str, n_clusters: int, protocol: SamplingProtocol
+) -> int:
+    if seed_mode == "legacy-kmeans":
+        return int(n_clusters)
+    if seed_mode == "external-bootstrap":
+        return int(protocol.bootstrap_count)
+    raise ValueError(f"Unsupported seed mode: {seed_mode}")
+
+
+def _validate_seed_for_mode(
+    seed_keys: Sequence[str],
+    center_seed_keys: Sequence[str],
+    *,
+    seed_mode: str,
+    label: str,
+) -> None:
+    if seed_mode == "legacy-kmeans":
+        _require_kmeans_center_seed(seed_keys, center_seed_keys, label=label)
+    elif seed_mode != "external-bootstrap":
+        raise ValueError(f"Unsupported seed mode: {seed_mode}")
+
+
 def _save_csv(
     path: Path,
     *,
@@ -887,11 +925,15 @@ def _dry_run_report(
     print(f"  selector checkpoint: {args.selector_checkpoint}")
     print(f"  output directory: {args.output_dir}")
     print(f"  target counts: {args.target_counts}")
+    print(f"  seed mode: {args.seed_mode}")
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     _resolve_paths(args)
+    protocol = SamplingProtocol.from_counts(
+        args.target_counts, allow_custom=args.max_samples is not None
+    )
     config = PCBACSConfig(
         n_clusters=int(args.n_clusters),
         target_counts=tuple(int(count) for count in args.target_counts),
@@ -901,7 +943,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         num_workers=int(args.num_workers),
         use_amp=bool(args.amp),
         dedup_threshold=float(args.dedup_threshold),
-        selector_seed_count=int(args.n_clusters),
+        selector_seed_count=_expected_seed_count(
+            seed_mode=args.seed_mode,
+            n_clusters=args.n_clusters,
+            protocol=protocol,
+        ),
     )
     _validate_args(args, config)
     _set_seed(config.random_seed)
@@ -1013,15 +1059,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             dry_selector.decoder.load_state_dict(legacy_state, strict=True)
             del dry_selector
             if dry_kmeans is not None:
-                _require_kmeans_center_seed(
+                _validate_seed_for_mode(
                     selection_seed_keys,
                     dry_kmeans.seed_keys,
+                    seed_mode=args.seed_mode,
                     label="Selection seed split",
                 )
                 if args.max_samples is None:
-                    _require_kmeans_center_seed(
+                    _validate_seed_for_mode(
                         selector_seed_keys,
                         dry_kmeans.seed_keys,
+                        seed_mode=args.seed_mode,
                         label="Selector training seed split",
                     )
             expected_score_spec = _score_spec(
@@ -1097,6 +1145,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             "sample_count": len(sample_keys),
             "seed_count": len(kmeans_result.seed_keys),
             "n_clusters": config.n_clusters,
+            "seed_mode": args.seed_mode,
+            "protocol_name": protocol.name,
             "random_seed": config.random_seed,
             "catalog_fingerprint": catalog_fingerprint,
             "dino_fingerprint": dino_fingerprint,
@@ -1130,15 +1180,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         expected_count=SELECTOR_TRAINING_SEED_COUNT,
         label="Selector training seed split",
     )
-    _require_kmeans_center_seed(
+    _validate_seed_for_mode(
         selection_seed_keys,
         kmeans_result.seed_keys,
+        seed_mode=args.seed_mode,
         label="Selection seed split",
     )
     if args.max_samples is None:
-        _require_kmeans_center_seed(
+        _validate_seed_for_mode(
             selector_seed_keys,
             kmeans_result.seed_keys,
+            seed_mode=args.seed_mode,
             label="Selector training seed split",
         )
 
@@ -1255,6 +1307,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 selection_seed_keys
             ),
             "clusters": config.n_clusters,
+            "seed_mode": args.seed_mode,
+            "protocol_name": protocol.name,
             "target_counts": list(config.target_counts),
             "dedup_threshold": config.dedup_threshold,
             "random_seed": config.random_seed,
