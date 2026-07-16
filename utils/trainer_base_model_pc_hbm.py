@@ -27,6 +27,7 @@ from Model.PC_HBM.training import (
     DiagnosticWarningTracker,
     collect_pc_diagnostics,
     make_ema_copy,
+    migration_aware_parameter_groups,
     pc_hbm_labeled_loss,
     pc_mode_for_epoch,
     update_ema_module,
@@ -50,6 +51,7 @@ from utils.logging_utils import current_time
 from utils.pc_memory_runner import (
     build_labeled_memory_loader,
     build_memory_compat_meta,
+    module_fingerprint,
     rebuild_memory,
 )
 
@@ -152,11 +154,24 @@ class BasePCHBMTrainer:
             dino.requires_grad_(False)
             dino.eval()
 
-        self.optimizer = optimizer or Adam(
-            (parameter for parameter in self.decoder.parameters() if parameter.requires_grad),
-            lr=float(cfg.learning_rate),
-            weight_decay=float(cfg.weight_decay),
-        )
+        if optimizer is None:
+            reused_names = getattr(
+                cfg,
+                "legacy_reused_parameter_names",
+                getattr(self.pc_cfg, "legacy_reused_parameter_names", ()),
+            )
+            parameter_groups = migration_aware_parameter_groups(
+                self.decoder,
+                base_lr=float(cfg.learning_rate),
+                reused_parameter_names=reused_names,
+            )
+            self.optimizer = Adam(
+                parameter_groups,
+                lr=float(cfg.learning_rate),
+                weight_decay=float(cfg.weight_decay),
+            )
+        else:
+            self.optimizer = optimizer
         self._validate_decoder_only_optimizer()
         self.scheduler = scheduler or CosineAnnealingLR(
             self.optimizer,
@@ -336,14 +351,32 @@ class BasePCHBMTrainer:
         self._assert_memory_ready(epoch)
         synchronize()
 
-    def _assert_memory_ready(self, epoch: int) -> None:
+    def _assert_memory_ready(
+        self,
+        epoch: int,
+        *,
+        producer: nn.Module | None = None,
+    ) -> None:
+        """Validate memory against the module that actually produced it.
+
+        Epoch memories are built by ``memory_decoder`` (the EMA producer),
+        whereas the final exported memory is rebuilt by the main Decoder.
+        Keeping the producer explicit prevents comparing those distinct state
+        fingerprints during finalization.
+        """
+
         if not hasattr(self.memory, "is_ready") or not bool(self.memory.is_ready()):
             raise RuntimeError(
                 f"Epoch {epoch} mode={pc_mode_for_epoch(epoch, self.pc_cfg)!r} "
                 "requires a finalized compatible labeled PC-HBM memory"
             )
         if hasattr(self.memory, "validate_compat"):
-            compatibility = self.memory.validate_compat(self.pc_cfg.expected_memory_meta())
+            producer = self.memory_decoder if producer is None else producer
+            compatibility = self.memory.validate_compat(
+                self.pc_cfg.expected_memory_meta(
+                    producer_fingerprint=module_fingerprint(producer)
+                )
+            )
             if not bool(compatibility):
                 reason = getattr(compatibility, "reason", "compatibility validation failed")
                 raise RuntimeError(f"Epoch {epoch} PC-HBM memory is incompatible: {reason}")
@@ -623,7 +656,7 @@ class BasePCHBMTrainer:
             compat_meta=compat_meta,
             use_amp=self.amp_enabled,
         )
-        self._assert_memory_ready(final_epoch)
+        self._assert_memory_ready(final_epoch, producer=self.decoder)
         synchronize()
         if not is_main_process():
             return

@@ -91,10 +91,88 @@ def base_structure_loss(outputs: Sequence[torch.Tensor], gt: torch.Tensor) -> to
     m4, m3, m2, z_main, global_logit = outputs
     total = zero_like_loss(z_main)
     for logit in (z_main, m2, m3, m4, global_logit):
-        if logit.shape[-2:] != gt.shape[-2:]:
-            logit = F.interpolate(logit, size=gt.shape[-2:], mode="bilinear", align_corners=False)
         total = total + structure_loss(logit, gt)
     return total
+
+
+def decoder_base_loss(
+    outputs: Sequence[torch.Tensor],
+    aux: Mapping[str, Any] | None,
+    gt: torch.Tensor,
+    config: Any,
+) -> torch.Tensor:
+    """Dispatch the architecture-specific base decoder supervision.
+
+    Legacy decoders keep their original five-output objective.  BGFBR exposes
+    four foreground/background side logits in stage4-to-stage1 order and uses
+    the DualUCOD hierarchy weights before supervising the final/global logits.
+    The runtime aux marker is authoritative so legacy PC-HBM artifacts remain
+    loadable even when a process-wide config defaults to the new decoder.
+    """
+
+    if not isinstance(outputs, (tuple, list)) or len(outputs) != 5:
+        raise ValueError("Decoder outputs must be (m4, m3, m2, z_main, global_logit)")
+    runtime_aux = aux if isinstance(aux, Mapping) else {}
+    architecture = runtime_aux.get("decoder_architecture")
+    if architecture is None and isinstance(runtime_aux.get("bgfbr"), Mapping):
+        architecture = "bgfbr_pc_v1"
+    if architecture is None:
+        architecture = "legacy_transformer"
+    architecture = str(architecture)
+
+    if architecture == "legacy_transformer":
+        return base_structure_loss(outputs, gt)
+    if architecture != "bgfbr_pc_v1":
+        raise ValueError(
+            f"Unsupported decoder architecture {architecture!r} for base loss"
+        )
+
+    bgfbr = runtime_aux.get("bgfbr")
+    if not isinstance(bgfbr, Mapping):
+        raise KeyError("BGFBR base loss requires aux['bgfbr'] mapping")
+    foreground = bgfbr.get("fg_output")
+    background = bgfbr.get("bg_output")
+    for name, values in (("fg_output", foreground), ("bg_output", background)):
+        if not isinstance(values, (tuple, list)) or len(values) != 4:
+            raise ValueError(
+                f"aux['bgfbr']['{name}'] must contain stage4-to-stage1 logits"
+            )
+        if not all(torch.is_tensor(value) for value in values):
+            raise TypeError(f"aux['bgfbr']['{name}'] entries must be tensors")
+
+    def supervised(logit: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if logit.shape[-2:] != target.shape[-2:]:
+            logit = F.interpolate(
+                logit, size=target.shape[-2:], mode="bilinear", align_corners=False
+            )
+        return structure_loss(logit, target)
+
+    stage_weights = (1.0 / 16.0, 1.0 / 8.0, 1.0 / 4.0, 1.0 / 2.0)
+    z_main = outputs[3]
+    global_logit = outputs[4]
+    loss_fg = zero_like_loss(z_main)
+    loss_bg = zero_like_loss(z_main)
+    target_98 = gt
+    if target_98.ndim == 3:
+        target_98 = target_98.unsqueeze(1)
+    if target_98.shape[-2:] != z_main.shape[-2:]:
+        target_98 = F.interpolate(
+            target_98.float(), size=z_main.shape[-2:], mode="nearest"
+        )
+    target_98 = target_98.to(device=z_main.device, dtype=z_main.dtype)
+    background_target = 1.0 - target_98
+    for weight, fg_logit, bg_logit in zip(stage_weights, foreground, background):
+        loss_fg = loss_fg + weight * supervised(fg_logit, target_98)
+        loss_bg = loss_bg + weight * supervised(bg_logit, background_target)
+
+    return (
+        float(getattr(config, "lambda_bgfbr_fg", 1.0)) * loss_fg
+        + float(getattr(config, "lambda_bgfbr_bg", 1.0)) * loss_bg
+        + float(getattr(config, "lambda_bgfbr_final", 1.0))
+        * supervised(z_main, target_98)
+        + float(getattr(config, "lambda_bgfbr_global", 1.0))
+        * supervised(global_logit, target_98)
+    )
 
 
 def pc_mode_for_epoch(epoch: int, config: Any) -> str:
@@ -142,7 +220,11 @@ def pc_hbm_labeled_loss(
     if not isinstance(outputs, (tuple, list)) or len(outputs) != 5:
         raise ValueError("Decoder outputs must be (m4, m3, m2, z_main, global_logit)")
     reference = outputs[3]
-    l_base = base_structure_loss(outputs, gt) if _include_base else zero_like_loss(reference)
+    l_base = (
+        decoder_base_loss(outputs, aux, gt, config)
+        if _include_base
+        else zero_like_loss(reference)
+    )
     mode = _resolve_mode(pc_mode, aux, epoch, config)
     _validate_pc_activation(aux, mode, strict)
     terms = _zero_terms(reference)
@@ -651,6 +733,7 @@ def _detach_terms(terms):
 
 __all__ = [
     "base_structure_loss",
+    "decoder_base_loss",
     "compute_pc_hbm_labeled_loss",
     "pc_hbm_labeled_loss",
     "pc_hbm_pc_only_labeled_loss",

@@ -1,9 +1,13 @@
 import torch
 import torch.nn as nn
 import warnings
-from Model.decoder import Decoder
+from Model.BGFBR import ImageNetRGBAdapter
+from Model.decoder import build_decoder, resolve_decoder_arch
 from Model.PC_HBM.training.ema import update_ema_module
-from utils.checkpoint_pc_hbm import load_decoder_compatible
+from utils.checkpoint_pc_hbm import (
+    load_decoder_compatible,
+    save_decoder_checkpoint as save_decoder_artifact,
+)
 
 class TSModel(nn.Module):
     VALID_TRAINING_DESIGNS = {'teacher_only', 'joint'}
@@ -15,6 +19,7 @@ class TSModel(nn.Module):
         pc_cfg=None,
         allow_legacy_pc_init=False,
         training_design='teacher_only',
+        decoder_arch=None,
     ):
         super(TSModel, self).__init__()
 
@@ -36,12 +41,18 @@ class TSModel(nn.Module):
         self.dino.eval()
         
         self.pc_cfg = pc_cfg
+        self.decoder_arch = resolve_decoder_arch(decoder_arch, pc_cfg)
         self.allow_legacy_pc_init = allow_legacy_pc_init
         self.training_design = training_design
-        self.teacher = Decoder(pc_cfg=pc_cfg)  # Teacher Network Decoder
-        self.student = Decoder(
-            pc_cfg=None if training_design == 'teacher_only' else pc_cfg
-        )  # Student Network Decoder
+        self.rgb_adapter = ImageNetRGBAdapter()
+        self.teacher = build_decoder(
+            self.decoder_arch, pc_cfg=pc_cfg, attach_pc=True
+        )
+        self.student = build_decoder(
+            self.decoder_arch,
+            pc_cfg=pc_cfg,
+            attach_pc=training_design != 'teacher_only',
+        )
 
         self.load_teacher(teacher_pth)
         if student_pth is not None:
@@ -75,10 +86,16 @@ class TSModel(nn.Module):
     def _extract_features(self, x):
         return self.extract_features(x)
 
+    def prepare_rgb(self, x):
+        """Invert ImageNet normalization once for all TS decoder branches."""
+
+        return self.rgb_adapter(x)
+
     @torch.inference_mode()
-    def teacher_pseudo(self, features, memory, epoch):
+    def teacher_pseudo(self, features, memory, epoch, image_rgb=None):
         _, aux = self.teacher(
             features,
+            image_rgb=image_rgb,
             memory=memory,
             pc_mode='teacher_pseudo',
             epoch=epoch,
@@ -115,11 +132,16 @@ class TSModel(nn.Module):
                 )
         return aux
 
-    def student_labeled(self, features, memory, epoch, query_image_ids=None):
+    def student_labeled(
+        self, features, memory, epoch, query_image_ids=None, image_rgb=None
+    ):
         if self.training_design == 'teacher_only':
-            return self.student(features, pc_mode='off', return_aux=True)
+            return self.student(
+                features, image_rgb=image_rgb, pc_mode='off', return_aux=True
+            )
         return self.student(
             features,
+            image_rgb=image_rgb,
             memory=memory,
             pc_mode='full',
             epoch=epoch,
@@ -127,11 +149,14 @@ class TSModel(nn.Module):
             query_image_ids=query_image_ids,
         )
 
-    def student_unlabeled(self, features, memory, epoch):
+    def student_unlabeled(self, features, memory, epoch, image_rgb=None):
         if self.training_design == 'teacher_only':
-            return self.student(features, pc_mode='off', return_aux=True)
+            return self.student(
+                features, image_rgb=image_rgb, pc_mode='off', return_aux=True
+            )
         return self.student(
             features,
+            image_rgb=image_rgb,
             memory=memory,
             pc_mode='student_core',
             epoch=epoch,
@@ -148,16 +173,23 @@ class TSModel(nn.Module):
         memory=None,
         epoch=None,
         query_image_ids=None,
+        image_rgb=None,
     ):
         if branch is not None:
             if features is None:
                 raise ValueError('Precomputed DINO features are required for branch dispatch.')
             if branch == 'student_labeled':
                 return self.student_labeled(
-                    features, memory, epoch, query_image_ids=query_image_ids
+                    features,
+                    memory,
+                    epoch,
+                    query_image_ids=query_image_ids,
+                    image_rgb=image_rgb,
                 )
             if branch == 'student_unlabeled':
-                return self.student_unlabeled(features, memory, epoch)
+                return self.student_unlabeled(
+                    features, memory, epoch, image_rgb=image_rgb
+                )
             raise ValueError(f'Unsupported TS forward branch: {branch!r}.')
 
         # Original combined/off API retained for the legacy SAM and pseudo trainers.
@@ -165,26 +197,32 @@ class TSModel(nn.Module):
             raise ValueError('Legacy TS forward requires both l_x and u_x.')
         l_x_features = self.extract_features(l_x)
         u_x_features = self.extract_features(u_x)
+        l_rgb = self.prepare_rgb(l_x)
+        u_rgb = self.prepare_rgb(u_x)
         with torch.no_grad():
-            teacher_label = torch.sigmoid(self.teacher(u_x_features, pc_mode='off')[3].detach())
-        l_segs = list(self.student(l_x_features, pc_mode='off'))
-        u_segs = list(self.student(u_x_features, pc_mode='off'))
+            teacher_label = torch.sigmoid(
+                self.teacher(u_x_features, image_rgb=u_rgb, pc_mode='off')[3].detach()
+            )
+        l_segs = list(self.student(l_x_features, image_rgb=l_rgb, pc_mode='off'))
+        u_segs = list(self.student(u_x_features, image_rgb=u_rgb, pc_mode='off'))
         return l_segs, u_segs, teacher_label
 
     
     def inference(self, x, memory=None, epoch=None):
         x_features = self.extract_features(x)
+        image_rgb = self.prepare_rgb(x)
         if self.training_design == 'teacher_only' or self.student.pc_hbm is None:
-            return self.student(x_features, pc_mode='off')[3]
+            return self.student(x_features, image_rgb=image_rgb, pc_mode='off')[3]
         if memory is None:
             warnings.warn(
                 'PC-HBM memory is missing; using z_main logits.',
                 RuntimeWarning,
                 stacklevel=2,
             )
-            return self.student(x_features, pc_mode='off')[3]
+            return self.student(x_features, image_rgb=image_rgb, pc_mode='off')[3]
         _, aux = self.student(
             x_features,
+            image_rgb=image_rgb,
             memory=memory,
             pc_mode='full',
             epoch=epoch,
@@ -223,7 +261,7 @@ class TSModel(nn.Module):
             if not name.startswith('pc_hbm.')
         }
         self.student.load_state_dict(raw_state, strict=True)
-        print('Initialized raw Student parameters from the Teacher legacy decoder.')
+        print('Initialized raw Student parameters from the Teacher decoder.')
 
     def _load_decoder(self, decoder, path, role):
         try:
@@ -245,7 +283,7 @@ class TSModel(nn.Module):
 
     def save_student(self, path):
         assert path.endswith('.pth'), f'Student parameters path should end with ".pth", but got: "{path}"'
-        torch.save(self.student.state_dict(), path)
+        save_decoder_artifact(path, self.student, self.pc_cfg, epoch=0)
         print(f'Successfully save student parameters to {path}.')
 
     @torch.no_grad()

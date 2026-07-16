@@ -282,3 +282,65 @@ def test_incomplete_artifact_metadata_is_rejected():
     }
     with pytest.raises(RuntimeError, match="metadata is incomplete"):
         read_artifact_metadata(malformed)
+
+
+def test_checkpoint_decoder_architecture_is_strict_and_versioned(tmp_path: Path):
+    legacy_cfg = DinoPCHBMConfig(decoder_arch="legacy_transformer")
+    legacy = TinyDecoder()
+    legacy.decoder_arch = "legacy_transformer"
+    legacy.decoder_contract_version = 1
+    path = tmp_path / "legacy_decoder.pth"
+    payload = save_decoder_checkpoint(path, legacy, legacy_cfg, epoch=1)
+    assert payload["format_version"] == 2
+    assert payload["decoder_architecture"] == "legacy_transformer"
+    assert payload["decoder_contract_version"] == 1
+
+    bgfbr = TinyDecoder()
+    bgfbr.decoder_arch = "bgfbr_pc_v1"
+    bgfbr.decoder_contract_version = 1
+    with pytest.raises(RuntimeError, match="architecture mismatch"):
+        load_decoder_compatible(bgfbr, path)
+    with pytest.raises(RuntimeError, match="no architecture metadata"):
+        load_decoder_compatible(bgfbr, legacy.state_dict())
+
+
+def test_explicit_legacy_migration_reuses_projectors_and_zero_expands_pc_inputs():
+    from utils.checkpoint_pc_hbm import load_legacy_into_bgfbr
+
+    class MigrationDecoder(nn.Module):
+        def __init__(self, architecture: str, pc_in_channels: int):
+            super().__init__()
+            self.decoder_arch = architecture
+            self.decoder_contract_version = 1
+            for index in range(1, 5):
+                setattr(
+                    self,
+                    f"linear_{index}",
+                    nn.Sequential(nn.Linear(3, 2), nn.GELU(), nn.LayerNorm(2)),
+                )
+            self.pc_hbm = nn.Module()
+            self.pc_hbm.boundary = nn.Conv2d(pc_in_channels, 2, 1, bias=False)
+
+    legacy = MigrationDecoder("legacy_transformer", 5)
+    with torch.no_grad():
+        for parameter in legacy.parameters():
+            parameter.fill_(0.25)
+    bgfbr = MigrationDecoder("bgfbr_pc_v1", 7)
+    result = load_legacy_into_bgfbr(
+        bgfbr,
+        legacy.state_dict(),
+        reuse_projectors=True,
+        reuse_pc_core=True,
+    )
+
+    assert "linear_1.0.weight" in result["reused_parameter_names"]
+    assert "pc_hbm.boundary.weight" in result["report"]["expanded_input_state_keys"]
+    torch.testing.assert_close(
+        bgfbr.linear_1[0].weight,
+        legacy.linear_1[0].weight,
+    )
+    torch.testing.assert_close(
+        bgfbr.pc_hbm.boundary.weight[:, :5],
+        legacy.pc_hbm.boundary.weight,
+    )
+    assert torch.count_nonzero(bgfbr.pc_hbm.boundary.weight[:, 5:]) == 0

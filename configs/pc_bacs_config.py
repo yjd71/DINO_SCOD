@@ -15,6 +15,7 @@ class PCBACSConfig:
     input_size: int = 392
     output_size: int = 98
     feature_dim: int = 768
+    decoder_arch: str = "legacy_transformer"
 
     n_clusters: int = 40
     target_counts: Tuple[int, ...] = (41, 202, 404)
@@ -31,6 +32,8 @@ class PCBACSConfig:
     score_formula_version: str = SCORE_FORMULA_VERSION
 
     def validate(self, sample_count: int | None = None) -> None:
+        if self.decoder_arch != "legacy_transformer":
+            raise ValueError("PC-BACS artifacts are locked to decoder_arch='legacy_transformer'.")
         if self.input_size != 392:
             raise ValueError("PC-BACS must use the current DINO_SCOD input size 392.")
         if self.output_size != 98:

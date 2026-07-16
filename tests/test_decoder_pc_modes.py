@@ -169,23 +169,28 @@ def test_missing_or_incompatible_memory_returns_explicit_baseline_fallback(
     decoder_inputs,
 ):
     model, features, memory = decoder_inputs
+    was_training = model.training
+    model.eval()
     baseline = model(features)
-    missing_outputs, missing_aux = model(
-        features, pc_mode="full", return_aux=True
-    )
-    assert missing_aux["fallback_reason"] == "memory_missing"
-    for actual, expected in zip(missing_outputs, baseline):
-        torch.testing.assert_close(actual, expected)
-
-    original_token_hw = memory.compat_meta["token_hw"]
     try:
-        memory.compat_meta["token_hw"] = (14, 14)
-        _, incompatible_aux = model(
-            features, memory=memory, pc_mode="full", return_aux=True
+        missing_outputs, missing_aux = model(
+            features, pc_mode="full", return_aux=True
         )
-        assert incompatible_aux["fallback_reason"] == "compat_mismatch:token_hw"
+        assert missing_aux["fallback_reason"] == "memory_missing"
+        for actual, expected in zip(missing_outputs, baseline):
+            torch.testing.assert_close(actual, expected)
+
+        original_token_hw = memory.compat_meta["token_hw"]
+        try:
+            memory.compat_meta["token_hw"] = (14, 14)
+            _, incompatible_aux = model(
+                features, memory=memory, pc_mode="full", return_aux=True
+            )
+            assert incompatible_aux["fallback_reason"] == "compat_mismatch:token_hw"
+        finally:
+            memory.compat_meta["token_hw"] = original_token_hw
     finally:
-        memory.compat_meta["token_hw"] = original_token_hw
+        model.train(was_training)
 
 
 def test_full_mode_backward_reaches_pc_modules(decoder_inputs):

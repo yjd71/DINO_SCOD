@@ -7,6 +7,7 @@ from torch import nn
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
 import utils.trainer_base_model_pc_hbm as trainer_module
 from utils.trainer_base_model_pc_hbm import BasePCHBMTrainer
+from utils.pc_memory_runner import module_fingerprint
 
 
 class _FakeDecoder(nn.Module):
@@ -222,3 +223,61 @@ def test_parent_only_rebuild_decoder_only_ema_checkpoint_and_resume(tmp_path):
     )
     resumed.resume(Path(tmp_path, "training_resume.pth"), restore_rng=False)
     assert resumed.current_epoch == 7
+
+
+def test_final_memory_is_validated_against_main_decoder_not_ema(tmp_path):
+    cfg = _cfg(tmp_path)
+    pc_cfg = DinoPCHBMConfig(use_amp=False)
+    images = torch.randn(2, 3, 8, 8)
+    gt = torch.randint(0, 2, (2, 1, 8, 8)).float()
+    loader = [(images.clone(), images, gt, ["a", "b"])]
+
+    class FingerprintMemory(_FakeMemory):
+        def __init__(self):
+            super().__init__()
+            self.producer_fingerprint = None
+            self.expected_fingerprint = None
+
+        def validate_compat(self, expected):
+            self.expected_fingerprint = expected.get("producer_fingerprint")
+            return self.expected_fingerprint == self.producer_fingerprint
+
+        def state_dict(self):
+            return {
+                "compat_meta": {
+                    "producer_fingerprint": self.producer_fingerprint,
+                },
+                "ready": self.ready,
+            }
+
+    memory = FingerprintMemory()
+
+    def fake_rebuild(**kwargs):
+        kwargs["memory"].ready = True
+        kwargs["memory"].producer_fingerprint = module_fingerprint(
+            kwargs["memory_decoder"]
+        )
+        return kwargs["memory"]
+
+    trainer = BasePCHBMTrainer(
+        _FakeModel(),
+        cfg,
+        pc_cfg,
+        memory=memory,
+        labeled_loader=loader,
+        memory_loader=[None],
+        memory_rebuild_fn=fake_rebuild,
+    )
+    trainer.current_epoch = 31
+    with torch.no_grad():
+        trainer.memory_decoder.weight.add_(1.0)
+    assert module_fingerprint(trainer.decoder) != module_fingerprint(
+        trainer.memory_decoder
+    )
+
+    trainer._finalize_teacher_enhancer()
+
+    assert memory.producer_fingerprint == module_fingerprint(trainer.decoder)
+    assert memory.expected_fingerprint == memory.producer_fingerprint
+    assert Path(tmp_path, "teacher_enhancer.pth").is_file()
+    assert Path(tmp_path, "teacher_enhancer_memory.pth").is_file()

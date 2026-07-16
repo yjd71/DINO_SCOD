@@ -62,6 +62,7 @@ class P1PixelRefinementAttention(nn.Module):
         detach_refs: bool = True,
         num_heads: int = 8,
         head_dim: int = 16,
+        boundary_in_ch: int = 8,
     ) -> None:
         super().__init__()
         self.p1_ch = int(p1_ch)
@@ -72,12 +73,16 @@ class P1PixelRefinementAttention(nn.Module):
         self.num_heads = int(num_heads)
         self.head_dim = int(head_dim)
         self.inner = self.num_heads * self.head_dim
+        self.boundary_in_ch = int(boundary_in_ch)
+        if self.boundary_in_ch not in {8, 10}:
+            raise ValueError("P1 boundary_in_ch must be 8 (legacy) or 10 (BGFBR)")
         if self.inner != self.dim:
             raise ValueError("num_heads * head_dim must equal dim")
         self.boundary_head = BoundaryQueryHead1(
             top_ratio=top_ratio,
             min_tokens=min_tokens,
             max_tokens=max_tokens,
+            in_ch=self.boundary_in_ch,
         )
         self.query_encoder = nn.Conv2d(self.p1_ch, self.dim, 1, bias=False)
         self.ref_encoder = nn.Sequential(
@@ -105,6 +110,8 @@ class P1PixelRefinementAttention(nn.Module):
         z_main: torch.Tensor,
         p1_hw: tuple[int, int],
         p2_aux: Mapping[str, torch.Tensor],
+        edge_context: torch.Tensor | None = None,
+        dual_uncertainty: torch.Tensor | None = None,
     ) -> torch.Tensor:
         z_p1 = F.interpolate(
             z_main, size=p1_hw, mode="bilinear", align_corners=False
@@ -116,13 +123,28 @@ class P1PixelRefinementAttention(nn.Module):
             )
             for name in ("B2_refined_map", "G2_refined_map", "valid2_map")
         ]
-        return torch.cat([base, *extras], dim=1)
+        boundary_input = torch.cat([base, *extras], dim=1)
+        if self.boundary_in_ch == 10:
+            zeros = torch.zeros_like(z_p1)
+            edge = zeros if edge_context is None else edge_context
+            dual = zeros if dual_uncertainty is None else dual_uncertainty
+            edge = F.interpolate(edge, size=p1_hw, mode="bilinear", align_corners=False)
+            dual = F.interpolate(dual, size=p1_hw, mode="bilinear", align_corners=False)
+            boundary_input = torch.cat([boundary_input, edge, dual], dim=1)
+        if boundary_input.size(1) != self.boundary_in_ch:
+            raise RuntimeError(
+                f"P1 boundary contract expected {self.boundary_in_ch} channels, "
+                f"got {boundary_input.size(1)}"
+            )
+        return boundary_input
 
     def forward(
         self,
         p1: torch.Tensor,
         z_main: torch.Tensor,
         p2_aux: Mapping[str, torch.Tensor],
+        edge_context: torch.Tensor | None = None,
+        dual_uncertainty: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         batch_size, _, height, width = p1.shape
         if (height, width) != (98, 98):
@@ -132,7 +154,11 @@ class P1PixelRefinementAttention(nn.Module):
         if z_main.shape != (batch_size, 1, height, width):
             raise ValueError("z_main must be [B,1,98,98] and match p1")
         boundary_input = self.build_boundary_input(
-            z_main, (height, width), p2_aux
+            z_main,
+            (height, width),
+            p2_aux,
+            edge_context=edge_context,
+            dual_uncertainty=dual_uncertainty,
         )
         boundary, indices = self.boundary_head(boundary_input)
         batch_ids = indices["batch_ids"]
@@ -315,4 +341,3 @@ class P1PixelRefinementAttention(nn.Module):
             for dx in range(-radius, radius + 1)
         ]
         return torch.tensor(values, device=device, dtype=dtype)
-

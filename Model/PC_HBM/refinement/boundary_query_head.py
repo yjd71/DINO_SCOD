@@ -134,16 +134,17 @@ class BoundaryQueryHead(nn.Module):
 
 
 class BoundaryQueryHead3(BoundaryQueryHead):
-    """Five-channel p3 boundary scorer on the 28 x 28 grid."""
+    """Configurable p3 boundary scorer on the 28 x 28 grid."""
 
     def __init__(
         self,
         top_ratio: float = 0.20,
         min_tokens: int = 32,
         max_tokens: int | None = 128,
+        in_ch: int = 5,
     ) -> None:
         super().__init__(
-            5,
+            int(in_ch),
             top_ratio=top_ratio,
             min_tokens=min_tokens,
             max_tokens=max_tokens,
@@ -151,16 +152,17 @@ class BoundaryQueryHead3(BoundaryQueryHead):
 
 
 class BoundaryQueryHead2(BoundaryQueryHead):
-    """Eight-channel p2 boundary scorer on the 28 x 28 grid."""
+    """Configurable p2 boundary scorer on the 28 x 28 grid."""
 
     def __init__(
         self,
         top_ratio: float = 0.20,
         min_tokens: int = 32,
         max_tokens: int | None = 128,
+        in_ch: int = 8,
     ) -> None:
         super().__init__(
-            8,
+            int(in_ch),
             top_ratio=top_ratio,
             min_tokens=min_tokens,
             max_tokens=max_tokens,
@@ -168,18 +170,18 @@ class BoundaryQueryHead2(BoundaryQueryHead):
 
 
 class BoundaryQueryHead1(BoundaryQueryHead):
-    """Eight-channel p1 boundary scorer on the 98 x 98 grid."""
+    """Configurable p1 boundary scorer on the 98 x 98 grid."""
 
     def __init__(
         self,
         top_ratio: float = 0.05,
         min_tokens: int = 96,
         max_tokens: int | None = 384,
+        in_ch: int = 8,
     ) -> None:
         super().__init__(
-            8,
+            int(in_ch),
             top_ratio=top_ratio,
             min_tokens=min_tokens,
             max_tokens=max_tokens,
         )
-

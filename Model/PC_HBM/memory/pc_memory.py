@@ -25,6 +25,42 @@ class CompatibilityResult:
         yield self.reason
 
 
+SCHEMA_V2_COMPAT_KEYS = (
+    "architecture",
+    "schema_version",
+    "decoder_architecture",
+    "decoder_contract_version",
+    "input_size",
+    "token_hw",
+    "output_hw",
+    "dino_layer_indices",
+    "encoder_dim",
+    "decoder_dim",
+    "memory_dim",
+    "value_dim",
+    "geometry_dim",
+    "storage_dtype",
+    "source",
+    "gbe_version",
+    "gbe_normalization",
+    "gbe_padding_mode",
+    "gpm_dilations",
+    "gpm_contract",
+    "f4_adapter_contract",
+    "ode_contract",
+    "rcab_reduction",
+    "bgfbr_stage_count",
+    "fg_bg_contract",
+    "boundary_feature_channels",
+    "use_gbe",
+    "use_ode",
+    "use_rcab",
+    "use_pc_boundary_context",
+    "sync_bn",
+)
+SCHEMA_V2_REQUIRED_MEMORY_KEYS = (*SCHEMA_V2_COMPAT_KEYS, "producer_fingerprint")
+
+
 class PCMemory:
     """Route/parent/child tensor store with no persistent GPU cache.
 
@@ -33,7 +69,7 @@ class PCMemory:
     """
 
     FORMAT_VERSION = 1
-    DEFAULT_SCHEMA_VERSION = 1
+    DEFAULT_SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -263,12 +299,20 @@ class PCMemory:
         self,
         expected: Mapping[str, Any] | object | None,
         *,
-        require_producer_match: bool = False,
+        require_producer_match: bool = True,
     ) -> CompatibilityResult:
         """Validate architecture/schema/dimensions and, optionally, producer."""
 
         if not self.is_ready():
             return CompatibilityResult(False, "memory_not_ready")
+        actual_schema = int(self.compat_meta.get("schema_version", 0))
+        if actual_schema != self.DEFAULT_SCHEMA_VERSION:
+            return CompatibilityResult(False, f"unsupported_memory_schema:{actual_schema}")
+        missing_actual = [
+            key for key in SCHEMA_V2_REQUIRED_MEMORY_KEYS if key not in self.compat_meta
+        ]
+        if missing_actual:
+            return CompatibilityResult(False, f"missing_compat_key:{missing_actual[0]}")
         if expected is None:
             return CompatibilityResult(True, None)
         if not isinstance(expected, Mapping):
@@ -277,21 +321,13 @@ class PCMemory:
                 expected = builder()
             else:
                 raise TypeError("expected compatibility data must be a mapping or PC config")
-        keys = (
-            "architecture",
-            "schema_version",
-            "input_size",
-            "token_hw",
-            "output_hw",
-            "dino_layer_indices",
-            "encoder_dim",
-            "decoder_dim",
-            "memory_dim",
-            "value_dim",
-            "geometry_dim",
-            "storage_dtype",
-            "source",
-        )
+        expected_schema = int(expected.get("schema_version", 0))
+        if expected_schema != self.DEFAULT_SCHEMA_VERSION:
+            return CompatibilityResult(False, f"unsupported_expected_memory_schema:{expected_schema}")
+        missing_expected = [key for key in SCHEMA_V2_COMPAT_KEYS if key not in expected]
+        if missing_expected:
+            return CompatibilityResult(False, f"missing_expected_compat_key:{missing_expected[0]}")
+        keys = SCHEMA_V2_COMPAT_KEYS
         if require_producer_match:
             keys = (*keys, "producer_fingerprint")
         for key in keys:
@@ -501,8 +537,27 @@ class PCMemory:
 
         outer_meta = dict(outer.get("compat_meta", {}) or {})
         inner_meta = dict(state.get("compat_meta", {}) or {})
+        schema_values = {
+            int(value)
+            for value in (
+                outer.get("schema_version"),
+                state.get("schema_version"),
+                outer_meta.get("schema_version"),
+                inner_meta.get("schema_version"),
+            )
+            if value is not None
+        }
+        if len(schema_values) > 1:
+            raise RuntimeError(f"Conflicting PC-HBM memory schema declarations: {sorted(schema_values)}")
+        declared_schema = next(iter(schema_values), 1)
+        if declared_schema != self.DEFAULT_SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Unsupported PC-HBM memory schema v{declared_schema}; "
+                "schema v1 cannot be migrated and the labeled memory must be rebuilt"
+            )
         self.compat_meta.update(outer_meta)
         self.compat_meta.update(inner_meta)
+        self.compat_meta["schema_version"] = declared_schema
         raw_route = state.get("route", {}) or {}
         raw_parent = state.get("parent", {}) or {}
         raw_child = state.get("child", {}) or {}
@@ -731,4 +786,3 @@ __all__ = [
     "PCHBMMemory",
     "parent_values_from_region",
 ]
-

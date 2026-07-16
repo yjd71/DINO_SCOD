@@ -8,6 +8,7 @@ import random
 import numpy as np
 import torch
 
+from configs.bgfbr_experiments import apply_experiment_profile, experiment_profile_names
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from configs.ts_model_config import Config
 from Model.ts_model import TSModel
@@ -38,6 +39,12 @@ def parse_args():
         choices=("teacher_only", "joint"),
         default="teacher_only",
         help="Teacher-only distillation is the default; joint preserves the legacy PC-HBM flow.",
+    )
+    parser.add_argument(
+        "--experiment-profile",
+        choices=experiment_profile_names(),
+        default="bgfbr_pc",
+        help="Architecture/component profile; Base-only mode overrides do not alter TS pseudo modes.",
     )
     parser.add_argument(
         "--teacher-pc-checkpoint",
@@ -110,6 +117,8 @@ def main():
 
     pc_cfg = DinoPCHBMConfig()
     pc_cfg.configure_training_design(args.training_design)
+    experiment_profile = apply_experiment_profile(pc_cfg, args.experiment_profile)
+    cfg.experiment_profile = experiment_profile.name
     model = TSModel(
         teacher_pth=args.teacher_pc_checkpoint,
         student_pth=args.student_checkpoint,
@@ -120,7 +129,12 @@ def main():
     model = wrap_distributed(
         model,
         context,
-        find_unused_parameters=args.training_design == "joint",
+        # Both TS designs alternate labeled and unlabeled graphs.  In the
+        # teacher-only BGFBR path, the unlabeled graph intentionally omits the
+        # Stage-1 foreground head while the labeled graph supervises it.
+        # DDP must therefore discover the per-forward unused set for raw and
+        # joint Students alike.
+        find_unused_parameters=True,
     )
     trainer = PCHBMPseudoTrainer(
         model,

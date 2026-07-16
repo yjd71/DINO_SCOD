@@ -4,6 +4,7 @@ from .diagnostics import DIAGNOSTIC_NAMES, DiagnosticWarningTracker, collect_pc_
 from .ema import make_ema_copy, update_ema_module
 from .losses import (
     base_structure_loss,
+    decoder_base_loss,
     compute_pc_hbm_labeled_loss,
     pc_hbm_labeled_loss,
     pc_hbm_pc_only_labeled_loss,
@@ -11,6 +12,7 @@ from .losses import (
     pc_mode_for_epoch,
     structure_loss,
 )
+from .optimizer import migration_aware_parameter_groups
 from .pseudo_label import (
     build_pc_confidence,
     confidence_weighted_feature_cosine_loss,
@@ -24,12 +26,14 @@ __all__ = [
     "DIAGNOSTIC_NAMES",
     "DiagnosticWarningTracker",
     "base_structure_loss",
+    "decoder_base_loss",
     "build_pc_confidence",
     "collect_pc_diagnostics",
     "confidence_weighted_feature_cosine_loss",
     "compute_pc_hbm_labeled_loss",
     "compute_pc_hbm_unlabeled_loss",
     "make_ema_copy",
+    "migration_aware_parameter_groups",
     "pc_hbm_labeled_loss",
     "pc_hbm_pc_only_labeled_loss",
     "pc_injection_strength",

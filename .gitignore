@@ -18,6 +18,11 @@ tests/*
 !tests/test_pc_bpus_prototype.py
 !tests/test_pc_bpus_greedy.py
 !tests/test_pc_bpus_cli.py
+!tests/test_bgfbr_primitives.py
+!tests/test_bgfbr_decoder.py
+!tests/test_bgfbr_experiments.py
+__pycache__/
+*.py[cod]
 ./cache
 .git
 .agents

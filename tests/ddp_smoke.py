@@ -5,10 +5,9 @@ Run with::
     python -m torch.distributed.run --standalone --nproc_per_node=2 \
         tests/ddp_smoke.py --cpu
 
-The smoke deliberately uses precomputed DINO features.  It keeps the real
-Decoder and every PC-HBM module, but replaces the four quadratic baseline
-TransformerBlocks with tiny shape-compatible blocks so the distributed
-contract can be exercised quickly on CPU.
+The smoke deliberately uses precomputed DINO features and reconstructs a
+deterministic RGB tensor from them. It keeps the real BGFBR decoder and every
+PC-HBM module so the distributed contract exercises the production graph.
 """
 
 from __future__ import annotations
@@ -28,25 +27,14 @@ if str(REPO_ROOT) not in sys.path:
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
-from Model.decoder import Decoder
+from Model.decoder import build_decoder
 from Model.PC_HBM.memory import PCMemory
 from Model.PC_HBM.training import pc_unlabeled_loss, update_ema_module
 from utils.pc_memory_runner import module_fingerprint
-
-
-class _CheapTransformerBlock(nn.Module):
-    """Linear-cost stand-in that preserves the Decoder token contract."""
-
-    def __init__(self, dim: int) -> None:
-        super().__init__()
-        self.norm = nn.LayerNorm(dim)
-        self.kv_scale = nn.Parameter(torch.tensor(0.125))
-
-    def forward(self, q: torch.Tensor, kv: torch.Tensor) -> torch.Tensor:
-        return self.norm(q + self.kv_scale.tanh() * kv)
 
 
 class _PCHBMDDPSmokeModule(nn.Module):
@@ -55,12 +43,21 @@ class _PCHBMDDPSmokeModule(nn.Module):
     def __init__(self, config: DinoPCHBMConfig, *, teacher_only: bool = False) -> None:
         super().__init__()
         self.teacher_only = bool(teacher_only)
-        self.student = Decoder(pc_cfg=None if self.teacher_only else config)
-        dim = config.decoder_dim
-        self.student.TransBlock_seg1 = _CheapTransformerBlock(dim)
-        self.student.TransBlock_seg2 = _CheapTransformerBlock(dim)
-        self.student.TransBlock_seg3 = _CheapTransformerBlock(dim)
-        self.student.TransBlock_seg4 = _CheapTransformerBlock(dim)
+        self.student = build_decoder(
+            decoder_arch="bgfbr_pc_v1",
+            pc_cfg=config,
+            attach_pc=not self.teacher_only,
+        )
+
+    @staticmethod
+    def _image_rgb(features: Sequence[torch.Tensor]) -> torch.Tensor:
+        first = features[0]
+        batch, tokens, _ = first.shape
+        side = int(tokens**0.5)
+        if side * side != tokens:
+            raise ValueError("DDP smoke features must form a square token grid")
+        rgb_28 = torch.sigmoid(first[:, :, :3].transpose(1, 2).reshape(batch, 3, side, side))
+        return F.interpolate(rgb_28, size=(392, 392), mode="bilinear", align_corners=False)
 
     def forward(
         self,
@@ -86,6 +83,7 @@ class _PCHBMDDPSmokeModule(nn.Module):
 
         outputs, aux = self.student(
             features,
+            image_rgb=self._image_rgb(features),
             memory=memory,
             pc_mode=mode,
             epoch=epoch,
@@ -153,7 +151,7 @@ def _smoke_config() -> DinoPCHBMConfig:
     )
 
 
-def _force_dense_refinement_queries(decoder: Decoder) -> None:
+def _force_dense_refinement_queries(decoder: nn.Module) -> None:
     """Select every P2/P1 query so the joint smoke has a real valid overlap."""
 
     if decoder.pc_hbm is None:
@@ -463,7 +461,7 @@ def main() -> None:
         # Base uses find_unused_parameters=True because the unused set changes
         # by stage: off leaves every PC parameter unused; parent_only activates
         # only the parent/B3 subset; full activates the complete correction
-        # path.  Legacy Decoder supervision remains live in all three stages.
+        # path. BGFBR supervision remains live in all three stages.
         # The changing reducer graph must not become stale or hang either rank.
         for step, mode in enumerate(("off", "parent_only", "full")):
             optimizer.zero_grad(set_to_none=True)
@@ -481,7 +479,7 @@ def main() -> None:
                 ddp.module,
                 pc_parameters=False,
                 expected=True,
-                name=f"Base/{mode} legacy Decoder",
+                name=f"Base/{mode} BGFBR Decoder",
             )
             _assert_finite_gradient_group(
                 ddp.module,
@@ -494,13 +492,16 @@ def main() -> None:
                 _parameter_checksum(ddp.module), name=f"Base/{mode} parameters"
             )
 
-        # Teacher-only TS uses a raw Student with no PC-HBM parameters and
-        # find_unused_parameters=False.  Both backwards synchronize normally.
+        # Teacher-only TS uses a raw Student with no PC-HBM parameters.  Its
+        # unlabeled objective intentionally leaves a small BGFBR subset (for
+        # example the Stage-1 foreground-logit head) outside that backward
+        # graph, so DDP must discover unused parameters on every invocation.
+        # Both backwards still synchronize and accumulate normally.
         torch.manual_seed(271828)
         raw_model = _PCHBMDDPSmokeModule(config, teacher_only=True)
         if raw_model.student.pc_hbm is not None:
             raise AssertionError("Teacher-only TS Student must be raw and contain no PC-HBM.")
-        raw_ddp = DDP(raw_model, find_unused_parameters=False)
+        raw_ddp = DDP(raw_model, find_unused_parameters=True)
         raw_optimizer = torch.optim.SGD(raw_ddp.parameters(), lr=1e-5)
         torch.manual_seed(161803)
         frozen_teacher = _PCHBMDDPSmokeModule(config).student
@@ -560,6 +561,33 @@ def main() -> None:
         )
         if module_fingerprint(frozen_teacher.pc_hbm) != teacher_pc_fingerprint:
             raise AssertionError("Selective EMA modified frozen Teacher PC-HBM state.")
+
+        # The production failure surfaced at the next labeled forward, when
+        # the reducer checked whether the preceding unlabeled reduction had
+        # completed. Exercise that exact unlabeled-backward -> next-forward
+        # transition instead of ending the raw-Student smoke one iteration too
+        # early.
+        raw_optimizer.zero_grad(set_to_none=True)
+        next_labeled_loss = raw_ddp(
+            _features(rank, 12),
+            None,
+            branch="student_labeled",
+            epoch=13,
+            query_image_ids=[f"next-labeled-query-rank-{rank}"],
+        )
+        if not torch.isfinite(next_labeled_loss):
+            raise AssertionError("Non-finite next-iteration TS labeled loss.")
+        next_labeled_loss.backward()
+        raw_optimizer.step()
+        update_ema_module(
+            raw_ddp.module.student,
+            frozen_teacher,
+            momentum=0.995,
+            shared_only=True,
+            exclude_prefixes=("pc_hbm.",),
+        )
+        if module_fingerprint(frozen_teacher.pc_hbm) != teacher_pc_fingerprint:
+            raise AssertionError("Selective EMA modified frozen Teacher PC-HBM state.")
         _assert_allreduce_consistent(
             _parameter_checksum(raw_ddp.module), name="TS raw Student parameters"
         )
@@ -596,6 +624,7 @@ def main() -> None:
         with torch.inference_mode():
             teacher_outputs, teacher_aux = joint_teacher(
                 joint_features,
+                image_rgb=_PCHBMDDPSmokeModule._image_rgb(joint_features),
                 memory=memory,
                 pc_mode="teacher_pseudo",
                 epoch=13,

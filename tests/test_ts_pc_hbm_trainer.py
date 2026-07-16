@@ -13,6 +13,7 @@ from utils.trainer_ts_model_pseudo_pc_hbm import (
     validate_teacher_enhancer_checkpoint,
 )
 import Model.ts_model as ts_model_module
+import train_ts_model_pseudo_pc_hbm as ts_entrypoint
 from train_ts_model_pseudo_pc_hbm import parse_args, validate_training_args
 
 
@@ -283,7 +284,13 @@ def test_ts_model_teacher_only_uses_raw_student_off_paths(monkeypatch):
 
     monkeypatch.setattr(ts_model_module.torch.hub, "load", lambda *args, **kwargs: FakeDino())
     monkeypatch.setattr(ts_model_module.torch, "load", lambda *args, **kwargs: {})
-    monkeypatch.setattr(ts_model_module, "Decoder", FakeDecoder)
+    monkeypatch.setattr(
+        ts_model_module,
+        "build_decoder",
+        lambda decoder_arch, pc_cfg=None, attach_pc=True: FakeDecoder(
+            pc_cfg=pc_cfg if attach_pc else None
+        ),
+    )
     monkeypatch.setattr(
         ts_model_module,
         "load_decoder_compatible",
@@ -475,3 +482,75 @@ def test_joint_cli_retains_legacy_optional_split():
             allow_legacy_pc_init=True,
         )
     )
+
+
+@pytest.mark.parametrize("training_design", ["teacher_only", "joint"])
+def test_ts_cli_enables_unused_parameter_discovery_for_every_design(
+    monkeypatch,
+    training_design,
+):
+    args = SimpleNamespace(
+        training_design=training_design,
+        experiment_profile="bgfbr_pc",
+        teacher_pc_checkpoint="teacher_enhancer.pth",
+        student_checkpoint=None,
+        output_dir="results/ts",
+        resume=None,
+        allow_legacy_pc_init=False,
+        labeled_indices_pt=None,
+        epochs=1,
+        num_workers=0,
+        memory_batch_size=1,
+        memory_num_workers=0,
+        seed=2027,
+        deterministic=True,
+    )
+    context = SimpleNamespace(rank=0, device="cuda:0")
+    cfg = SimpleNamespace()
+    pc_cfg = SimpleNamespace(configure_training_design=lambda _design: None)
+    model = SimpleNamespace(to=lambda _device: model)
+    wrap_calls = []
+    train_calls = []
+
+    monkeypatch.setattr(ts_entrypoint, "parse_args", lambda: args)
+    monkeypatch.setattr(ts_entrypoint, "init_distributed", lambda: context)
+    monkeypatch.setattr(ts_entrypoint, "set_seed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(ts_entrypoint, "Config", lambda: cfg)
+    monkeypatch.setattr(
+        ts_entrypoint,
+        "configure_distributed",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(ts_entrypoint, "DinoPCHBMConfig", lambda: pc_cfg)
+    monkeypatch.setattr(
+        ts_entrypoint,
+        "apply_experiment_profile",
+        lambda *_args, **_kwargs: SimpleNamespace(name="bgfbr_pc"),
+    )
+    monkeypatch.setattr(ts_entrypoint, "TSModel", lambda **_kwargs: model)
+
+    def fake_wrap_distributed(
+        wrapped_model,
+        wrapped_context,
+        *,
+        find_unused_parameters=False,
+    ):
+        wrap_calls.append(
+            (wrapped_model, wrapped_context, find_unused_parameters)
+        )
+        return wrapped_model
+
+    monkeypatch.setattr(ts_entrypoint, "wrap_distributed", fake_wrap_distributed)
+    monkeypatch.setattr(
+        ts_entrypoint,
+        "PCHBMPseudoTrainer",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            train=lambda: train_calls.append(training_design)
+        ),
+    )
+    monkeypatch.setattr(ts_entrypoint, "cleanup_distributed", lambda: None)
+
+    ts_entrypoint.main()
+
+    assert wrap_calls == [(model, context, True)]
+    assert train_calls == [training_design]

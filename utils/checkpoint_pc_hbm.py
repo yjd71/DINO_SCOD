@@ -27,6 +27,115 @@ ARTIFACT_METADATA_KEYS = (
     "pc_frozen",
 )
 TRAINING_DESIGNS = frozenset({"teacher_only", "two_stage", "joint"})
+DECODER_ARCHITECTURES = frozenset({"legacy_transformer", "bgfbr_pc_v1"})
+DECODER_CONTRACT_VERSION = 1
+
+
+def _config_decoder_identity(config: Any | None) -> tuple[str | None, int | None]:
+    if config is None:
+        return None, None
+    if isinstance(config, Mapping):
+        architecture = config.get("decoder_arch") or config.get("decoder_architecture")
+        contract = config.get("decoder_contract_version")
+    else:
+        architecture = getattr(config, "decoder_arch", None) or getattr(
+            config, "decoder_architecture", None
+        )
+        contract = getattr(config, "decoder_contract_version", None)
+    if architecture is None:
+        return None, None
+    architecture = str(architecture)
+    if architecture not in DECODER_ARCHITECTURES:
+        raise ValueError(f"Unsupported decoder architecture metadata: {architecture!r}")
+    return architecture, int(contract if contract is not None else DECODER_CONTRACT_VERSION)
+
+
+def _module_decoder_identity(module: nn.Module | None) -> tuple[str | None, int | None]:
+    if module is None:
+        return None, None
+    root = _unwrap(module)
+    identities: set[tuple[str, int]] = set()
+    for candidate in root.modules():
+        architecture = getattr(candidate, "decoder_arch", None) or getattr(
+            candidate, "decoder_architecture", None
+        )
+        class_name = type(candidate).__name__.lower()
+        if architecture is None and "legacytransformerdecoder" in class_name:
+            architecture = "legacy_transformer"
+        elif architecture is None and "bgfbr" in class_name and "decoder" in class_name:
+            architecture = "bgfbr_pc_v1"
+        if architecture is None:
+            continue
+        architecture = str(architecture)
+        if architecture not in DECODER_ARCHITECTURES:
+            raise ValueError(f"Unsupported decoder architecture on module: {architecture!r}")
+        contract = int(
+            getattr(candidate, "decoder_contract_version", DECODER_CONTRACT_VERSION)
+        )
+        identities.add((architecture, contract))
+    if not identities:
+        return _config_decoder_identity(getattr(root, "pc_cfg", None))
+    if len(identities) != 1:
+        raise RuntimeError(f"Model contains conflicting decoder identities: {sorted(identities)}")
+    return next(iter(identities))
+
+
+def _checkpoint_decoder_identity(checkpoint: Mapping[str, Any]) -> tuple[str | None, int | None]:
+    architecture = checkpoint.get("decoder_architecture")
+    contract = checkpoint.get("decoder_contract_version")
+    if architecture is None:
+        return _config_decoder_identity(checkpoint.get("pc_cfg"))
+    architecture = str(architecture)
+    if architecture not in DECODER_ARCHITECTURES:
+        raise RuntimeError(f"Checkpoint declares unsupported decoder architecture {architecture!r}")
+    return architecture, int(contract if contract is not None else DECODER_CONTRACT_VERSION)
+
+
+def _resolved_save_decoder_identity(
+    module: nn.Module, config: Any | None
+) -> tuple[str | None, int | None]:
+    module_identity = _module_decoder_identity(module)
+    config_identity = _config_decoder_identity(config)
+    if module_identity[0] is not None and config_identity[0] is not None:
+        if module_identity != config_identity:
+            raise RuntimeError(
+                "Decoder module/config architecture mismatch: "
+                f"module={module_identity}, config={config_identity}"
+            )
+    return module_identity if module_identity[0] is not None else config_identity
+
+
+def _attach_decoder_identity(
+    payload: dict[str, Any], module: nn.Module, config: Any | None
+) -> None:
+    architecture, contract = _resolved_save_decoder_identity(module, config)
+    if architecture is None:
+        return
+    payload["decoder_architecture"] = architecture
+    payload["decoder_contract_version"] = int(contract)
+
+
+def _validate_decoder_identity(checkpoint: Mapping[str, Any], target: nn.Module) -> None:
+    expected_arch, expected_contract = _module_decoder_identity(target)
+    if expected_arch is None:
+        return
+    actual_arch, actual_contract = _checkpoint_decoder_identity(checkpoint)
+    if actual_arch is None:
+        if expected_arch == "legacy_transformer":
+            return
+        raise RuntimeError(
+            "Decoder checkpoint has no architecture metadata; normal BGFBR loading is forbidden. "
+            "Use load_legacy_into_bgfbr(...) for an explicit legacy migration."
+        )
+    if actual_arch != expected_arch:
+        raise RuntimeError(
+            f"Decoder architecture mismatch: checkpoint={actual_arch!r}, target={expected_arch!r}"
+        )
+    if expected_contract is not None and actual_contract != expected_contract:
+        raise RuntimeError(
+            "Decoder contract mismatch: "
+            f"checkpoint={actual_contract!r}, target={expected_contract!r}"
+        )
 
 
 def load_decoder_compatible(
@@ -46,6 +155,7 @@ def load_decoder_compatible(
     checkpoint = _load_source(source)
     if expected_artifact_meta is not None:
         validate_artifact_metadata(checkpoint, expected_artifact_meta)
+    _validate_decoder_identity(checkpoint, decoder)
     state = extract_decoder_state(checkpoint)
     result = decoder.load_state_dict(state, strict=False)
     invalid_missing = [key for key in result.missing_keys if not key.startswith("pc_hbm.")]
@@ -80,6 +190,7 @@ def save_decoder_checkpoint(
         "decoder": _unwrap(decoder).state_dict(),
         "pc_cfg": _config_dict(pc_cfg),
     }
+    _attach_decoder_identity(payload, decoder, pc_cfg)
     _optional_state(payload, "optimizer", optimizer)
     _optional_state(payload, "scheduler", scheduler)
     _optional_state(payload, "scaler", scaler)
@@ -115,7 +226,7 @@ def load_memory_checkpoint(
     path: str | os.PathLike | Mapping[str, Any],
     memory,
     expected_compat: Mapping[str, Any] | None = None,
-    require_producer_match: bool = False,
+    require_producer_match: bool = True,
 ) -> dict[str, Any]:
     """Load CPU memory and reject an incompatible schema when requested."""
 
@@ -161,6 +272,7 @@ def save_training_resume(
         "pc_cfg": _config_dict(pc_cfg),
         "rng_state": capture_rng_state(),
     }
+    _attach_decoder_identity(payload, model, pc_cfg)
     _optional_state(payload, "scheduler", scheduler)
     _optional_state(payload, "scaler", scaler)
     if ema_model is not None:
@@ -191,6 +303,7 @@ def load_training_resume(
     if expected_artifact_meta is not None:
         validate_artifact_metadata(checkpoint, expected_artifact_meta)
     target_model = _unwrap(model)
+    _validate_decoder_identity(checkpoint, target_model)
     state = _align_module_prefix(checkpoint["model"], target_model.state_dict())
     target_model.load_state_dict(state, strict=True)
     _restore_optional_state(checkpoint, "optimizer", optimizer)
@@ -429,6 +542,101 @@ def extract_decoder_state(
     return _strip_single_module_prefix(_extract_decoder_state(checkpoint))
 
 
+def load_legacy_into_bgfbr(
+    decoder: nn.Module,
+    checkpoint: str | os.PathLike | Mapping[str, Any],
+    *,
+    reuse_projectors: bool = True,
+    reuse_pc_core: bool = False,
+) -> dict[str, Any]:
+    """Explicitly migrate the reusable subset of a legacy Decoder into BGFBR.
+
+    This is intentionally separate from :func:`load_decoder_compatible`.
+    Transformer blocks, segmentation heads, and memory tensors are never
+    imported.  Expanded PC boundary/mixture inputs copy old channels into the
+    leading slice and initialize every newly introduced channel to zero.
+    """
+
+    source_checkpoint = _load_source(checkpoint)
+    if not isinstance(source_checkpoint, Mapping):
+        raise TypeError("Legacy decoder checkpoint must be a mapping")
+    source_arch, _ = _checkpoint_decoder_identity(source_checkpoint)
+    if source_arch not in {None, "legacy_transformer"}:
+        raise RuntimeError(
+            f"Explicit legacy migration requires legacy_transformer weights, got {source_arch!r}"
+        )
+    target = _unwrap(decoder)
+    target_arch, target_contract = _module_decoder_identity(target)
+    if target_arch != "bgfbr_pc_v1":
+        raise RuntimeError(
+            "load_legacy_into_bgfbr target must declare decoder_arch='bgfbr_pc_v1'"
+        )
+
+    source_state = extract_decoder_state(source_checkpoint)
+    target_state = {
+        name: value.detach().clone() if torch.is_tensor(value) else value
+        for name, value in target.state_dict().items()
+    }
+    parameter_names = {name for name, _ in target.named_parameters()}
+    copied: set[str] = set()
+    expanded: set[str] = set()
+    skipped_pc: set[str] = set()
+
+    projector_prefixes = tuple(f"linear_{index}." for index in range(1, 5))
+    for name, source_value in source_state.items():
+        is_projector = name.startswith(projector_prefixes)
+        is_pc = name.startswith("pc_hbm.")
+        if not ((reuse_projectors and is_projector) or (reuse_pc_core and is_pc)):
+            continue
+        target_value = target_state.get(name)
+        if target_value is None or not torch.is_tensor(source_value):
+            if is_pc:
+                skipped_pc.add(name)
+            continue
+        source_value = source_value.detach().to(device=target_value.device, dtype=target_value.dtype)
+        if source_value.shape == target_value.shape:
+            target_state[name] = source_value.clone()
+            copied.add(name)
+            continue
+        if is_pc and reuse_pc_core:
+            can_expand_conv = (
+                source_value.ndim == target_value.ndim == 4
+                and source_value.shape[0] == target_value.shape[0]
+                and source_value.shape[2:] == target_value.shape[2:]
+                and source_value.shape[1] < target_value.shape[1]
+            )
+            can_expand_linear = (
+                source_value.ndim == target_value.ndim == 2
+                and source_value.shape[0] == target_value.shape[0]
+                and source_value.shape[1] < target_value.shape[1]
+            )
+            if can_expand_conv or can_expand_linear:
+                migrated = torch.zeros_like(target_value)
+                migrated[:, : source_value.shape[1], ...] = source_value
+                target_state[name] = migrated
+                copied.add(name)
+                expanded.add(name)
+                continue
+            skipped_pc.add(name)
+
+    target.load_state_dict(target_state, strict=True)
+    reused_parameter_names = tuple(sorted(copied.intersection(parameter_names)))
+    report = {
+        "source_architecture": source_arch or "legacy_transformer",
+        "target_architecture": target_arch,
+        "target_contract_version": target_contract,
+        "reuse_projectors": bool(reuse_projectors),
+        "reuse_pc_core": bool(reuse_pc_core),
+        "copied_state_keys": tuple(sorted(copied)),
+        "expanded_input_state_keys": tuple(sorted(expanded)),
+        "skipped_pc_state_keys": tuple(sorted(skipped_pc)),
+    }
+    return {
+        "reused_parameter_names": reused_parameter_names,
+        "report": report,
+    }
+
+
 def extract_non_pc_decoder_state(
     source: str | os.PathLike | Mapping[str, Any],
     *,
@@ -598,6 +806,7 @@ __all__ = [
     "extract_decoder_state",
     "extract_non_pc_decoder_state",
     "load_decoder_compatible",
+    "load_legacy_into_bgfbr",
     "load_memory_checkpoint",
     "load_pc_hbm_memory",
     "load_training_resume",

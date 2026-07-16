@@ -168,6 +168,7 @@ def test_missing_memory_warns_and_legacy_checkpoint_alias(monkeypatch):
     assert args.batch_size == 16
     assert args.num_workers == 4
     assert args.amp is False
+    assert args.require_producer_match is True
 
 
 def test_inference_cli_accepts_throughput_options(monkeypatch):

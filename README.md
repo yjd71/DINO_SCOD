@@ -139,6 +139,10 @@ The opt-in DINO PC-HBM training, resume, inference, compatibility, and smoke-tes
 commands are documented in [docs/PC_HBM.md](docs/PC_HBM.md). The original RSBL
 entry points remain available.
 
+The BGFBR × PC-HBM architecture, reproducible ablation profiles, explicit legacy
+migration, schema-v2 memory rebuild, and Phase-7 experiment matrix are documented
+in [docs/BGFBR_PC_HBM.md](docs/BGFBR_PC_HBM.md).
+
 ### PC-BACS offline sampling
 
 The zero-parameter PC-BACS workflow builds a 40-image DINO seed, trains a

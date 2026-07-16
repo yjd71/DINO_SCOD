@@ -10,6 +10,7 @@ import argparse
 import warnings
 from contextlib import nullcontext
 
+from configs.bgfbr_experiments import apply_experiment_profile, experiment_profile_names
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from Model.PC_HBM.memory.pc_memory import PCMemory
 from utils.checkpoint_pc_hbm import load_decoder_compatible, load_memory_checkpoint
@@ -124,6 +125,12 @@ def inference(
 def parse_args():
     parser = argparse.ArgumentParser(description='Run RSBL inference.')
     parser.add_argument(
+        '--experiment-profile',
+        choices=experiment_profile_names(),
+        default='bgfbr_pc',
+        help='Must match the profile used to produce the Decoder and optional memory.',
+    )
+    parser.add_argument(
         '--checkpoint',
         '--decoder-checkpoint',
         dest='decoder_checkpoint',
@@ -143,8 +150,9 @@ def parse_args():
     )
     parser.add_argument(
         '--require-producer-match',
-        action='store_true',
-        help='Also require the memory producer fingerprint to match the expected fingerprint.',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Require the memory producer fingerprint to match (default: enabled).',
     )
     parser.add_argument(
         '--batch-size',
@@ -171,7 +179,7 @@ def parse_args():
 def load_inference_memory(
     path,
     pc_cfg,
-    require_producer_match=False,
+    require_producer_match=True,
     producer_fingerprint=None,
 ):
     """Load compatible CPU-FP16 memory, or warn and return ``None``.
@@ -183,6 +191,14 @@ def load_inference_memory(
     if path is None:
         warnings.warn(
             'No PC-HBM memory checkpoint was provided; inference will use z_main logits.',
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return None
+    if require_producer_match and not producer_fingerprint:
+        warnings.warn(
+            'PC-HBM producer fingerprint is required for strict inference; '
+            'inference will use z_main logits.',
             RuntimeWarning,
             stacklevel=2,
         )
@@ -221,6 +237,8 @@ if __name__ == '__main__':
     args = parse_args()
     cfg = Config()
     pc_cfg = DinoPCHBMConfig()
+    experiment_profile = apply_experiment_profile(pc_cfg, args.experiment_profile)
+    cfg.experiment_profile = experiment_profile.name
     model = BaseModel(pc_cfg=pc_cfg)
     load_decoder_compatible(
         model.decoder,

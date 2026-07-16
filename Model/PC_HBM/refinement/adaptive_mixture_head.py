@@ -24,6 +24,7 @@ class AdaptiveMixtureHead(nn.Module):
         init_bias: list[float] | tuple[float, ...] = (1.0, -0.5, -0.5, -0.5),
         use_branch_quality: bool = True,
         use_branch_dropout: bool = True,
+        context_ch: int = 14,
     ) -> None:
         super().__init__()
         if len(init_bias) != 4:
@@ -32,8 +33,11 @@ class AdaptiveMixtureHead(nn.Module):
         self.max_offset = float(max_offset)
         self.mask_corr_epsilon = float(mask_corr_epsilon)
         self.use_branch_dropout = bool(use_branch_dropout)
+        self.context_ch = int(context_ch)
+        if self.context_ch not in {14, 16}:
+            raise ValueError("mixture context_ch must be 14 (legacy) or 16 (BGFBR)")
         self.mix_head = nn.Sequential(
-            nn.Conv2d(14, 32, 3, padding=1),
+            nn.Conv2d(self.context_ch, 32, 3, padding=1),
             nn.GELU(),
             nn.Conv2d(32, 4, 1),
         )
@@ -44,7 +48,7 @@ class AdaptiveMixtureHead(nn.Module):
             )
         if use_branch_quality:
             self.quality_head: nn.Module | None = nn.Sequential(
-                nn.Conv2d(14, 32, 3, padding=1),
+                nn.Conv2d(self.context_ch, 32, 3, padding=1),
                 nn.GELU(),
                 nn.Conv2d(32, 4, 1),
             )
@@ -61,6 +65,7 @@ class AdaptiveMixtureHead(nn.Module):
         epoch: int | None = None,
         temperature: float = 1.0,
         eps_floor: float = 0.0,
+        extra_context: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         del epoch
         if z_main.ndim != 4 or z_main.shape[1:] != (1, 98, 98):
@@ -143,6 +148,21 @@ class AdaptiveMixtureHead(nn.Module):
             ],
             dim=1,
         )
+        if self.context_ch == 16:
+            if extra_context is None:
+                extra_context = torch.zeros(
+                    z_main.size(0), 2, *size, device=z_main.device, dtype=z_main.dtype
+                )
+            if extra_context.ndim != 4 or extra_context.size(1) != 2:
+                raise ValueError("BGFBR mixture extra_context must be [B,2,H,W]")
+            extra_context = F.interpolate(
+                extra_context, size=size, mode="bilinear", align_corners=False
+            )
+            context = torch.cat([context, extra_context], dim=1)
+        if context.size(1) != self.context_ch:
+            raise RuntimeError(
+                f"mixture context expected {self.context_ch} channels, got {context.size(1)}"
+            )
         mix_logits = self.mix_head(context)
         if self.training and self.use_branch_dropout:
             drop = torch.rand(
@@ -193,4 +213,3 @@ class AdaptiveMixtureHead(nn.Module):
             "z_final": z_final,
             "p_final": torch.sigmoid(z_final),
         }
-

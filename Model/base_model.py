@@ -1,12 +1,16 @@
 import torch
 import torch.nn as nn
 import warnings
-from Model.decoder import Decoder
-from utils.checkpoint_pc_hbm import load_decoder_compatible
+from Model.BGFBR import ImageNetRGBAdapter
+from Model.decoder import build_decoder, resolve_decoder_arch
+from utils.checkpoint_pc_hbm import (
+    load_decoder_compatible,
+    save_decoder_checkpoint as save_decoder_artifact,
+)
 
 
 class BaseModel(nn.Module):
-    def __init__(self, pc_cfg=None):
+    def __init__(self, pc_cfg=None, decoder_arch=None, attach_pc=True):
         super(BaseModel, self).__init__()
 
         self.patch_size = 14
@@ -18,7 +22,13 @@ class BaseModel(nn.Module):
         self.dino.eval()
 
         self.pc_cfg = pc_cfg
-        self.decoder = Decoder(pc_cfg=pc_cfg)
+        self.decoder_arch = resolve_decoder_arch(decoder_arch, pc_cfg)
+        self.rgb_adapter = ImageNetRGBAdapter()
+        self.decoder = build_decoder(
+            self.decoder_arch,
+            pc_cfg=pc_cfg,
+            attach_pc=bool(attach_pc),
+        )
 
     def train(self, mode=True):
         super().train(mode)
@@ -49,6 +59,11 @@ class BaseModel(nn.Module):
     def _extract_features(self, x):
         """Backward-compatible alias used by the original training scripts."""
         return self.extract_features(x)
+
+    def prepare_rgb(self, x):
+        """Return the sole RGB representation consumed by BGFBR and memory."""
+
+        return self.rgb_adapter(x)
         
     def forward(
         self,
@@ -60,8 +75,10 @@ class BaseModel(nn.Module):
         query_image_ids=None,
     ):
         x_features = self.extract_features(x)
+        image_rgb = self.prepare_rgb(x)
         return self.decoder(
             features=x_features,
+            image_rgb=image_rgb,
             memory=memory,
             pc_mode=pc_mode,
             epoch=epoch,
@@ -71,17 +88,19 @@ class BaseModel(nn.Module):
     
     def inference(self, x, memory=None, epoch=None):
         x_features = self.extract_features(x)
+        image_rgb = self.prepare_rgb(x)
         if self.decoder.pc_hbm is None:
-            return self.decoder(features=x_features, pc_mode='off')[3]
+            return self.decoder(features=x_features, image_rgb=image_rgb, pc_mode='off')[3]
         if memory is None:
             warnings.warn(
                 'PC-HBM memory is missing; using z_main logits.',
                 RuntimeWarning,
                 stacklevel=2,
             )
-            return self.decoder(features=x_features, pc_mode='off')[3]
+            return self.decoder(features=x_features, image_rgb=image_rgb, pc_mode='off')[3]
         _, aux = self.decoder(
             features=x_features,
+            image_rgb=image_rgb,
             memory=memory,
             pc_mode='full',
             epoch=epoch,
@@ -99,7 +118,7 @@ class BaseModel(nn.Module):
     
     def save_decoder_checkpoint(self, path):
         assert path.endswith('.pth'), f'Path should end with .pth, but got: {path}'
-        torch.save(self.decoder.state_dict(), path)
+        save_decoder_artifact(path, self.decoder, self.pc_cfg, epoch=0)
         print(f'Successfully save seg parameters to {path}.')
 
     def load_decoder_checkpoint(self, path, require_pc_complete=False):
