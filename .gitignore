@@ -18,6 +18,13 @@ tests/*
 !tests/test_pc_bpus_prototype.py
 !tests/test_pc_bpus_greedy.py
 !tests/test_pc_bpus_cli.py
+!tests/test_bpus_v2_score.py
+!tests/test_bpus_v2_utility.py
+!tests/test_bpus_v2_prototype.py
+!tests/test_bpus_v2_greedy.py
+!tests/test_bpus_v2_trainer.py
+!tests/test_bpus_v2_cli.py
+!tests/test_bpus_v2_integration.py
 !tests/test_bgfbr_primitives.py
 !tests/test_bgfbr_decoder.py
 !tests/test_bgfbr_experiments.py
