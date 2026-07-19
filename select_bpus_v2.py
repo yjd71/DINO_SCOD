@@ -13,6 +13,7 @@ import os
 import platform
 import random
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -535,20 +536,90 @@ def _verify_saved_splits(
     counts: Sequence[int],
     catalog_keys: Sequence[str],
     bootstrap_keys: Sequence[str],
-) -> tuple[dict[int, list[str]], dict[str, str]]:
+) -> tuple[dict[int, list[str]], dict[str, str], dict[str, str]]:
     loaded: dict[int, list[str]] = {}
     fingerprints: dict[str, str] = {}
+    txt_fingerprints: dict[str, str] = {}
     for count in counts:
         path = output_dir / f"bpus_v2_{count:04d}_seed{seed}.pt"
         keys = load_split_keys(path, catalog_keys=catalog_keys, expected_count=count)
+        txt_path = path.with_suffix(".txt")
+        txt_keys = _load_split_text(txt_path, expected_keys=keys)
+        if compute_labeled_split_fingerprint(txt_keys) != compute_labeled_split_fingerprint(
+            keys
+        ):
+            raise RuntimeError(f"TXT split fingerprint disagrees with {path.name}")
         loaded[int(count)] = keys
         fingerprints[str(count)] = compute_labeled_split_fingerprint(keys)
+        txt_fingerprints[str(count)] = file_sha256(txt_path)
     if loaded[int(counts[0])] != list(bootstrap_keys):
         raise RuntimeError("The smallest BPUS-v2 split is not the common bootstrap")
     for smaller, larger in zip(counts, counts[1:]):
         if not set(loaded[int(smaller)]) < set(loaded[int(larger)]):
             raise RuntimeError(f"Strict nesting failed for {smaller} subset {larger}")
-    return loaded, fingerprints
+    return loaded, fingerprints, txt_fingerprints
+
+
+def _canonical_split_text(sample_keys: Sequence[str]) -> bytes:
+    keys = list(sample_keys)
+    if not keys:
+        raise ValueError("TXT split must contain at least one sample key")
+    if not all(type(key) is str for key in keys):
+        raise TypeError("TXT split must contain only strings")
+    if keys != sorted(keys) or len(keys) != len(set(keys)):
+        raise ValueError("TXT split keys must be sorted and unique")
+    if any(
+        not key
+        or key != key.strip()
+        or "\\" in key
+        or "\n" in key
+        or "\r" in key
+        for key in keys
+    ):
+        raise ValueError("TXT split contains a non-canonical sample key")
+    return ("\n".join(keys) + "\n").encode("utf-8")
+
+
+def _save_split_text(path: Path, sample_keys: Sequence[str]) -> str:
+    """Atomically save one canonical stable sample key per UTF-8 line."""
+
+    payload = _canonical_split_text(sample_keys)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        if path.read_bytes() == payload:
+            return file_sha256(path)
+        raise FileExistsError(f"refusing to overwrite different TXT split: {path}")
+
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    os.close(descriptor)
+    temporary_path = Path(temporary_name)
+    try:
+        temporary_path.write_bytes(payload)
+        os.replace(temporary_path, path)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return file_sha256(path)
+
+
+def _load_split_text(path: Path, *, expected_keys: Sequence[str]) -> list[str]:
+    """Reload a TXT split and require exact semantic parity with its PT peer."""
+
+    if not path.is_file():
+        raise FileNotFoundError(f"Missing TXT split: {path}")
+    expected = list(expected_keys)
+    expected_payload = _canonical_split_text(expected)
+    payload = path.read_bytes()
+    if payload != expected_payload:
+        try:
+            actual = payload.decode("utf-8").splitlines()
+        except UnicodeDecodeError as error:
+            raise ValueError(f"TXT split is not valid UTF-8: {path}") from error
+        if actual != expected:
+            raise ValueError(f"TXT split disagrees with its PT peer: {path}")
+        raise ValueError(f"TXT split is not in canonical UTF-8/LF form: {path}")
+    return expected
 
 
 def _with_fingerprint(
@@ -580,6 +651,35 @@ def _validate_fingerprinted_payload(
         raise ValueError(f"{label} fields disagree with the expected schema")
     if stable_fingerprint(saved_without_fingerprint) != expected_fingerprint:
         raise ValueError(f"{label} contents disagree with deterministic replay")
+
+
+def _save_or_upgrade_manifest(
+    manifest: Mapping[str, Any],
+    manifest_base: Mapping[str, Any],
+    path: Path,
+) -> None:
+    """Save the manifest, allowing only the deterministic TXT-field upgrade."""
+
+    if not path.is_file():
+        atomic_json_save(manifest, path)
+        return
+    with path.open("r", encoding="utf-8") as stream:
+        saved = json.load(stream)
+    if saved == manifest:
+        return
+
+    legacy_base = dict(manifest_base)
+    legacy_base.pop("split_txt_fingerprints")
+    legacy_files = dict(legacy_base["files"])
+    legacy_files.pop("split_txt")
+    legacy_base["files"] = legacy_files
+    _validate_fingerprinted_payload(
+        saved,
+        legacy_base,
+        fingerprint_field="manifest_fingerprint",
+        label="legacy selection_manifest.json",
+    )
+    atomic_json_save(manifest, path, refuse_mismatch=False)
 
 
 def _cumulative_subset_counts(
@@ -851,11 +951,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.verify_only:
         atomic_torch_save(acquisition_payload, acquisition_path)
         for count in protocol.target_counts:
-            save_split_keys(
-                args.output_dir / f"bpus_v2_{count:04d}_seed{args.seed}.pt",
-                result.splits[count],
+            split_path = (
+                args.output_dir / f"bpus_v2_{count:04d}_seed{args.seed}.pt"
             )
-    _, split_fingerprints = _verify_saved_splits(
+            save_split_keys(split_path, result.splits[count])
+            _save_split_text(split_path.with_suffix(".txt"), result.splits[count])
+    _, split_fingerprints, split_txt_fingerprints = _verify_saved_splits(
         args.output_dir,
         seed=args.seed,
         counts=protocol.target_counts,
@@ -892,6 +993,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "bootstrap_path": str(args.bootstrap_split),
         "bootstrap_fingerprint": split_fingerprint,
         "split_fingerprints": split_fingerprints,
+        "split_txt_fingerprints": split_txt_fingerprints,
         "acquired_count": len(result.acquired_keys),
         "tie_break": ["higher_Q", "higher_V", "higher_N", "smaller_sample_key"],
         "diagnostics": diagnostics,
@@ -902,6 +1004,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             "runtime_report": runtime_path.name,
             "splits": {
                 str(count): f"bpus_v2_{count:04d}_seed{args.seed}.pt"
+                for count in protocol.target_counts
+            },
+            "split_txt": {
+                str(count): f"bpus_v2_{count:04d}_seed{args.seed}.txt"
                 for count in protocol.target_counts
             },
         },
@@ -945,7 +1051,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Verification passed; cache replay and all nested splits are identical.")
         return 0
 
-    atomic_json_save(manifest, manifest_path)
+    _save_or_upgrade_manifest(manifest, manifest_base, manifest_path)
     runtime = _runtime_payload(
         args=args,
         protocol=protocol,

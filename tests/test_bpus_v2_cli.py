@@ -20,6 +20,7 @@ from utils.checkpoint_pc_hbm import (
     compute_labeled_split_fingerprint,
     state_dict_fingerprint,
 )
+from utils.dataloader import _load_txt_sample_keys
 
 
 def test_cli_requires_explicit_counts_and_defaults_to_batch_16() -> None:
@@ -122,6 +123,23 @@ def test_schema_one_pool_cache_cannot_be_rebuilt_in_place(tmp_path: Path) -> Non
     torch.save({"schema_version": 1, "method": "legacy"}, cache)
     with pytest.raises(ValueError, match="schema 2"):
         select_bpus_v2._assert_v2_cache_namespace((cache,))
+
+
+def test_split_txt_uses_loader_compatible_stable_keys(tmp_path: Path) -> None:
+    keys = ["TR-CAMO/a", "TR-COD10K/shared-name"]
+    path = tmp_path / "bpus_v2_0002_seed17.txt"
+    fingerprint = select_bpus_v2._save_split_text(path, keys)
+
+    items = [
+        {"key": "TR-CAMO/a", "stem": "a"},
+        {"key": "TR-COD10K/shared-name", "stem": "shared-name"},
+    ]
+    assert _load_txt_sample_keys(path, items) == set(keys)
+    assert fingerprint == file_sha256(path)
+    assert path.read_bytes() == b"TR-CAMO/a\nTR-COD10K/shared-name\n"
+
+    with pytest.raises(FileExistsError, match="different TXT split"):
+        select_bpus_v2._save_split_text(path, ["TR-CAMO/different"])
 
 
 def test_score_pool_never_enables_amp_on_cpu(
@@ -336,8 +354,32 @@ def test_synthetic_schema_two_round_trip_verify_and_tamper_detection(
         load_split_keys(output_dir / "bpus_v2_0004_seed17.pt")
     ) < set(load_split_keys(output_dir / "bpus_v2_0006_seed17.pt"))
 
+    for count in protocol.target_counts:
+        pt_path = output_dir / f"bpus_v2_{count:04d}_seed17.pt"
+        txt_path = pt_path.with_suffix(".txt")
+        pt_keys = load_split_keys(pt_path)
+        assert txt_path.read_text(encoding="utf-8").splitlines() == pt_keys
+        assert txt_path.read_bytes() == (
+            "\n".join(pt_keys) + "\n"
+        ).encode("utf-8")
+
     manifest_path = output_dir / "selection_manifest.json"
     manifest_before = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest_before["files"]["split_txt"] == {
+        str(count): f"bpus_v2_{count:04d}_seed17.txt"
+        for count in protocol.target_counts
+    }
+    assert manifest_before["split_txt_fingerprints"] == {
+        str(count): file_sha256(
+            output_dir / f"bpus_v2_{count:04d}_seed17.txt"
+        )
+        for count in protocol.target_counts
+    }
+    for count in protocol.target_counts:
+        pt_keys = load_split_keys(output_dir / f"bpus_v2_{count:04d}_seed17.pt")
+        assert manifest_before["split_fingerprints"][str(count)] == (
+            compute_labeled_split_fingerprint(pt_keys)
+        )
     runtime_path = output_dir / "runtime_report.json"
     runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
     runtime["elapsed_seconds"] = 999.0
@@ -350,6 +392,14 @@ def test_synthetic_schema_two_round_trip_verify_and_tamper_detection(
     )
     assert select_bpus_v2.main([*common, "--verify-only"]) == 0
     assert json.loads(manifest_path.read_text(encoding="utf-8")) == manifest_before
+
+    txt_path = output_dir / "bpus_v2_0002_seed17.txt"
+    canonical_txt = txt_path.read_bytes()
+    txt_path.write_text("TR-CAMO/not-the-pt-split\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="TXT split disagrees with its PT peer"):
+        select_bpus_v2.main([*common, "--verify-only"])
+    txt_path.write_bytes(canonical_txt)
+    assert select_bpus_v2.main([*common, "--verify-only"]) == 0
 
     acquisition["utility"][0] += 1.0
     torch.save(acquisition, output_dir / "acquisition_order.pt")
