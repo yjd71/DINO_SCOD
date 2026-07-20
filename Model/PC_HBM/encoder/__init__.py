@@ -30,7 +30,22 @@ from .encoder_memory import (
 )
 from .encoder_memory_builder import EncoderMemoryBuilder
 from .encoder_router import EncoderPCRouter, EncoderRouter
+from .encoder_feature_injector import (
+    EncoderF4F3InjectionOutput,
+    EncoderFeatureInjector,
+)
+from .encoder_pc_adapter import (
+    EncoderPCAdapter,
+    EncoderPCAdapterOutput,
+    EncoderPCHBMAdapter,
+    EncoderPCStageFlags,
+)
 from .feature_projector import DinoFeatureProjector, ProjectedDinoFeatures
+from .route_context_adapter import (
+    EncoderRouteContextAdapter,
+    EncoderRouteContextOutput,
+    scatter_query_tokens,
+)
 
 __all__ = [
     "DinoFeatureBundle",
@@ -53,6 +68,15 @@ __all__ = [
     "EncoderPCMemory",
     "EncoderPCRouter",
     "EncoderRouter",
+    "EncoderF4F3InjectionOutput",
+    "EncoderFeatureInjector",
+    "EncoderPCAdapter",
+    "EncoderPCAdapterOutput",
+    "EncoderPCHBMAdapter",
+    "EncoderPCStageFlags",
+    "EncoderRouteContextAdapter",
+    "EncoderRouteContextOutput",
+    "scatter_query_tokens",
     "ChildSemanticDetailVerifier",
     "EncoderParentChildDetailVerifier",
     "EncoderParentRetriever",
