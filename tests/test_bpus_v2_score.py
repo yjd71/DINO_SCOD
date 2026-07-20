@@ -40,6 +40,44 @@ def test_constant_prediction_is_strictly_invalid_and_zero_value() -> None:
     assert not score.valid_boundary.item()
 
 
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize(
+    "input_name", ["probability", "transformed_probability"]
+)
+def test_boundary_score_rejects_nonfinite_probability(
+    input_name: str, bad_value: float
+) -> None:
+    probability = _square_probability()
+    transformed = probability.clone()
+    target = probability if input_name == "probability" else transformed
+    target[0, 0, 3, 3] = bad_value
+
+    with pytest.raises(ValueError, match=input_name):
+        compute_boundary_score_bpus_v2(probability, transformed)
+
+
+@pytest.mark.parametrize("bad_value", [-1e-3, 1.001])
+def test_boundary_score_rejects_probability_outside_formal_range(
+    bad_value: float,
+) -> None:
+    probability = _square_probability()
+    probability[0, 0, 0, 0] = bad_value
+
+    with pytest.raises(ValueError, match=r"\[0,1\]"):
+        compute_boundary_score_bpus_v2(probability, probability.clone())
+
+
+def test_probability_allows_only_tiny_endpoint_roundoff() -> None:
+    probability = torch.full((1, 1, 8, 8), 0.5, dtype=torch.float64)
+    probability[0, 0, 0, 0] = -5e-7
+    probability[0, 0, 0, 1] = 1.0 + 5e-7
+
+    score = compute_boundary_score_bpus_v2(probability, probability.clone())
+
+    assert torch.isfinite(score.boundary_value).all()
+    assert score.global_disagreement.item() == 0.0
+
+
 def test_boundary_local_change_has_higher_value_than_global_change() -> None:
     probability = _square_probability()
     boundary = sobel_magnitude_bpus_v2(probability) > 0
@@ -75,6 +113,27 @@ class _TwoViewSelector(torch.nn.Module):
         return (), {"p_final": probability, "features": {"p2": p2}}
 
 
+class _NonFiniteSelector(_TwoViewSelector):
+    def __init__(self, target: str, bad_value: float) -> None:
+        super().__init__()
+        self.target = target
+        self.bad_value = bad_value
+
+    def forward(self, images: torch.Tensor, *, pc_mode: str, return_aux: bool):
+        outputs, aux = super().forward(
+            images, pc_mode=pc_mode, return_aux=return_aux
+        )
+        if self.target == "p_final":
+            probability = aux["p_final"].clone()
+            probability[0, 0, 0, 0] = self.bad_value
+            aux["p_final"] = probability
+        else:
+            p2 = aux["features"]["p2"].clone()
+            p2[0, 0, 0, 0] = self.bad_value
+            aux["features"]["p2"] = p2
+        return outputs, aux
+
+
 def test_scoring_uses_two_explicit_forwards_and_aligns_flip() -> None:
     model = _TwoViewSelector()
     images = torch.randn(2, 3, 56, 56)
@@ -92,6 +151,20 @@ def test_scoring_rejects_non_production_p2_shape() -> None:
         score_and_prototype_bpus_v2(
             _TwoViewSelector(p2_shape=(64, 28, 28)), torch.randn(1, 3, 56, 56)
         )
+
+
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("target", ["p_final", "p2"])
+def test_scoring_rejects_nonfinite_model_outputs_immediately(
+    target: str, bad_value: float
+) -> None:
+    model = _NonFiniteSelector(target, bad_value)
+
+    with pytest.raises(ValueError, match="p_final|P2"):
+        score_and_prototype_bpus_v2(model, torch.randn(1, 3, 56, 56))
+
+    # The invalid original view is rejected before a second model forward.
+    assert model.forward_calls == 1
 
 
 @pytest.mark.parametrize("eps", [0.0, -1.0, float("inf")])

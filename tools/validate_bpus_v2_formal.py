@@ -14,7 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from selection.artifacts import load_split_keys, stable_fingerprint
+from selection.artifacts import file_sha256, load_split_keys, stable_fingerprint
 from utils.checkpoint_pc_hbm import state_dict_fingerprint
 from utils.dataloader import (
     PCLabeledTrainDataset,
@@ -119,6 +119,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise RuntimeError(f"seed{seed} Bootstrap quota mismatch: {quotas}")
 
         splits: dict[int, list[str]] = {}
+        split_txt_fingerprints: dict[str, str] = {}
         loader_counts: dict[str, dict[str, int]] = {}
         for count in counts:
             path = output_dir / f"bpus_v2_{count:04d}_seed{seed}.pt"
@@ -130,6 +131,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             if not set(raw) <= catalog_set:
                 raise ValueError(f"{path} contains keys outside the catalog")
             splits[count] = raw
+
+            txt_path = path.with_suffix(".txt")
+            try:
+                txt_payload = txt_path.read_bytes()
+                txt_text = txt_payload.decode("utf-8")
+            except UnicodeDecodeError as error:
+                raise ValueError(f"{txt_path} is not valid UTF-8") from error
+            canonical_txt = ("\n".join(raw) + "\n").encode("utf-8")
+            if txt_payload != canonical_txt or txt_text.splitlines() != raw:
+                raise ValueError(f"{txt_path} does not exactly match {path.name}")
+            split_txt_fingerprints[str(count)] = file_sha256(txt_path)
 
             base_labeled = PCLabeledTrainDataset(
                 image_roots,
@@ -151,16 +163,33 @@ def main(argv: Sequence[str] | None = None) -> int:
                 392,
                 labeled_indices_pt=str(path),
             )
+            txt_labeled = PCLabeledTrainDataset(
+                image_roots,
+                gt_roots,
+                str(txt_path),
+                392,
+                labeled_indices_pt=None,
+            )
+            txt_unlabeled = UnlabeledPseudoTrainDataset(
+                image_roots,
+                str(txt_path),
+                392,
+                labeled_indices_pt=None,
+            )
             expected_unlabeled = len(catalog) - count
             actual = {
                 "base_labeled": len(base_labeled),
                 "ts_labeled": len(ts_labeled),
                 "ts_unlabeled": len(ts_unlabeled),
+                "txt_labeled": len(txt_labeled),
+                "txt_unlabeled": len(txt_unlabeled),
             }
             expected = {
                 "base_labeled": count,
                 "ts_labeled": count,
                 "ts_unlabeled": expected_unlabeled,
+                "txt_labeled": count,
+                "txt_unlabeled": expected_unlabeled,
             }
             if actual != expected:
                 raise RuntimeError(
@@ -237,6 +266,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         if manifest.get("schema_version") != 2 or manifest.get("acquired_count") != 363:
             raise ValueError("selection manifest identity/count mismatch")
+        if manifest.get("split_txt_fingerprints") != split_txt_fingerprints:
+            raise ValueError("selection manifest TXT fingerprints mismatch")
+        expected_txt_files = {
+            str(count): f"bpus_v2_{count:04d}_seed{seed}.txt" for count in counts
+        }
+        if manifest.get("files", {}).get("split_txt") != expected_txt_files:
+            raise ValueError("selection manifest TXT file mapping mismatch")
         if runtime.get("kind") != "bpus_v2_runtime" or "elapsed_seconds" not in runtime:
             raise ValueError("runtime_report.json is invalid")
 
@@ -245,15 +281,42 @@ def main(argv: Sequence[str] | None = None) -> int:
             (selector_dir / "selector_config.json").read_text(encoding="utf-8")
         )
         state = _torch_load(selector_dir / "selector_raw.pth")
+        resume = _torch_load(selector_dir / "selector_resume.pth")
         if (
             config.get("schema_version") != 2
             or config.get("kind") != "bpus_v2_selector"
             or config.get("method") != "BPUS-v2"
+            or config.get("formal_mode") is not True
+            or config.get("debug_mode") is not False
             or config.get("epochs") != 30
+            or config.get("num_workers") != 0
+            or config.get("bootstrap_subset_quotas") != quotas
             or config.get("target_counts") != list(counts)
             or config.get("selector_fingerprint") != state_dict_fingerprint(state)
         ):
             raise ValueError(f"seed{seed} Selector identity mismatch")
+        rng_state = resume.get("rng_state") if isinstance(resume, dict) else None
+        required_rng_fields = {
+            "schema_version",
+            "python",
+            "numpy",
+            "torch_cpu",
+            "torch_cuda",
+            "torch_cuda_device_count",
+            "dataloader_generator",
+        }
+        if (
+            not isinstance(resume, dict)
+            or resume.get("schema_version") != 2
+            or resume.get("kind") != "bpus_v2_selector_resume"
+            or resume.get("method") != "BPUS-v2"
+            or resume.get("formal_mode") is not True
+            or resume.get("debug_mode") is not False
+            or resume.get("completed_epoch") != 30
+            or not isinstance(rng_state, dict)
+            or set(rng_state) != required_rng_fields
+        ):
+            raise ValueError(f"seed{seed} Selector resume identity/RNG mismatch")
 
         rows.append(
             {

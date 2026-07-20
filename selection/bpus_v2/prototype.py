@@ -9,7 +9,7 @@ import torch.nn.functional as F
 
 
 BPUS_V2_PROTOTYPE_VERSION = (
-    "bpus_v2_p2_v2_aligned_mean_point_l2_bilinear_boundary_pool"
+    "bpus_v2_p2_v3_strict_finite_aligned_mean_point_l2_bilinear_boundary_pool"
 )
 PROTOTYPE_LEVEL = "p2"
 PROTOTYPE_DIM = 128
@@ -23,6 +23,11 @@ def _positive_finite(value: float, name: str) -> float:
     if not math.isfinite(value) or value <= 0.0:
         raise ValueError(f"{name} must be finite and positive.")
     return value
+
+
+def _require_finite_tensor(value: torch.Tensor, name: str) -> None:
+    if not bool(torch.isfinite(value).all().item()):
+        raise ValueError(f"{name} must contain only finite values (no NaN or Inf).")
 
 
 def build_bpus_v2_prototype(
@@ -50,6 +55,7 @@ def build_bpus_v2_prototype(
             f"p2 must have shape [B,{PROTOTYPE_DIM},{PROTOTYPE_HEIGHT},"
             f"{PROTOTYPE_WIDTH}], found {tuple(p2.shape)}."
         )
+    _require_finite_tensor(p2, "p2")
     if not isinstance(boundary_weight, torch.Tensor):
         raise TypeError("boundary_weight must be a torch.Tensor.")
     if boundary_weight.ndim != 4 or boundary_weight.shape[1] != 1:
@@ -58,14 +64,14 @@ def build_bpus_v2_prototype(
         raise ValueError("p2 and boundary_weight batch dimensions must match.")
     if boundary_weight.shape[-2] <= 0 or boundary_weight.shape[-1] <= 0:
         raise ValueError("boundary_weight must have non-empty spatial dimensions.")
+    _require_finite_tensor(boundary_weight, "boundary_weight")
 
-    features = torch.nan_to_num(
-        p2.float(), nan=0.0, posinf=0.0, neginf=0.0
-    )
-    weights = torch.nan_to_num(
-        boundary_weight.float(), nan=0.0, posinf=0.0, neginf=0.0
-    ).clamp_min(0.0)
+    features = p2.float()
+    weights = boundary_weight.float().clamp_min(0.0)
+    _require_finite_tensor(features, "p2 after float32 conversion")
+    _require_finite_tensor(weights, "boundary_weight after float32 conversion")
     original_mass = weights.flatten(1).sum(dim=1)
+    _require_finite_tensor(original_mass, "boundary_weight mass")
     if valid_boundary is None:
         valid = original_mass > boundary_mass_eps
     else:
@@ -73,6 +79,9 @@ def build_bpus_v2_prototype(
             raise TypeError("valid_boundary must be a torch.Tensor.")
         if valid_boundary.ndim != 1 or valid_boundary.shape[0] != p2.shape[0]:
             raise ValueError("valid_boundary must have shape [B].")
+        if valid_boundary.is_complex():
+            raise ValueError("valid_boundary must be real-valued.")
+        _require_finite_tensor(valid_boundary, "valid_boundary")
         valid = valid_boundary.to(device=p2.device, dtype=torch.bool)
 
     if tuple(weights.shape[-2:]) != (PROTOTYPE_HEIGHT, PROTOTYPE_WIDTH):
@@ -82,16 +91,27 @@ def build_bpus_v2_prototype(
             mode="bilinear",
             align_corners=False,
         )
+        _require_finite_tensor(weights, "resized boundary_weight")
 
     point_norm = torch.linalg.vector_norm(features, dim=1, keepdim=True)
+    _require_finite_tensor(point_norm, "P2 point norm")
     unit_features = features / point_norm.clamp_min(eps)
+    _require_finite_tensor(unit_features, "normalized P2")
     resized_mass = weights.flatten(1).sum(dim=1)
-    pooled = (unit_features * weights).flatten(2).sum(dim=2)
+    _require_finite_tensor(resized_mass, "resized boundary_weight mass")
+    weighted_features = unit_features * weights
+    _require_finite_tensor(weighted_features, "boundary-weighted P2")
+    pooled = weighted_features.flatten(2).sum(dim=2)
+    _require_finite_tensor(pooled, "pooled P2 numerator")
     pooled = pooled / (resized_mass[:, None] + eps)
+    _require_finite_tensor(pooled, "pooled P2")
     pooled_norm = torch.linalg.vector_norm(pooled, dim=1, keepdim=True)
+    _require_finite_tensor(pooled_norm, "pooled P2 norm")
     prototype = pooled / pooled_norm.clamp_min(eps)
+    _require_finite_tensor(prototype, "normalized prototype")
     prototype = torch.where(valid[:, None], prototype, torch.zeros_like(prototype))
-    return torch.nan_to_num(prototype, nan=0.0, posinf=0.0, neginf=0.0)
+    _require_finite_tensor(prototype, "prototype")
+    return prototype
 
 
 PROTOTYPE_VERSION = BPUS_V2_PROTOTYPE_VERSION

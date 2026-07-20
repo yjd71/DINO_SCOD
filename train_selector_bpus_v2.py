@@ -42,6 +42,19 @@ FORMAL_BATCH_SIZE = 8
 FORMAL_LEARNING_RATE = 1.0e-4
 FORMAL_MIN_LEARNING_RATE = 1.0e-7
 FORMAL_CATALOG_SIZE = 4040
+FORMAL_NUM_WORKERS = 0
+FORMAL_TRAIN_SETS = ("TR-CAMO", "TR-COD10K")
+FORMAL_BOOTSTRAP_QUOTAS = {"TR-CAMO": 10, "TR-COD10K": 31}
+RESUME_RNG_SCHEMA_VERSION = 1
+_RNG_STATE_FIELDS = {
+    "schema_version",
+    "python",
+    "numpy",
+    "torch_cpu",
+    "torch_cuda",
+    "torch_cuda_device_count",
+    "dataloader_generator",
+}
 
 
 def _positive_int(value: str) -> int:
@@ -95,7 +108,15 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--batch-size", type=_positive_int, default=8)
     parser.add_argument("--learning-rate", type=_positive_float, default=1.0e-4)
     parser.add_argument("--min-learning-rate", type=_positive_float, default=1.0e-7)
-    parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=FORMAL_NUM_WORKERS,
+        help=(
+            "DataLoader workers. Formal training fixes this to 0 so a resume can "
+            "restore the augmentation RNG stream exactly."
+        ),
+    )
     parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda")
     parser.add_argument(
         "--amp", action=argparse.BooleanOptionalAction, default=True
@@ -174,10 +195,19 @@ def _validate_protocol_and_mode(
     return protocol, bool(is_formal_request and not args.debug)
 
 
-def _training_config(args: argparse.Namespace) -> dict[str, Any]:
+def _training_config(
+    args: argparse.Namespace, *, formal_mode: bool
+) -> dict[str, Any]:
     return {
+        "formal_mode": bool(formal_mode),
+        "debug_mode": bool(args.debug),
         "epochs": int(args.epochs),
         "batch_size": int(args.batch_size),
+        "num_workers": int(args.num_workers),
+        "persistent_workers": False,
+        "dataloader_generator": "explicit_seeded_torch_generator",
+        "train_sets": list(args.train_sets),
+        "device": str(args.device),
         "learning_rate": float(args.learning_rate),
         "min_learning_rate": float(args.min_learning_rate),
         "optimizer": "Adam",
@@ -207,6 +237,7 @@ def _validate_formal_training_settings(
         return
     expected = {
         "batch_size": FORMAL_BATCH_SIZE,
+        "num_workers": FORMAL_NUM_WORKERS,
         "learning_rate": FORMAL_LEARNING_RATE,
         "min_learning_rate": FORMAL_MIN_LEARNING_RATE,
         "amp": True,
@@ -219,6 +250,11 @@ def _validate_formal_training_settings(
                 f"Formal BPUS-v2 requires --{cli_name}={value!r}; "
                 "use --debug with an isolated output directory for deviations."
             )
+    if tuple(args.train_sets) != FORMAL_TRAIN_SETS:
+        raise ValueError(
+            "Formal BPUS-v2 requires --train-sets TR-CAMO TR-COD10K; "
+            "use --debug with an isolated output directory for deviations."
+        )
     if args.device != "cuda" and not args.dry_run:
         raise ValueError(
             "Formal BPUS-v2 training requires CUDA so that AMP is active; "
@@ -234,11 +270,19 @@ def _resume_identity(
     dino_fingerprint: str,
     catalog_fingerprint: str,
     training_fingerprint: str,
+    formal_mode: bool,
+    debug_mode: bool,
 ) -> dict[str, Any]:
+    if bool(formal_mode) == bool(debug_mode):
+        raise ValueError(
+            "BPUS-v2 resume identity requires exactly one of formal_mode/debug_mode"
+        )
     return {
         "schema_version": SELECTOR_SCHEMA_VERSION,
         "kind": SELECTOR_RESUME_KIND,
         "method": SELECTOR_METHOD,
+        "formal_mode": bool(formal_mode),
+        "debug_mode": bool(debug_mode),
         "seed": int(seed),
         "target_counts": list(target_counts),
         "split_fingerprint": split_fingerprint,
@@ -260,6 +304,174 @@ def _validate_resume_identity(
             )
 
 
+def _bootstrap_subset_quotas(sample_keys: Sequence[str]) -> dict[str, int]:
+    quotas: dict[str, int] = {}
+    for key in sample_keys:
+        subset = key.split("/", 1)[0]
+        quotas[subset] = quotas.get(subset, 0) + 1
+    return dict(sorted(quotas.items()))
+
+
+def _validate_formal_bootstrap(sample_keys: Sequence[str]) -> dict[str, int]:
+    quotas = _bootstrap_subset_quotas(sample_keys)
+    if quotas != FORMAL_BOOTSTRAP_QUOTAS:
+        raise ValueError(
+            "Formal BPUS-v2 bootstrap must contain TR-CAMO=10 and "
+            f"TR-COD10K=31, found {quotas}."
+        )
+    return quotas
+
+
+def _validate_byte_rng_state(value: Any, *, label: str) -> torch.Tensor:
+    if (
+        not torch.is_tensor(value)
+        or value.device.type != "cpu"
+        or value.dtype != torch.uint8
+        or value.ndim != 1
+        or value.numel() == 0
+    ):
+        raise ValueError(f"BPUS-v2 Selector resume {label} is invalid")
+    return value.detach().clone()
+
+
+def _validate_rng_state(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        raise ValueError("BPUS-v2 Selector resume has no valid rng_state mapping")
+    fields = set(payload)
+    if fields != _RNG_STATE_FIELDS:
+        missing = sorted(_RNG_STATE_FIELDS - fields)
+        unexpected = sorted(fields - _RNG_STATE_FIELDS)
+        raise ValueError(
+            "BPUS-v2 Selector resume rng_state fields mismatch: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    if payload["schema_version"] != RESUME_RNG_SCHEMA_VERSION:
+        raise ValueError(
+            "BPUS-v2 Selector resume RNG schema_version mismatch: "
+            f"{payload['schema_version']!r} != {RESUME_RNG_SCHEMA_VERSION!r}"
+        )
+
+    python_state = payload["python"]
+    if not isinstance(python_state, tuple):
+        raise ValueError("BPUS-v2 Selector resume Python RNG state is invalid")
+    try:
+        random.Random().setstate(python_state)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "BPUS-v2 Selector resume Python RNG state is invalid"
+        ) from error
+
+    numpy_state = payload["numpy"]
+    if (
+        not isinstance(numpy_state, tuple)
+        or len(numpy_state) != 5
+        or numpy_state[0] != "MT19937"
+        or not isinstance(numpy_state[1], np.ndarray)
+        or numpy_state[1].dtype != np.uint32
+        or numpy_state[1].ndim != 1
+        or numpy_state[1].size != 624
+        or type(numpy_state[2]) is not int
+        or type(numpy_state[3]) is not int
+        or not isinstance(numpy_state[4], (float, np.floating))
+    ):
+        raise ValueError("BPUS-v2 Selector resume NumPy RNG state is invalid")
+    try:
+        np.random.RandomState().set_state(numpy_state)
+    except (TypeError, ValueError) as error:
+        raise ValueError(
+            "BPUS-v2 Selector resume NumPy RNG state is invalid"
+        ) from error
+
+    torch_cpu_state = _validate_byte_rng_state(
+        payload["torch_cpu"], label="Torch CPU RNG state"
+    )
+    dataloader_state = _validate_byte_rng_state(
+        payload["dataloader_generator"],
+        label="DataLoader generator state",
+    )
+    for label, state in (
+        ("Torch CPU RNG state", torch_cpu_state),
+        ("DataLoader generator state", dataloader_state),
+    ):
+        try:
+            torch.Generator(device="cpu").set_state(state)
+        except RuntimeError as error:
+            raise ValueError(f"BPUS-v2 Selector resume {label} is invalid") from error
+
+    cuda_device_count = payload["torch_cuda_device_count"]
+    cuda_states = payload["torch_cuda"]
+    if type(cuda_device_count) is not int or cuda_device_count < 0:
+        raise ValueError(
+            "BPUS-v2 Selector resume Torch CUDA device count is invalid"
+        )
+    if not isinstance(cuda_states, list) or len(cuda_states) != cuda_device_count:
+        raise ValueError("BPUS-v2 Selector resume Torch CUDA RNG states are invalid")
+    validated_cuda_states = [
+        _validate_byte_rng_state(state, label=f"Torch CUDA RNG state {index}")
+        for index, state in enumerate(cuda_states)
+    ]
+    if cuda_device_count:
+        if not torch.cuda.is_available():
+            raise ValueError(
+                "BPUS-v2 Selector resume contains CUDA RNG states but CUDA is unavailable"
+            )
+        if torch.cuda.device_count() != cuda_device_count:
+            raise ValueError(
+                "BPUS-v2 Selector resume CUDA device count mismatch: "
+                f"{cuda_device_count} != {torch.cuda.device_count()}"
+            )
+
+    return {
+        "schema_version": RESUME_RNG_SCHEMA_VERSION,
+        "python": python_state,
+        "numpy": numpy_state,
+        "torch_cpu": torch_cpu_state,
+        "torch_cuda": validated_cuda_states,
+        "torch_cuda_device_count": cuda_device_count,
+        "dataloader_generator": dataloader_state,
+    }
+
+
+def _capture_rng_state(loader_generator: torch.Generator) -> dict[str, Any]:
+    if not isinstance(loader_generator, torch.Generator):
+        raise TypeError("loader_generator must be a torch.Generator")
+    numpy_state = np.random.get_state()
+    cuda_states = (
+        [state.detach().cpu().clone() for state in torch.cuda.get_rng_state_all()]
+        if torch.cuda.is_available()
+        else []
+    )
+    return {
+        "schema_version": RESUME_RNG_SCHEMA_VERSION,
+        "python": random.getstate(),
+        "numpy": (
+            numpy_state[0],
+            numpy_state[1].copy(),
+            numpy_state[2],
+            numpy_state[3],
+            numpy_state[4],
+        ),
+        "torch_cpu": torch.get_rng_state().clone(),
+        "torch_cuda": cuda_states,
+        "torch_cuda_device_count": len(cuda_states),
+        "dataloader_generator": loader_generator.get_state().clone(),
+    }
+
+
+def _restore_rng_state(
+    payload: Any, *, loader_generator: torch.Generator
+) -> None:
+    if not isinstance(loader_generator, torch.Generator):
+        raise TypeError("loader_generator must be a torch.Generator")
+    state = _validate_rng_state(payload)
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"])
+    if state["torch_cuda_device_count"]:
+        torch.cuda.set_rng_state_all(state["torch_cuda"])
+    loader_generator.set_state(state["dataloader_generator"])
+
+
 def _resume_payload(
     *,
     epoch: int,
@@ -268,6 +480,7 @@ def _resume_payload(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.amp.GradScaler,
     identity: Mapping[str, Any],
+    loader_generator: torch.Generator,
 ) -> dict[str, Any]:
     decoder_state = model.decoder.state_dict()
     return {
@@ -278,6 +491,7 @@ def _resume_payload(
         "optimizer_state": optimizer.state_dict(),
         "scheduler_state": scheduler.state_dict(),
         "scaler_state": scaler.state_dict(),
+        "rng_state": _capture_rng_state(loader_generator),
     }
 
 
@@ -289,6 +503,7 @@ def _load_resume(
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.amp.GradScaler,
     identity: Mapping[str, Any],
+    loader_generator: torch.Generator,
 ) -> int:
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if not isinstance(payload, dict):
@@ -300,13 +515,20 @@ def _load_resume(
     actual_fingerprint = state_dict_fingerprint(decoder_state)
     if payload.get("decoder_fingerprint") != actual_fingerprint:
         raise ValueError("BPUS-v2 Selector resume decoder fingerprint mismatch")
+    completed_epoch = payload.get("completed_epoch")
+    if type(completed_epoch) is not int or completed_epoch < 0:
+        raise ValueError("BPUS-v2 Selector resume completed_epoch is invalid")
+    for field in ("optimizer_state", "scheduler_state", "scaler_state"):
+        if not isinstance(payload.get(field), Mapping):
+            raise ValueError(f"BPUS-v2 Selector resume {field} is invalid")
+    _validate_rng_state(payload.get("rng_state"))
     model.decoder.load_state_dict(decoder_state, strict=True)
     optimizer.load_state_dict(payload["optimizer_state"])
     scheduler.load_state_dict(payload["scheduler_state"])
     scaler.load_state_dict(payload["scaler_state"])
-    completed_epoch = payload.get("completed_epoch")
-    if not isinstance(completed_epoch, int) or completed_epoch < 0:
-        raise ValueError("BPUS-v2 Selector resume completed_epoch is invalid")
+    _restore_rng_state(
+        payload["rng_state"], loader_generator=loader_generator
+    )
     return completed_epoch + 1
 
 
@@ -388,6 +610,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"Bootstrap contains {len(bootstrap_keys)} keys; protocol requires "
             f"{protocol.bootstrap_count}."
         )
+    bootstrap_subset_quotas = _bootstrap_subset_quotas(bootstrap_keys)
+    if formal_mode:
+        _validate_formal_bootstrap(bootstrap_keys)
     split_fingerprint = compute_labeled_split_fingerprint(bootstrap_keys)
     dino_fingerprint = file_sha256(DINO_WEIGHT_PATH)
 
@@ -409,7 +634,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             f"{protocol.bootstrap_count}."
         )
 
-    training_config = _training_config(args)
+    training_config = _training_config(args, formal_mode=formal_mode)
     training_fingerprint = stable_fingerprint(training_config)
     resume_identity = _resume_identity(
         seed=args.seed,
@@ -418,6 +643,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         dino_fingerprint=dino_fingerprint,
         catalog_fingerprint=catalog_fingerprint,
         training_fingerprint=training_fingerprint,
+        formal_mode=formal_mode,
+        debug_mode=bool(args.debug),
     )
     print(
         f"BPUS-v2 Selector protocol={protocol.name} seed={args.seed} "
@@ -449,7 +676,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         num_workers=args.num_workers,
         pin_memory=device.type == "cuda",
         drop_last=False,
-        persistent_workers=args.num_workers > 0,
+        # Persistent worker-local Python/NumPy RNG streams cannot be serialized.
+        # Recreating workers per epoch lets the explicit generator fully define
+        # their seeds in debug runs; formal runs additionally require workers=0.
+        persistent_workers=False,
         worker_init_fn=_worker_init,
         generator=generator,
     )
@@ -478,6 +708,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             scheduler=scheduler,
             scaler=scaler,
             identity=resume_identity,
+            loader_generator=generator,
         )
     if start_epoch > args.epochs:
         raise ValueError(
@@ -543,6 +774,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     scheduler=scheduler,
                     scaler=scaler,
                     identity=resume_identity,
+                    loader_generator=generator,
                 ),
                 args.output_dir / "selector_resume.pth",
                 refuse_mismatch=False,
@@ -565,6 +797,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "schema_version": SELECTOR_SCHEMA_VERSION,
         "kind": SELECTOR_KIND,
         "method": SELECTOR_METHOD,
+        "formal_mode": bool(formal_mode),
+        "debug_mode": bool(args.debug),
         "protocol": protocol.name,
         "target_counts": list(protocol.target_counts),
         "bootstrap_count": protocol.bootstrap_count,
@@ -575,6 +809,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "split_path": str(args.labeled_indices_pt),
         "split_fingerprint": split_fingerprint,
         "bootstrap_fingerprint": split_fingerprint,
+        "bootstrap_subset_quotas": bootstrap_subset_quotas,
         "dino_weight_path": str(DINO_WEIGHT_PATH),
         "dino_weight_fingerprint": dino_fingerprint,
         "selector_fingerprint": selector_fingerprint,
@@ -583,6 +818,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         "training_fingerprint": training_fingerprint,
         "epochs": args.epochs,
         "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "persistent_workers": False,
         "learning_rate": args.learning_rate,
         "min_learning_rate": args.min_learning_rate,
         "optimizer": "Adam",

@@ -57,6 +57,8 @@ REPO_ROOT = Path(__file__).resolve().parent
 DINO_WEIGHT_PATH = REPO_ROOT / "weight" / "dinov2_vitb14_pretrain.pth"
 FORMAL_TARGET_COUNTS = (41, 202, 404)
 FORMAL_CATALOG_SIZE = 4040
+FORMAL_BOOTSTRAP_QUOTAS = {"TR-CAMO": 10, "TR-COD10K": 31}
+FORMAL_TRAIN_SETS = ["TR-CAMO", "TR-COD10K"]
 EXPECTED_P2_DIM = 128
 SCHEMA_VERSION = 2
 METHOD = "BPUS-v2"
@@ -184,6 +186,44 @@ def _image_roots(args: argparse.Namespace) -> list[str]:
     return [str(args.data_root / name / "im") for name in args.train_sets]
 
 
+def _bootstrap_subset_quotas(sample_keys: Sequence[str]) -> dict[str, int]:
+    quotas: dict[str, int] = {}
+    for key in sample_keys:
+        subset = key.split("/", 1)[0]
+        quotas[subset] = quotas.get(subset, 0) + 1
+    return dict(sorted(quotas.items()))
+
+
+def _validate_formal_bootstrap(sample_keys: Sequence[str]) -> dict[str, int]:
+    quotas = _bootstrap_subset_quotas(sample_keys)
+    if quotas != FORMAL_BOOTSTRAP_QUOTAS:
+        raise ValueError(
+            "Formal BPUS-v2 bootstrap must contain TR-CAMO=10 and "
+            f"TR-COD10K=31, found {quotas}."
+        )
+    return quotas
+
+
+def _validate_formal_scoring_settings(
+    args: argparse.Namespace, *, formal_mode: bool
+) -> None:
+    if not formal_mode:
+        return
+    expected = {
+        "batch_size": 16,
+        "device": "cuda",
+        "amp": True,
+        "deterministic": True,
+    }
+    for field, value in expected.items():
+        if getattr(args, field) != value:
+            raise ValueError(
+                f"Formal BPUS-v2 scoring requires {field}={value!r}; "
+                "use --debug-custom-counts with an isolated debug output "
+                "directory for numerical-setting deviations."
+            )
+
+
 def _torch_load(path: Path) -> Any:
     try:
         return torch.load(path, map_location="cpu", weights_only=False)
@@ -208,6 +248,33 @@ def _assert_v2_cache_namespace(paths: Sequence[Path]) -> None:
             raise ValueError(
                 f"Existing cache belongs to another method and cannot be replaced: {path}"
             )
+
+
+def _validate_cache_mode(
+    scores_path: Path,
+    prototypes_path: Path,
+    *,
+    reuse_cache: bool,
+    rebuild_cache: bool,
+    verify_only: bool,
+) -> tuple[bool, bool]:
+    existing = (scores_path.exists(), prototypes_path.exists())
+    if any(existing) and not all(existing):
+        if not rebuild_cache:
+            raise RuntimeError("BPUS-v2 cache is incomplete; use --rebuild-cache")
+        _assert_v2_cache_namespace((scores_path, prototypes_path))
+    elif all(existing):
+        _assert_v2_cache_namespace((scores_path, prototypes_path))
+    if all(existing) and not (reuse_cache or rebuild_cache or verify_only):
+        raise FileExistsError(
+            "BPUS-v2 cache already exists; pass --reuse-cache to validate it or "
+            "--rebuild-cache to replace it atomically."
+        )
+    if reuse_cache and not all(existing):
+        raise FileNotFoundError("--reuse-cache requires both pool cache files")
+    if verify_only and not all(existing):
+        raise FileNotFoundError("--verify-only requires both pool cache files")
+    return existing
 
 
 def _set_seed(seed: int, deterministic: bool) -> None:
@@ -260,10 +327,13 @@ def _load_selector_identity(
             raise FileNotFoundError(f"Missing {label}: {path}")
     with args.selector_config.open("r", encoding="utf-8") as stream:
         config = json.load(stream)
+    selector_formal_mode = tuple(protocol.target_counts) == FORMAL_TARGET_COUNTS
     expected = {
         "schema_version": SCHEMA_VERSION,
         "kind": "bpus_v2_selector",
         "method": METHOD,
+        "formal_mode": selector_formal_mode,
+        "debug_mode": not selector_formal_mode,
         "protocol": protocol.name,
         "target_counts": list(protocol.target_counts),
         "bootstrap_count": protocol.bootstrap_count,
@@ -273,6 +343,20 @@ def _load_selector_identity(
         "dino_weight_fingerprint": dino_fingerprint,
         "catalog_fingerprint": catalog_fingerprint,
     }
+    if selector_formal_mode:
+        expected.update(
+            {
+                "train_sets": FORMAL_TRAIN_SETS,
+                "bootstrap_subset_quotas": FORMAL_BOOTSTRAP_QUOTAS,
+                "batch_size": 8,
+                "num_workers": 0,
+                "persistent_workers": False,
+                "learning_rate": 1.0e-4,
+                "min_learning_rate": 1.0e-7,
+                "amp": True,
+                "deterministic": True,
+            }
+        )
     for field, value in expected.items():
         if config.get(field) != value:
             raise ValueError(
@@ -283,12 +367,48 @@ def _load_selector_identity(
         protocol.target_counts
     ) == FORMAL_TARGET_COUNTS:
         raise ValueError("Formal Selector config must bind the 4040-image catalog")
-    if tuple(protocol.target_counts) == FORMAL_TARGET_COUNTS:
+    if selector_formal_mode:
         if config.get("epochs") != 30:
             raise ValueError("Formal BPUS-v2 Selector must be trained for exactly 30 epochs")
         training_config = config.get("training_config")
         if not isinstance(training_config, Mapping) or training_config.get("epochs") != 30:
             raise ValueError("Selector training_config must record epochs=30")
+        formal_training = {
+            "formal_mode": True,
+            "debug_mode": False,
+            "epochs": 30,
+            "batch_size": 8,
+            "num_workers": 0,
+            "persistent_workers": False,
+            "dataloader_generator": "explicit_seeded_torch_generator",
+            "train_sets": FORMAL_TRAIN_SETS,
+            "device": "cuda",
+            "learning_rate": 1.0e-4,
+            "min_learning_rate": 1.0e-7,
+            "optimizer": "Adam",
+            "weight_decay": 0.0,
+            "scheduler": "CosineAnnealingLR",
+            "scheduler_t_max": 30,
+            "image_size": [392, 392],
+            "pc_mode": "off",
+            "loss": "base_structure_loss_five_outputs",
+            "amp_requested": True,
+            "deterministic": True,
+            "sdpa_backend": "math",
+            "augmentations": {
+                "random_vertical_flip": True,
+                "random_crop": True,
+                "random_rotate": False,
+                "color_enhance": True,
+                "random_pepper": False,
+            },
+        }
+        for field, value in formal_training.items():
+            if training_config.get(field) != value:
+                raise ValueError(
+                    f"Formal Selector training_config mismatch for {field}: "
+                    f"expected {value!r}, found {training_config.get(field)!r}."
+                )
     training_config = config.get("training_config")
     if not isinstance(training_config, Mapping):
         raise ValueError("Selector config must contain training_config")
@@ -340,6 +460,14 @@ def _preprocessing_fingerprint(
             },
             "eps": float(args.eps),
             "boundary_mass_eps": float(args.boundary_mass_eps),
+            "scoring_numerics": {
+                "device_type": str(args.device),
+                "amp": bool(args.amp and args.device == "cuda"),
+                "deterministic": bool(args.deterministic),
+                "batch_size": int(args.batch_size),
+                "num_workers": int(args.num_workers),
+                "output_dtype": "float32",
+            },
             "formula": dict(formula_spec),
             "prototype_version": BPUS_V2_PROTOTYPE_VERSION,
         }
@@ -580,7 +708,12 @@ def _canonical_split_text(sample_keys: Sequence[str]) -> bytes:
     return ("\n".join(keys) + "\n").encode("utf-8")
 
 
-def _save_split_text(path: Path, sample_keys: Sequence[str]) -> str:
+def _save_split_text(
+    path: Path,
+    sample_keys: Sequence[str],
+    *,
+    refuse_mismatch: bool = True,
+) -> str:
     """Atomically save one canonical stable sample key per UTF-8 line."""
 
     payload = _canonical_split_text(sample_keys)
@@ -588,7 +721,8 @@ def _save_split_text(path: Path, sample_keys: Sequence[str]) -> str:
     if path.exists():
         if path.read_bytes() == payload:
             return file_sha256(path)
-        raise FileExistsError(f"refusing to overwrite different TXT split: {path}")
+        if refuse_mismatch:
+            raise FileExistsError(f"refusing to overwrite different TXT split: {path}")
 
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
@@ -657,6 +791,8 @@ def _save_or_upgrade_manifest(
     manifest: Mapping[str, Any],
     manifest_base: Mapping[str, Any],
     path: Path,
+    *,
+    rebuild: bool = False,
 ) -> None:
     """Save the manifest, allowing only the deterministic TXT-field upgrade."""
 
@@ -666,6 +802,9 @@ def _save_or_upgrade_manifest(
     with path.open("r", encoding="utf-8") as stream:
         saved = json.load(stream)
     if saved == manifest:
+        return
+    if rebuild:
+        atomic_json_save(manifest, path, refuse_mismatch=False)
         return
 
     legacy_base = dict(manifest_base)
@@ -756,11 +895,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     protocol = SamplingProtocol.from_counts(
         counts, allow_custom=bool(args.debug_custom_counts)
     )
-    debug_run = counts != FORMAL_TARGET_COUNTS or args.formula_variant != "v2"
+    debug_run = bool(args.debug_custom_counts) or counts != FORMAL_TARGET_COUNTS or args.formula_variant != "v2"
+    formal_run = not debug_run
     if debug_run and not args.debug_custom_counts:
         raise ValueError("Diagnostic formula variants require --debug-custom-counts")
     if debug_run and "debug" not in str(args.output_dir).lower():
         raise ValueError("Debug runs require an isolated output directory containing 'debug'")
+    _validate_formal_scoring_settings(args, formal_mode=formal_run)
     if args.device == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("--device cuda requested but CUDA is unavailable")
     if not DINO_WEIGHT_PATH.is_file():
@@ -782,6 +923,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.bootstrap_split,
         catalog_keys=sample_keys,
         expected_count=protocol.bootstrap_count,
+    )
+    bootstrap_quotas = (
+        _validate_formal_bootstrap(bootstrap_keys)
+        if formal_run
+        else _bootstrap_subset_quotas(bootstrap_keys)
     )
     split_fingerprint = compute_labeled_split_fingerprint(bootstrap_keys)
     catalog_fingerprint = compute_catalog_fingerprint(sample_keys)
@@ -810,20 +956,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     scores_path = args.output_dir / "pool_scores.pt"
     prototypes_path = args.output_dir / "pool_prototypes.pt"
-    existing = (scores_path.exists(), prototypes_path.exists())
-    if any(existing) and not all(existing):
-        raise RuntimeError("BPUS-v2 cache is incomplete; use --rebuild-cache")
-    if all(existing):
-        _assert_v2_cache_namespace((scores_path, prototypes_path))
-    if all(existing) and not (args.reuse_cache or args.rebuild_cache or args.verify_only):
-        raise FileExistsError(
-            "BPUS-v2 cache already exists; pass --reuse-cache to validate it or "
-            "--rebuild-cache to replace it atomically."
-        )
-    if args.reuse_cache and not all(existing):
-        raise FileNotFoundError("--reuse-cache requires both pool cache files")
-    if args.verify_only and not all(existing):
-        raise FileNotFoundError("--verify-only requires both pool cache files")
+    existing = _validate_cache_mode(
+        scores_path,
+        prototypes_path,
+        reuse_cache=bool(args.reuse_cache),
+        rebuild_cache=bool(args.rebuild_cache),
+        verify_only=bool(args.verify_only),
+    )
 
     identity_kwargs = _cache_validation_kwargs(
         sample_keys=sample_keys,
@@ -918,6 +1057,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "schema_version": SCHEMA_VERSION,
         "kind": "bpus_v2_acquisition",
         "method": METHOD,
+        "formal_mode": formal_run,
         "protocol": protocol.name,
         "target_counts": list(protocol.target_counts),
         "seed": int(args.seed),
@@ -942,6 +1082,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "prototype_version": BPUS_V2_PROTOTYPE_VERSION,
         "prototype_fingerprint": prototype_payload["prototype_fingerprint"],
         "bootstrap_fingerprint": split_fingerprint,
+        "bootstrap_quotas": bootstrap_quotas,
         "score_cache_fingerprint": score_cache_fingerprint,
         "prototype_cache_fingerprint": prototype_cache_fingerprint,
     }
@@ -949,13 +1090,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         acquisition_base, fingerprint_field="acquisition_fingerprint"
     )
     if not args.verify_only:
-        atomic_torch_save(acquisition_payload, acquisition_path)
+        atomic_torch_save(
+            acquisition_payload,
+            acquisition_path,
+            refuse_mismatch=not args.rebuild_cache,
+        )
         for count in protocol.target_counts:
             split_path = (
                 args.output_dir / f"bpus_v2_{count:04d}_seed{args.seed}.pt"
             )
-            save_split_keys(split_path, result.splits[count])
-            _save_split_text(split_path.with_suffix(".txt"), result.splits[count])
+            if args.rebuild_cache:
+                atomic_torch_save(
+                    sorted(result.splits[count]),
+                    split_path,
+                    refuse_mismatch=False,
+                )
+            else:
+                save_split_keys(split_path, result.splits[count])
+            _save_split_text(
+                split_path.with_suffix(".txt"),
+                result.splits[count],
+                refuse_mismatch=not args.rebuild_cache,
+            )
     _, split_fingerprints, split_txt_fingerprints = _verify_saved_splits(
         args.output_dir,
         seed=args.seed,
@@ -968,6 +1124,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "schema_version": SCHEMA_VERSION,
         "kind": "bpus_v2_selection_manifest",
         "method": METHOD,
+        "formal_mode": formal_run,
         "protocol": protocol.name,
         "target_counts": list(protocol.target_counts),
         "seed": int(args.seed),
@@ -992,6 +1149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         "acquisition_fingerprint": acquisition_payload["acquisition_fingerprint"],
         "bootstrap_path": str(args.bootstrap_split),
         "bootstrap_fingerprint": split_fingerprint,
+        "bootstrap_quotas": bootstrap_quotas,
         "split_fingerprints": split_fingerprints,
         "split_txt_fingerprints": split_txt_fingerprints,
         "acquired_count": len(result.acquired_keys),
@@ -1051,7 +1209,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         print("Verification passed; cache replay and all nested splits are identical.")
         return 0
 
-    _save_or_upgrade_manifest(manifest, manifest_base, manifest_path)
+    _save_or_upgrade_manifest(
+        manifest,
+        manifest_base,
+        manifest_path,
+        rebuild=bool(args.rebuild_cache),
+    )
     runtime = _runtime_payload(
         args=args,
         protocol=protocol,

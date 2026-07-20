@@ -15,9 +15,15 @@ from .prototype import EXPECTED_P2_SHAPE, build_bpus_v2_prototype
 
 
 BPUS_V2_FORMULA_VERSION = (
-    "bpus_v2_boundary_v2_smooth_value_soft_reward_sobel_div8_replicate_hypot"
+    "bpus_v2_boundary_v3_strict_finite_smooth_value_soft_reward_"
+    "sobel_div8_replicate_hypot"
 )
 SCORE_FORMULA_VERSION = BPUS_V2_FORMULA_VERSION
+
+# Selector probabilities come from a sigmoid and are therefore formally in
+# [0, 1].  A very small tolerance accommodates dtype conversion round-off at
+# the endpoints; values outside it indicate a broken selector contract.
+PROBABILITY_RANGE_TOLERANCE = 1e-6
 
 
 @dataclass(frozen=True)
@@ -61,6 +67,11 @@ class ScorePrototypeBPUSV2Result:
         return self.valid_boundary
 
 
+def _require_finite_tensor(value: torch.Tensor, name: str) -> None:
+    if not bool(torch.isfinite(value).all().item()):
+        raise ValueError(f"{name} must contain only finite values (no NaN or Inf).")
+
+
 def _validate_probability(probability: torch.Tensor, name: str) -> None:
     if not isinstance(probability, torch.Tensor):
         raise TypeError(f"{name} must be a torch.Tensor.")
@@ -68,6 +79,26 @@ def _validate_probability(probability: torch.Tensor, name: str) -> None:
         raise ValueError(f"{name} must have shape [B,1,H,W].")
     if probability.shape[0] <= 0 or probability.shape[-2] <= 0 or probability.shape[-1] <= 0:
         raise ValueError(f"{name} must have non-empty batch and spatial dimensions.")
+    if probability.is_complex():
+        raise ValueError(f"{name} must contain real-valued probabilities.")
+    _require_finite_tensor(probability, name)
+    outside_range = (probability < -PROBABILITY_RANGE_TOLERANCE) | (
+        probability > 1.0 + PROBABILITY_RANGE_TOLERANCE
+    )
+    if bool(outside_range.any().item()):
+        raise ValueError(
+            f"{name} must lie in [0,1] (allowing at most "
+            f"{PROBABILITY_RANGE_TOLERANCE:g} endpoint round-off)."
+        )
+
+
+def _probability_float32(probability: torch.Tensor, name: str) -> torch.Tensor:
+    """Validate a probability tensor and normalize tolerated endpoint drift."""
+
+    _validate_probability(probability, name)
+    result = probability.float()
+    _require_finite_tensor(result, f"{name} after float32 conversion")
+    return result.clamp(0.0, 1.0)
 
 
 def _positive_finite(value: float, name: str) -> float:
@@ -87,11 +118,8 @@ def sobel_magnitude_bpus_v2(
     field.
     """
 
-    _validate_probability(probability, "probability")
     _positive_finite(eps, "eps")
-    probability = torch.nan_to_num(
-        probability.float(), nan=0.0, posinf=1.0, neginf=0.0
-    ).clamp(0.0, 1.0)
+    probability = _probability_float32(probability, "probability")
     padded = F.pad(probability, (1, 1, 1, 1), mode="replicate")
     # Group the positive and negative halves symmetrically before subtraction.
     # Besides being exactly the conventional /8 Sobel operator, this ordering
@@ -122,6 +150,7 @@ def sobel_magnitude_bpus_v2(
     magnitude[..., -1, :] = 0.0
     magnitude[..., :, 0] = 0.0
     magnitude[..., :, -1] = 0.0
+    _require_finite_tensor(magnitude, "Sobel boundary magnitude")
     return magnitude
 
 
@@ -142,26 +171,26 @@ def compute_boundary_score_bpus_v2(
     eps = _positive_finite(eps, "eps")
     boundary_mass_eps = _positive_finite(boundary_mass_eps, "boundary_mass_eps")
 
-    probability = torch.nan_to_num(
-        probability.float(), nan=0.0, posinf=1.0, neginf=0.0
-    ).clamp(0.0, 1.0)
-    transformed_probability = torch.nan_to_num(
-        transformed_probability.float(), nan=0.0, posinf=1.0, neginf=0.0
-    ).clamp(0.0, 1.0)
+    probability = _probability_float32(probability, "probability")
+    transformed_probability = _probability_float32(
+        transformed_probability, "transformed_probability"
+    )
     mean_probability = 0.5 * (probability + transformed_probability)
     disagreement = (probability - transformed_probability).abs()
+    _require_finite_tensor(mean_probability, "mean probability")
+    _require_finite_tensor(disagreement, "flip disagreement")
     boundary_weight = sobel_magnitude_bpus_v2(mean_probability, eps=eps)
     boundary_mass = boundary_weight.flatten(1).sum(dim=1)
     numerator = (boundary_weight * disagreement).flatten(1).sum(dim=1)
-    boundary_disagreement = torch.nan_to_num(
-        numerator / (boundary_mass + eps), nan=0.0, posinf=1.0, neginf=0.0
-    ).clamp(0.0, 1.0)
-    global_disagreement = torch.nan_to_num(
-        disagreement.flatten(1).mean(dim=1),
-        nan=0.0,
-        posinf=1.0,
-        neginf=0.0,
-    ).clamp(0.0, 1.0)
+    _require_finite_tensor(boundary_weight, "boundary_weight")
+    _require_finite_tensor(boundary_mass, "boundary mass")
+    _require_finite_tensor(numerator, "boundary disagreement numerator")
+    boundary_disagreement = numerator / (boundary_mass + eps)
+    global_disagreement = disagreement.flatten(1).mean(dim=1)
+    _require_finite_tensor(boundary_disagreement, "boundary disagreement")
+    _require_finite_tensor(global_disagreement, "global disagreement")
+    boundary_disagreement = boundary_disagreement.clamp(0.0, 1.0)
+    global_disagreement = global_disagreement.clamp(0.0, 1.0)
     valid_boundary = boundary_mass > boundary_mass_eps
     boundary_value = compute_boundary_value(
         boundary_disagreement,
@@ -169,6 +198,7 @@ def compute_boundary_score_bpus_v2(
         valid_boundary,
         mode=value_mode,
     )
+    _require_finite_tensor(boundary_value, "boundary value")
     return BoundaryScoreBPUSV2(
         boundary_disagreement=boundary_disagreement,
         global_disagreement=global_disagreement,
@@ -205,6 +235,7 @@ def _extract_selector_tensors(
             f"Selector P2 must have shape [B,{EXPECTED_P2_SHAPE[0]},"
             f"{EXPECTED_P2_SHAPE[1]},{EXPECTED_P2_SHAPE[2]}], found {tuple(p2.shape)}."
         )
+    _require_finite_tensor(p2, "Selector P2 (aux['features']['p2'])")
     return probability, p2
 
 
@@ -233,13 +264,13 @@ def score_and_prototype_bpus_v2(
 
     with torch.autocast(device_type=images.device.type, enabled=amp_enabled):
         original_result = model(images, pc_mode="off", return_aux=True)
+    original_probability, original_p2 = _extract_selector_tensors(
+        original_result, batch_size
+    )
     with torch.autocast(device_type=images.device.type, enabled=amp_enabled):
         flipped_result = model(
             torch.flip(images, dims=(-1,)), pc_mode="off", return_aux=True
         )
-    original_probability, original_p2 = _extract_selector_tensors(
-        original_result, batch_size
-    )
     flipped_probability, flipped_p2 = _extract_selector_tensors(
         flipped_result, batch_size
     )
@@ -248,6 +279,10 @@ def score_and_prototype_bpus_v2(
     transformed_probability = torch.flip(flipped_probability.float(), dims=(-1,))
     aligned_flipped_p2 = torch.flip(flipped_p2.float(), dims=(-1,))
     mean_p2 = 0.5 * (original_p2.float() + aligned_flipped_p2)
+    _require_finite_tensor(probability, "aligned original p_final")
+    _require_finite_tensor(transformed_probability, "aligned flipped p_final")
+    _require_finite_tensor(aligned_flipped_p2, "aligned flipped P2")
+    _require_finite_tensor(mean_p2, "aligned mean P2")
     score = compute_boundary_score_bpus_v2(
         probability,
         transformed_probability,

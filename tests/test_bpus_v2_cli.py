@@ -85,6 +85,17 @@ def test_formal_mode_rejects_other_counts_and_diagnostic_formula(
                 *common,
             ]
         )
+    with pytest.raises(ValueError, match="isolated output directory"):
+        select_bpus_v2.main(
+            [
+                "--target-counts",
+                "41",
+                "202",
+                "404",
+                "--debug-custom-counts",
+                *common,
+            ]
+        )
 
 
 def test_selector_identity_rejects_schema_one(tmp_path: Path) -> None:
@@ -125,6 +136,61 @@ def test_schema_one_pool_cache_cannot_be_rebuilt_in_place(tmp_path: Path) -> Non
         select_bpus_v2._assert_v2_cache_namespace((cache,))
 
 
+def test_partial_schema_two_cache_can_only_be_recovered_by_rebuild(
+    tmp_path: Path,
+) -> None:
+    scores = tmp_path / "pool_scores.pt"
+    prototypes = tmp_path / "pool_prototypes.pt"
+    torch.save({"schema_version": 2, "method": "BPUS-v2"}, scores)
+
+    with pytest.raises(RuntimeError, match="incomplete"):
+        select_bpus_v2._validate_cache_mode(
+            scores,
+            prototypes,
+            reuse_cache=False,
+            rebuild_cache=False,
+            verify_only=False,
+        )
+    assert select_bpus_v2._validate_cache_mode(
+        scores,
+        prototypes,
+        reuse_cache=False,
+        rebuild_cache=True,
+        verify_only=False,
+    ) == (True, False)
+
+
+def test_formal_bootstrap_quota_and_scoring_numerics_identity() -> None:
+    bootstrap = [f"TR-CAMO/camo-{index}" for index in range(10)] + [
+        f"TR-COD10K/cod-{index}" for index in range(31)
+    ]
+    assert select_bpus_v2._validate_formal_bootstrap(bootstrap) == {
+        "TR-CAMO": 10,
+        "TR-COD10K": 31,
+    }
+    with pytest.raises(ValueError, match="TR-CAMO=10"):
+        select_bpus_v2._validate_formal_bootstrap(bootstrap[1:])
+
+    base = SimpleNamespace(
+        eps=1e-6,
+        boundary_mass_eps=1e-6,
+        device="cuda",
+        amp=True,
+        deterministic=True,
+        batch_size=16,
+        num_workers=8,
+    )
+    formula = select_bpus_v2._formula_spec("v2")
+    select_bpus_v2._validate_formal_scoring_settings(base, formal_mode=True)
+    baseline = select_bpus_v2._preprocessing_fingerprint(base, formula)
+    changed = SimpleNamespace(**{**vars(base), "batch_size": 8})
+    with pytest.raises(ValueError, match="batch_size=16"):
+        select_bpus_v2._validate_formal_scoring_settings(
+            changed, formal_mode=True
+        )
+    assert select_bpus_v2._preprocessing_fingerprint(changed, formula) != baseline
+
+
 def test_split_txt_uses_loader_compatible_stable_keys(tmp_path: Path) -> None:
     keys = ["TR-CAMO/a", "TR-COD10K/shared-name"]
     path = tmp_path / "bpus_v2_0002_seed17.txt"
@@ -140,6 +206,12 @@ def test_split_txt_uses_loader_compatible_stable_keys(tmp_path: Path) -> None:
 
     with pytest.raises(FileExistsError, match="different TXT split"):
         select_bpus_v2._save_split_text(path, ["TR-CAMO/different"])
+    select_bpus_v2._save_split_text(
+        path,
+        ["TR-CAMO/different"],
+        refuse_mismatch=False,
+    )
+    assert path.read_bytes() == b"TR-CAMO/different\n"
 
 
 def test_score_pool_never_enables_amp_on_cpu(
@@ -254,6 +326,8 @@ def test_synthetic_schema_two_round_trip_verify_and_tamper_detection(
         "schema_version": 2,
         "kind": "bpus_v2_selector",
         "method": "BPUS-v2",
+        "formal_mode": False,
+        "debug_mode": True,
         "protocol": protocol.name,
         "target_counts": list(protocol.target_counts),
         "bootstrap_count": protocol.bootstrap_count,

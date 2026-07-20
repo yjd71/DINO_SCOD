@@ -63,6 +63,38 @@ def test_invalid_boundary_prototype_is_exact_zero() -> None:
     assert torch.count_nonzero(prototype).item() == 0
 
 
+@pytest.mark.parametrize("bad_value", [float("nan"), float("inf"), -float("inf")])
+@pytest.mark.parametrize("target", ["p2", "boundary_weight"])
+def test_prototype_rejects_nonfinite_inputs(target: str, bad_value: float) -> None:
+    p2 = torch.randn(1, 128, 28, 28)
+    boundary_weight = torch.ones(1, 1, 56, 56)
+    tensor = p2 if target == "p2" else boundary_weight
+    tensor[0, 0, 0, 0] = bad_value
+
+    with pytest.raises(ValueError, match=target):
+        build_bpus_v2_prototype(p2, boundary_weight)
+
+
+def test_prototype_rejects_nonfinite_intermediate_norm() -> None:
+    p2 = torch.full(
+        (1, 128, 28, 28), torch.finfo(torch.float32).max, dtype=torch.float32
+    )
+
+    with pytest.raises(ValueError, match="P2 point norm"):
+        build_bpus_v2_prototype(p2, torch.ones(1, 1, 56, 56))
+
+
+def test_prototype_rejects_nonfinite_intermediate_boundary_mass() -> None:
+    boundary_weight = torch.full(
+        (1, 1, 56, 56), torch.finfo(torch.float32).max, dtype=torch.float32
+    )
+
+    with pytest.raises(ValueError, match="boundary_weight mass"):
+        build_bpus_v2_prototype(
+            torch.randn(1, 128, 28, 28), boundary_weight
+        )
+
+
 def test_schema2_score_cache_round_trip_and_schema1_rejection(tmp_path) -> None:
     keys = ["TR-CAMO/a", "TR-COD10K/b"]
     payload = build_score_payload(
