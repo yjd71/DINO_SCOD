@@ -2,6 +2,14 @@
 
 from .diagnostics import DIAGNOSTIC_NAMES, DiagnosticWarningTracker, collect_pc_diagnostics
 from .ema import make_ema_copy, update_ema_module
+from .encoder_training import (
+    EncoderPCStage,
+    build_encoder_pc_optimizer,
+    configure_encoder_pc_stage,
+    encoder_pc_labeled_loss,
+    make_ema_encoder_adapter,
+    update_ema_encoder_adapter,
+)
 from .losses import (
     base_structure_loss,
     decoder_base_loss,
@@ -25,14 +33,19 @@ from .pseudo_label import (
 __all__ = [
     "DIAGNOSTIC_NAMES",
     "DiagnosticWarningTracker",
+    "EncoderPCStage",
     "base_structure_loss",
     "decoder_base_loss",
     "build_pc_confidence",
+    "build_encoder_pc_optimizer",
     "collect_pc_diagnostics",
     "confidence_weighted_feature_cosine_loss",
     "compute_pc_hbm_labeled_loss",
     "compute_pc_hbm_unlabeled_loss",
+    "configure_encoder_pc_stage",
+    "encoder_pc_labeled_loss",
     "make_ema_copy",
+    "make_ema_encoder_adapter",
     "migration_aware_parameter_groups",
     "pc_hbm_labeled_loss",
     "pc_hbm_pc_only_labeled_loss",
@@ -42,5 +55,6 @@ __all__ = [
     "prepare_pseudo_targets",
     "structure_loss",
     "update_ema_module",
+    "update_ema_encoder_adapter",
     "weighted_structure_loss",
 ]

@@ -7,7 +7,7 @@ import random
 import hashlib
 import json
 import unicodedata
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, is_dataclass
 from numbers import Integral
 from pathlib import Path
@@ -29,6 +29,13 @@ ARTIFACT_METADATA_KEYS = (
 TRAINING_DESIGNS = frozenset({"teacher_only", "two_stage", "joint"})
 DECODER_ARCHITECTURES = frozenset({"legacy_transformer", "bgfbr_pc_v1"})
 DECODER_CONTRACT_VERSION = 1
+
+ENCODER_PC_FORMAT_VERSION = 3
+ENCODER_PC_ARCHITECTURE = "DINO_SCOD_ENCODER_PC_HBM"
+ENCODER_PC_MODEL_ARCHITECTURE = "dino_encoder_pc_bgfbr_v1"
+ENCODER_PC_ARTIFACT_KIND = "encoder_pc_model"
+ENCODER_PC_RESUME_KIND = "encoder_pc_training_resume"
+ENCODER_PC_MODEL_ROLES = frozenset({"base", "student"})
 
 
 def _config_decoder_identity(config: Any | None) -> tuple[str | None, int | None]:
@@ -320,6 +327,288 @@ def load_training_resume(
             raise RuntimeError("Resume checkpoint has no RNG state")
         restore_rng_state(checkpoint["rng_state"])
     return dict(checkpoint)
+
+
+def save_encoder_pc_checkpoint(
+    path: str | os.PathLike,
+    *,
+    epoch: int,
+    encoder_pc_hbm: nn.Module,
+    decoder: nn.Module,
+    pseudo_refiner: nn.Module,
+    config: Any,
+    model_role: str,
+    training_design: str,
+    artifact_meta: Mapping[str, Any] | None = None,
+    extra: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Save a standalone encoder-side PC-HBM artifact in format v3.
+
+    The three trainable subsystems deliberately have independent state-dict
+    entries.  This prevents a decoder-side PC-HBM checkpoint from being
+    mistaken for an encoder-side artifact and makes inference loading strict.
+    """
+
+    decoder_state = _encoder_pc_decoder_state(decoder)
+    payload: dict[str, Any] = {
+        "format_version": ENCODER_PC_FORMAT_VERSION,
+        "architecture": ENCODER_PC_ARCHITECTURE,
+        "model_architecture": ENCODER_PC_MODEL_ARCHITECTURE,
+        "artifact_kind": ENCODER_PC_ARTIFACT_KIND,
+        "epoch": int(epoch),
+        "encoder_pc_hbm": _unwrap(encoder_pc_hbm).state_dict(),
+        "decoder": decoder_state,
+        "pseudo_refiner": _unwrap(pseudo_refiner).state_dict(),
+        "config": _encoder_pc_config_dict(config),
+        "artifact_meta": _encoder_pc_artifact_metadata(
+            artifact_meta,
+            model_role=model_role,
+            training_design=training_design,
+        ),
+    }
+    if extra:
+        payload["extra"] = dict(extra)
+    _atomic_torch_save(payload, path)
+    return payload
+
+
+def load_encoder_pc_checkpoint(
+    source: str | os.PathLike | Mapping[str, Any],
+    *,
+    encoder_pc_hbm: nn.Module,
+    decoder: nn.Module,
+    pseudo_refiner: nn.Module,
+    expected_model_role: str,
+    expected_training_design: str,
+    expected_config: Any | Mapping[str, Any] | None = None,
+    expected_artifact_meta: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Strictly restore a standalone encoder-side format-v3 artifact."""
+
+    checkpoint = _load_source(source)
+    _validate_encoder_pc_checkpoint(
+        checkpoint,
+        expected_kind=ENCODER_PC_ARTIFACT_KIND,
+        expected_model_role=expected_model_role,
+        expected_training_design=expected_training_design,
+        expected_artifact_meta=expected_artifact_meta,
+    )
+    _validate_encoder_pc_expected_config(checkpoint, expected_config)
+    _load_encoder_pc_modules(
+        checkpoint,
+        encoder_pc_hbm=encoder_pc_hbm,
+        decoder=decoder,
+        pseudo_refiner=pseudo_refiner,
+    )
+    return dict(checkpoint)
+
+
+def save_encoder_pc_training_resume(
+    path: str | os.PathLike,
+    *,
+    epoch: int,
+    encoder_pc_hbm: nn.Module,
+    decoder: nn.Module,
+    pseudo_refiner: nn.Module,
+    optimizer,
+    config: Any,
+    stage_state: Any,
+    split_state: Any,
+    memory_profile: Any,
+    model_role: str,
+    training_design: str,
+    scheduler=None,
+    scaler=None,
+    ema_adapter: nn.Module | None = None,
+    ema_decoder: nn.Module | None = None,
+    ema_refiner: nn.Module | None = None,
+    artifact_meta: Mapping[str, Any] | None = None,
+    extra: Mapping[str, Any] | None = None,
+    rng_state_by_rank: Sequence[Mapping[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Save exact encoder-side Base/TS training state in format v3."""
+
+    if optimizer is None:
+        raise TypeError("encoder-PC training resume requires an optimizer")
+    payload: dict[str, Any] = {
+        "format_version": ENCODER_PC_FORMAT_VERSION,
+        "architecture": ENCODER_PC_ARCHITECTURE,
+        "model_architecture": ENCODER_PC_MODEL_ARCHITECTURE,
+        "artifact_kind": ENCODER_PC_RESUME_KIND,
+        "epoch": int(epoch),
+        "encoder_pc_hbm": _unwrap(encoder_pc_hbm).state_dict(),
+        "decoder": _encoder_pc_decoder_state(decoder),
+        "pseudo_refiner": _unwrap(pseudo_refiner).state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "config": _encoder_pc_config_dict(config),
+        "stage_state": _plain_checkpoint_state(stage_state, name="stage_state"),
+        "split_state": _plain_checkpoint_state(split_state, name="split_state"),
+        "memory_profile": _plain_checkpoint_state(memory_profile, name="memory_profile"),
+        "rng_state": capture_rng_state(),
+        "artifact_meta": _encoder_pc_artifact_metadata(
+            artifact_meta,
+            model_role=model_role,
+            training_design=training_design,
+        ),
+    }
+    if rng_state_by_rank is not None:
+        states = [dict(state) for state in rng_state_by_rank]
+        if not states:
+            raise ValueError("rng_state_by_rank must contain at least one rank state")
+        payload["rng_state_by_rank"] = states
+        payload["rng_state"] = states[0]
+    _optional_state(payload, "scheduler", scheduler)
+    _optional_state(payload, "scaler", scaler)
+    _optional_module_state(payload, "ema_adapter", ema_adapter)
+    _optional_module_state(payload, "ema_decoder", ema_decoder)
+    _optional_module_state(payload, "ema_refiner", ema_refiner)
+    if extra:
+        payload["extra"] = dict(extra)
+    _atomic_torch_save(payload, path)
+    return payload
+
+
+def load_encoder_pc_training_resume(
+    source: str | os.PathLike | Mapping[str, Any],
+    *,
+    encoder_pc_hbm: nn.Module,
+    decoder: nn.Module,
+    pseudo_refiner: nn.Module,
+    expected_model_role: str,
+    expected_training_design: str,
+    expected_config: Any | Mapping[str, Any] | None = None,
+    optimizer=None,
+    scheduler=None,
+    scaler=None,
+    ema_adapter: nn.Module | None = None,
+    ema_decoder: nn.Module | None = None,
+    ema_refiner: nn.Module | None = None,
+    restore_rng: bool = True,
+    expected_split_state: Any | None = None,
+    expected_memory_profile: Any | None = None,
+    expected_artifact_meta: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Strictly restore a format-v3 Base/TS resume checkpoint."""
+
+    checkpoint = _load_source(source)
+    _validate_encoder_pc_checkpoint(
+        checkpoint,
+        expected_kind=ENCODER_PC_RESUME_KIND,
+        expected_model_role=expected_model_role,
+        expected_training_design=expected_training_design,
+        expected_artifact_meta=expected_artifact_meta,
+    )
+    _validate_encoder_pc_expected_config(checkpoint, expected_config)
+    for name in ("optimizer", "stage_state", "split_state", "memory_profile", "rng_state"):
+        if name not in checkpoint:
+            raise RuntimeError(f"Encoder-PC resume is missing required {name!r} state")
+    if expected_split_state is not None:
+        _validate_plain_checkpoint_state(
+            checkpoint["split_state"], expected_split_state, name="split_state"
+        )
+    if expected_memory_profile is not None:
+        _validate_plain_checkpoint_state(
+            checkpoint["memory_profile"], expected_memory_profile, name="memory_profile"
+        )
+    _load_encoder_pc_modules(
+        checkpoint,
+        encoder_pc_hbm=encoder_pc_hbm,
+        decoder=decoder,
+        pseudo_refiner=pseudo_refiner,
+    )
+    _restore_optional_state(checkpoint, "optimizer", optimizer)
+    _restore_optional_state(checkpoint, "scheduler", scheduler)
+    _restore_optional_state(checkpoint, "scaler", scaler)
+    _restore_optional_module_state(checkpoint, "ema_adapter", ema_adapter)
+    _restore_optional_module_state(checkpoint, "ema_decoder", ema_decoder)
+    _restore_optional_module_state(checkpoint, "ema_refiner", ema_refiner)
+    if restore_rng:
+        rank_states = checkpoint.get("rng_state_by_rank")
+        if rank_states is not None:
+            if not isinstance(rank_states, Sequence) or not rank_states:
+                raise RuntimeError("rng_state_by_rank must be a non-empty sequence")
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                else 0
+            )
+            world_size = (
+                torch.distributed.get_world_size()
+                if torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                else 1
+            )
+            if len(rank_states) != world_size or rank >= len(rank_states):
+                raise RuntimeError(
+                    "Resume RNG rank count differs from the current distributed world"
+                )
+            restore_rng_state(rank_states[rank])
+        else:
+            restore_rng_state(checkpoint["rng_state"])
+    return dict(checkpoint)
+
+
+def load_bgfbr_decoder_warm_start(
+    decoder: nn.Module,
+    source: str | os.PathLike | Mapping[str, Any],
+    *,
+    drop_prefixes: tuple[str, ...] = ("pc_hbm.",),
+    strict_non_pc: bool = True,
+) -> dict[str, Any]:
+    """Warm-start a detached BGFBR Decoder from complete non-PC weights only.
+
+    ``pc_hbm.*`` is the only source namespace that may be discarded.  Missing
+    or additional non-PC tensors are errors, so legacy optimizer, memory, and
+    PC state can never be silently migrated into the new encoder-side profile.
+    """
+
+    if tuple(drop_prefixes) != ("pc_hbm.",):
+        raise ValueError("Encoder-PC warm-start may drop only the 'pc_hbm.' prefix")
+    if strict_non_pc is not True:
+        raise ValueError("Encoder-PC warm-start requires strict_non_pc=True")
+
+    target = _unwrap(decoder)
+    target_state = target.state_dict()
+    target_pc = sorted(key for key in target_state if key.startswith("pc_hbm."))
+    if target_pc:
+        raise RuntimeError(
+            "Encoder-side warm-start requires a detached BGFBR Decoder; "
+            f"target contains PC-HBM keys: {target_pc[:5]}"
+        )
+    target_architecture, _ = _module_decoder_identity(target)
+    if target_architecture not in (None, "bgfbr_pc_v1"):
+        raise RuntimeError(
+            "Encoder-side warm-start target is not BGFBR: "
+            f"{target_architecture!r}"
+        )
+
+    checkpoint = _load_source(source)
+    source_architecture, _ = _checkpoint_decoder_identity(checkpoint)
+    if source_architecture not in (None, "bgfbr_pc_v1"):
+        raise RuntimeError(
+            "Warm-start source is not a BGFBR checkpoint: "
+            f"{source_architecture!r}"
+        )
+    source_state = extract_decoder_state(checkpoint)
+    ignored_pc = sorted(key for key in source_state if key.startswith("pc_hbm."))
+    non_pc_state = {
+        key: value for key, value in source_state.items() if not key.startswith("pc_hbm.")
+    }
+    missing = sorted(set(target_state) - set(non_pc_state))
+    unexpected = sorted(set(non_pc_state) - set(target_state))
+    if missing:
+        raise RuntimeError(f"BGFBR warm-start is missing non-PC keys: {missing}")
+    if unexpected:
+        raise RuntimeError(f"BGFBR warm-start has unexpected non-PC keys: {unexpected}")
+    target.load_state_dict(non_pc_state, strict=True)
+    return {
+        "loaded_keys": tuple(sorted(non_pc_state)),
+        "ignored_pc_keys": tuple(ignored_pc),
+        "source_format_version": checkpoint.get("format_version")
+        if isinstance(checkpoint, Mapping)
+        else None,
+    }
 
 
 def capture_rng_state() -> dict[str, Any]:
@@ -755,6 +1044,241 @@ def _attach_artifact_metadata(
         payload["artifact_meta"] = _normalize_artifact_metadata(metadata)
 
 
+def _encoder_pc_config_dict(config: Any) -> dict[str, Any]:
+    state = _config_dict(config)
+    if not isinstance(state, dict) or not state:
+        raise TypeError("Encoder-PC format v3 requires a non-empty config mapping")
+    architecture = state.get("architecture")
+    if architecture is not None and architecture != ENCODER_PC_ARCHITECTURE:
+        raise RuntimeError(
+            "Encoder-PC config architecture mismatch: "
+            f"expected {ENCODER_PC_ARCHITECTURE!r}, got {architecture!r}"
+        )
+    schema = state.get("memory_schema_version", state.get("schema_version"))
+    if schema is not None and int(schema) != ENCODER_PC_FORMAT_VERSION:
+        raise RuntimeError(
+            "Encoder-PC config must use memory schema v3; "
+            f"got {schema!r}"
+        )
+    return state
+
+
+def _validate_encoder_pc_expected_config(
+    checkpoint: Mapping[str, Any],
+    expected_config: Any | Mapping[str, Any] | None,
+) -> None:
+    if expected_config is None:
+        return
+    saved = checkpoint.get("config")
+    if not isinstance(saved, Mapping):
+        raise RuntimeError("Encoder-PC checkpoint has no valid config mapping")
+    expected = _encoder_pc_config_dict(expected_config)
+    saved_state = dict(saved)
+    missing = sorted(set(expected) - set(saved_state))
+    unexpected = sorted(set(saved_state) - set(expected))
+    mismatched = sorted(
+        key
+        for key in set(expected).intersection(saved_state)
+        if saved_state[key] != expected[key]
+    )
+    if missing or unexpected or mismatched:
+        details = []
+        if missing:
+            details.append(f"missing={missing}")
+        if unexpected:
+            details.append(f"unexpected={unexpected}")
+        if mismatched:
+            preview = {
+                key: (saved_state[key], expected[key]) for key in mismatched[:10]
+            }
+            details.append(f"mismatched={preview}")
+        raise RuntimeError(
+            "Encoder-PC checkpoint config differs from the live contract: "
+            + "; ".join(details)
+        )
+
+
+def _encoder_pc_artifact_metadata(
+    metadata: Mapping[str, Any] | None,
+    *,
+    model_role: str,
+    training_design: str,
+) -> dict[str, Any]:
+    if model_role not in ENCODER_PC_MODEL_ROLES:
+        raise ValueError(
+            f"Unsupported encoder-PC model_role {model_role!r}; "
+            f"expected one of {sorted(ENCODER_PC_MODEL_ROLES)}"
+        )
+    if not isinstance(training_design, str) or not training_design.strip():
+        raise TypeError("encoder-PC training_design must be a non-empty string")
+    resolved = dict(metadata or {})
+    for key, expected in (
+        ("model_role", model_role),
+        ("training_design", training_design),
+    ):
+        actual = resolved.get(key, expected)
+        if actual != expected:
+            raise RuntimeError(
+                f"Encoder-PC artifact metadata {key} mismatch: "
+                f"argument={expected!r}, metadata={actual!r}"
+            )
+        resolved[key] = expected
+    resolved.setdefault("encoder_pc_metadata_version", 1)
+    if resolved["encoder_pc_metadata_version"] != 1:
+        raise RuntimeError(
+            "Unsupported encoder-PC artifact metadata version: "
+            f"{resolved['encoder_pc_metadata_version']!r}"
+        )
+    return resolved
+
+
+def _validate_encoder_pc_checkpoint(
+    checkpoint: Mapping[str, Any],
+    *,
+    expected_kind: str,
+    expected_model_role: str,
+    expected_training_design: str,
+    expected_artifact_meta: Mapping[str, Any] | None,
+) -> None:
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError("Encoder-PC checkpoint must be a mapping")
+    version = checkpoint.get("format_version")
+    if version != ENCODER_PC_FORMAT_VERSION:
+        raise RuntimeError(
+            "Encoder-PC loader requires checkpoint format v3; "
+            f"got {version!r}. Legacy format v1/v2 is not migrated."
+        )
+    architecture = checkpoint.get("architecture")
+    if architecture != ENCODER_PC_ARCHITECTURE:
+        raise RuntimeError(
+            "Encoder-PC checkpoint architecture mismatch: "
+            f"expected {ENCODER_PC_ARCHITECTURE!r}, got {architecture!r}"
+        )
+    model_architecture = checkpoint.get("model_architecture")
+    if model_architecture != ENCODER_PC_MODEL_ARCHITECTURE:
+        raise RuntimeError(
+            "Encoder-PC model architecture mismatch: "
+            f"expected {ENCODER_PC_MODEL_ARCHITECTURE!r}, "
+            f"got {model_architecture!r}"
+        )
+    kind = checkpoint.get("artifact_kind")
+    if kind != expected_kind:
+        raise RuntimeError(
+            f"Encoder-PC checkpoint kind mismatch: expected {expected_kind!r}, got {kind!r}"
+        )
+    if "config" not in checkpoint:
+        raise RuntimeError("Encoder-PC checkpoint is missing required 'config' state")
+    _encoder_pc_config_dict(checkpoint["config"])
+    metadata = checkpoint.get("artifact_meta")
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError("Encoder-PC checkpoint is missing artifact_meta")
+    normalized = _encoder_pc_artifact_metadata(
+        metadata,
+        model_role=expected_model_role,
+        training_design=expected_training_design,
+    )
+    for key, expected in dict(expected_artifact_meta or {}).items():
+        if key not in normalized:
+            raise RuntimeError(f"Encoder-PC artifact metadata is missing {key!r}")
+        if normalized[key] != expected:
+            raise RuntimeError(
+                f"Encoder-PC artifact metadata mismatch for {key}: "
+                f"checkpoint={normalized[key]!r}, expected={expected!r}"
+            )
+
+
+def _encoder_pc_decoder_state(decoder: nn.Module) -> Mapping[str, torch.Tensor]:
+    target = _unwrap(decoder)
+    architecture, _ = _module_decoder_identity(target)
+    if architecture != "bgfbr_pc_v1":
+        raise RuntimeError(
+            "Encoder-PC format v3 requires a BGFBR Decoder, got "
+            f"{architecture!r}"
+        )
+    state = target.state_dict()
+    pc_keys = sorted(key for key in state if key.startswith("pc_hbm."))
+    if pc_keys:
+        raise RuntimeError(
+            "Encoder-PC format v3 requires Decoder attach_pc=False; "
+            f"found PC-HBM state keys: {pc_keys[:5]}"
+        )
+    return state
+
+
+def _load_encoder_pc_modules(
+    checkpoint: Mapping[str, Any],
+    *,
+    encoder_pc_hbm: nn.Module,
+    decoder: nn.Module,
+    pseudo_refiner: nn.Module,
+) -> None:
+    targets = {
+        "encoder_pc_hbm": _unwrap(encoder_pc_hbm),
+        "decoder": _unwrap(decoder),
+        "pseudo_refiner": _unwrap(pseudo_refiner),
+    }
+    for name, target in targets.items():
+        if name == "decoder":
+            _encoder_pc_decoder_state(target)
+        state = checkpoint.get(name)
+        if not isinstance(state, Mapping):
+            raise RuntimeError(f"Encoder-PC checkpoint is missing {name!r} state")
+        if name == "decoder":
+            checkpoint_pc = sorted(key for key in state if key.startswith("pc_hbm."))
+            target_pc = sorted(
+                key for key in target.state_dict() if key.startswith("pc_hbm.")
+            )
+            if checkpoint_pc or target_pc:
+                raise RuntimeError(
+                    "Encoder-PC v3 Decoder must not contain pc_hbm state; "
+                    f"checkpoint={checkpoint_pc[:5]}, target={target_pc[:5]}"
+                )
+        aligned = _align_module_prefix(state, target.state_dict())
+        target.load_state_dict(aligned, strict=True)
+
+
+def _plain_checkpoint_state(value: Any, *, name: str) -> Any:
+    if is_dataclass(value):
+        value = asdict(value)
+    if isinstance(value, Mapping):
+        return {
+            str(key): _plain_checkpoint_state(item, name=f"{name}.{key}")
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_plain_checkpoint_state(item, name=name) for item in value]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    raise TypeError(
+        f"{name} must contain only dataclass/mapping/list/scalar state, "
+        f"got {type(value).__name__}"
+    )
+
+
+def _validate_plain_checkpoint_state(actual: Any, expected: Any, *, name: str) -> None:
+    expected_plain = _plain_checkpoint_state(expected, name=name)
+    if actual != expected_plain:
+        raise RuntimeError(
+            f"Encoder-PC resume {name} mismatch: "
+            f"checkpoint={actual!r}, expected={expected_plain!r}"
+        )
+
+
+def _optional_module_state(payload, name, module):
+    if module is not None:
+        payload[name] = _unwrap(module).state_dict()
+
+
+def _restore_optional_module_state(checkpoint, name, module):
+    if module is None:
+        return
+    if name not in checkpoint:
+        raise RuntimeError(f"Resume requested {name} but checkpoint has none")
+    target = _unwrap(module)
+    state = _align_module_prefix(checkpoint[name], target.state_dict())
+    target.load_state_dict(state, strict=True)
+
+
 def _optional_state(payload, name, object_with_state):
     if object_with_state is not None:
         payload[name] = object_with_state.state_dict()
@@ -798,6 +1322,12 @@ load_pc_hbm_memory = load_memory_checkpoint
 __all__ = [
     "ARTIFACT_METADATA_KEYS",
     "ARTIFACT_METADATA_VERSION",
+    "ENCODER_PC_ARCHITECTURE",
+    "ENCODER_PC_ARTIFACT_KIND",
+    "ENCODER_PC_FORMAT_VERSION",
+    "ENCODER_PC_MODEL_ARCHITECTURE",
+    "ENCODER_PC_MODEL_ROLES",
+    "ENCODER_PC_RESUME_KIND",
     "TRAINING_DESIGNS",
     "build_artifact_metadata",
     "capture_rng_state",
@@ -806,6 +1336,9 @@ __all__ = [
     "extract_decoder_state",
     "extract_non_pc_decoder_state",
     "load_decoder_compatible",
+    "load_encoder_pc_checkpoint",
+    "load_encoder_pc_training_resume",
+    "load_bgfbr_decoder_warm_start",
     "load_legacy_into_bgfbr",
     "load_memory_checkpoint",
     "load_pc_hbm_memory",
@@ -814,6 +1347,8 @@ __all__ = [
     "read_artifact_metadata",
     "restore_rng_state",
     "save_decoder_checkpoint",
+    "save_encoder_pc_checkpoint",
+    "save_encoder_pc_training_resume",
     "save_memory_checkpoint",
     "save_pc_hbm_decoder",
     "save_pc_hbm_memory",

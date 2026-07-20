@@ -174,6 +174,10 @@ class EncoderPCHBMAdapter(nn.Module):
         batch_ids, flat_indices = self._sparse_indices(
             bootstrap.boundary_output.selected_indices
         )
+        aux["boundary_indices"] = {
+            "batch_ids": batch_ids,
+            "flat_indices": flat_indices,
+        }
         parent = self.verifier.parent_retriever(
             e3, batch_ids, flat_indices, route["parent_subbanks"]
         )
@@ -188,6 +192,7 @@ class EncoderPCHBMAdapter(nn.Module):
             bootstrap.boundary_output.boundary_probability,
         )
         query_geometry = gather_tokens(query_geometry_map, batch_ids, flat_indices)
+        aux["query_geometry"] = query_geometry
         verification = self.verifier.child_verifier(
             e1,
             e2,

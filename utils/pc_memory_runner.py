@@ -334,6 +334,7 @@ __all__ = [
     "build_memory_compat_meta",
     "build_pc_memory_loader",
     "module_fingerprint",
+    "rebuild_encoder_memory",
     "rebuild_memory",
     "unpack_memory_batch",
 ]

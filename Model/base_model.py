@@ -3,7 +3,12 @@ import torch.nn as nn
 import warnings
 from Model.BGFBR import ImageNetRGBAdapter
 from Model.decoder import build_decoder, resolve_decoder_arch
-from Model.PC_HBM.encoder import DinoFeatureBundle
+from configs.pc_hbm_dino_config import EncoderPCHBMConfig
+from Model.PC_HBM.encoder import (
+    DinoFeatureBundle,
+    EncoderPCHBMAdapter,
+    EncoderPCStageFlags,
+)
 from utils.checkpoint_pc_hbm import (
     load_decoder_compatible,
     save_decoder_checkpoint as save_decoder_artifact,
@@ -36,6 +41,17 @@ class BaseModel(nn.Module):
             pc_cfg=pc_cfg,
             attach_pc=bool(attach_pc) and self.pc_placement == 'decoder',
         )
+        self.encoder_pc_hbm = None
+        self.encoder_pc_config = None
+        self.encoder_pc_profile_v3 = False
+        if self.pc_placement == 'encoder':
+            # The legacy profile registry can still stamp pc_placement onto a
+            # v2 config for contract/isolation tests.  Production encoder-PC
+            # execution requires the independent strict v3 config.
+            self.encoder_pc_profile_v3 = isinstance(pc_cfg, EncoderPCHBMConfig)
+            if self.encoder_pc_profile_v3:
+                self.encoder_pc_config = pc_cfg
+                self.encoder_pc_hbm = EncoderPCHBMAdapter(self.encoder_pc_config)
 
     def train(self, mode=True):
         super().train(mode)
@@ -102,13 +118,48 @@ class BaseModel(nn.Module):
         epoch=None,
         return_aux=False,
         query_image_ids=None,
+        encoder_stage=None,
+        allow_memory_fallback=False,
     ):
-        x_features = self.extract_features(x)
+        bundle = self.extract_feature_bundle(x)
+        x_features = bundle.patch_tokens
         image_rgb = self.prepare_rgb(x)
         if getattr(self, 'pc_placement', 'decoder') == 'encoder':
-            memory = None
-            pc_mode = 'off'
-            query_image_ids = None
+            encoder_aux = {'mode': 'off', 'pc_active': False}
+            if self.encoder_pc_profile_v3:
+                if encoder_stage is not None and not isinstance(
+                    encoder_stage, EncoderPCStageFlags
+                ):
+                    raise TypeError('encoder_stage must be EncoderPCStageFlags or None.')
+                adapter_output = self.encoder_pc_hbm(
+                    bundle,
+                    memory=memory,
+                    mode=pc_mode,
+                    stage=encoder_stage,
+                    query_image_ids=query_image_ids,
+                    allow_memory_fallback=allow_memory_fallback,
+                )
+                x_features = adapter_output.features
+                encoder_aux = adapter_output.aux
+            decoder_result = self.decoder(
+                features=x_features,
+                image_rgb=image_rgb,
+                memory=None,
+                pc_mode='off',
+                epoch=epoch,
+                return_aux=return_aux,
+                query_image_ids=None,
+            )
+            if not return_aux:
+                return decoder_result
+            if not isinstance(decoder_result, (tuple, list)) or len(decoder_result) != 2:
+                raise RuntimeError('BGFBR Decoder must return (outputs, aux).')
+            outputs, decoder_aux = decoder_result
+            combined_aux = dict(decoder_aux or {})
+            combined_aux['encoder_pc_hbm'] = encoder_aux
+            combined_aux['pc_active'] = bool(encoder_aux.get('pc_active', False))
+            combined_aux['pc_mode'] = str(encoder_aux.get('mode', pc_mode))
+            return outputs, combined_aux
         return self.decoder(
             features=x_features,
             image_rgb=image_rgb,
@@ -120,8 +171,27 @@ class BaseModel(nn.Module):
         )
     
     def inference(self, x, memory=None, epoch=None):
-        x_features = self.extract_features(x)
+        bundle = self.extract_feature_bundle(x)
+        x_features = bundle.patch_tokens
         image_rgb = self.prepare_rgb(x)
+        if self.pc_placement == 'encoder' and self.encoder_pc_profile_v3:
+            adapter_output = self.encoder_pc_hbm(
+                bundle,
+                memory=memory,
+                mode='full',
+                stage=EncoderPCStageFlags(
+                    enable_f4_f3=True,
+                    f4_f3_progress=1.0,
+                    enable_f2_f1=True,
+                    f2_f1_progress=1.0,
+                ),
+            )
+            return self.decoder(
+                features=adapter_output.features,
+                image_rgb=image_rgb,
+                memory=None,
+                pc_mode='off',
+            )[3]
         if self.decoder.pc_hbm is None:
             return self.decoder(features=x_features, image_rgb=image_rgb, pc_mode='off')[3]
         if memory is None:
@@ -150,11 +220,19 @@ class BaseModel(nn.Module):
         return aux['z_final'] if aux['z_final'] is not None else aux['z_main']
     
     def save_decoder_checkpoint(self, path):
+        if self.pc_placement == 'encoder':
+            raise RuntimeError(
+                'encoder_pc must be saved as a complete v3 adapter/decoder/refiner artifact.'
+            )
         assert path.endswith('.pth'), f'Path should end with .pth, but got: {path}'
         save_decoder_artifact(path, self.decoder, self.pc_cfg, epoch=0)
         print(f'Successfully save seg parameters to {path}.')
 
     def load_decoder_checkpoint(self, path, require_pc_complete=False):
+        if self.pc_placement == 'encoder':
+            raise RuntimeError(
+                'encoder_pc accepts only strict non-PC BGFBR warm-start or v3 artifacts.'
+            )
         assert path.endswith('.pth'), f'Path should end with .pth, but got: {path}'
         load_decoder_compatible(
             self.decoder,

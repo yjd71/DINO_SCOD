@@ -8,7 +8,10 @@ import random
 import numpy as np
 import torch
 
-from configs.bgfbr_experiments import experiment_profile_names
+from configs.bgfbr_experiments import (
+    build_experiment_profile,
+    experiment_profile_names,
+)
 
 
 def set_seed(seed: int = 2025, deterministic: bool = False) -> None:
@@ -50,8 +53,11 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         "--base-model-path",
         dest="output_dir",
-        default="./results/base_pc_hbm",
-        help="Directory for Decoder, memory and resumable training checkpoints.",
+        default=None,
+        help=(
+            "Output directory. Defaults to ./results/base_pc_hbm for legacy profiles "
+            "and ./results/base_encoder_pc for encoder_pc."
+        ),
     )
     initialization = parser.add_mutually_exclusive_group()
     initialization.add_argument(
@@ -100,9 +106,9 @@ def parse_args() -> argparse.Namespace:
             "(currently 16); global batch size is batch_size * world_size."
         ),
     )
-    parser.add_argument("--memory-batch-size", type=int, default=16)
+    parser.add_argument("--memory-batch-size", type=_positive_int, default=16)
     parser.add_argument("--num-workers", type=int, default=None)
-    parser.add_argument("--checkpoint-interval", type=int, default=1)
+    parser.add_argument("--checkpoint-interval", type=_positive_int, default=1)
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument(
@@ -142,18 +148,37 @@ def validate_training_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--legacy-warm-start conflicts with baseline/decoder/resume initialization"
         )
+    if build_experiment_profile(args.experiment_profile).pc_placement == "encoder":
+        if args.training_design != "two_stage":
+            raise ValueError("encoder_pc uses its fixed five-stage Base curriculum.")
+        if args.decoder_checkpoint or args.legacy_warm_start:
+            raise ValueError(
+                "encoder_pc accepts only --baseline-checkpoint for optional BGFBR warm-start."
+            )
+        if args.allow_self_match:
+            raise ValueError("encoder_pc always excludes retrieval self-matches.")
+        if args.learning_rate is not None:
+            raise ValueError(
+                "encoder_pc uses fixed per-module learning rates; omit --learning-rate."
+            )
+        if not 1 <= int(args.epochs) <= 30:
+            raise ValueError("encoder_pc Base epochs must be in [1, 30].")
 
 
 if __name__ == "__main__":
     args = parse_args()
     validate_training_args(args)
     from configs.base_model_config import Config
-    from configs.bgfbr_experiments import apply_experiment_profile
-    from configs.pc_hbm_dino_config import DinoPCHBMConfig
+    from configs.bgfbr_experiments import (
+        apply_experiment_profile,
+        build_experiment_profile,
+    )
+    from configs.pc_hbm_dino_config import DinoPCHBMConfig, EncoderPCHBMConfig
     from Model.base_model import BaseModel
     from utils.checkpoint_pc_hbm import (
         extract_non_pc_decoder_state,
         load_decoder_compatible,
+        load_bgfbr_decoder_warm_start,
         load_legacy_into_bgfbr,
         state_dict_fingerprint,
     )
@@ -168,13 +193,21 @@ if __name__ == "__main__":
         configure_teacher_only_trainability,
         configure_two_stage_trainability,
     )
+    from utils.trainer_base_model_encoder_pc import EncoderPCHBMTrainer
 
     context = init_distributed()
     try:
         set_seed(args.seed + context.rank, deterministic=args.deterministic)
         cfg = Config()
         configure_distributed(cfg, context, seed=args.seed)
-        cfg.save_dir = args.output_dir
+        uses_encoder_placement = (
+            build_experiment_profile(args.experiment_profile).pc_placement == "encoder"
+        )
+        cfg.save_dir = args.output_dir or (
+            "./results/base_encoder_pc"
+            if uses_encoder_placement
+            else "./results/base_pc_hbm"
+        )
         cfg.training_design = args.training_design
         cfg.train_labeled_indices_pt = args.labeled_indices_pt
         cfg.epochs = args.epochs
@@ -187,15 +220,30 @@ if __name__ == "__main__":
         if args.learning_rate is not None:
             cfg.learning_rate = args.learning_rate
 
-        pc_cfg = DinoPCHBMConfig(
-            use_amp=not args.no_amp,
-            exclude_self_match=not args.allow_self_match,
-        )
-        pc_cfg.configure_training_design(args.training_design)
-        experiment_profile = apply_experiment_profile(pc_cfg, args.experiment_profile)
+        requested_profile = build_experiment_profile(args.experiment_profile)
+        encoder_profile = requested_profile.pc_placement == "encoder"
+        if encoder_profile:
+            experiment_profile = requested_profile
+            pc_cfg = EncoderPCHBMConfig()
+            cfg.use_amp = not args.no_amp
+        else:
+            pc_cfg = DinoPCHBMConfig(
+                use_amp=not args.no_amp,
+                exclude_self_match=not args.allow_self_match,
+            )
+            pc_cfg.configure_training_design(args.training_design)
+            experiment_profile = apply_experiment_profile(pc_cfg, args.experiment_profile)
         cfg.experiment_profile = experiment_profile.name
         model = BaseModel(pc_cfg=pc_cfg).to(cfg.device)
-        if args.training_design in {"teacher_only", "two_stage"} and args.baseline_checkpoint:
+        decoder_warm_started = False
+        if encoder_profile and args.baseline_checkpoint:
+            cfg.baseline_fingerprint = state_dict_fingerprint(
+                extract_non_pc_decoder_state(args.baseline_checkpoint)
+            )
+            cfg.initialization_source = "bgfbr_non_pc_warm_start"
+            load_bgfbr_decoder_warm_start(model.decoder, args.baseline_checkpoint)
+            decoder_warm_started = True
+        elif args.training_design in {"teacher_only", "two_stage"} and args.baseline_checkpoint:
             cfg.baseline_fingerprint = state_dict_fingerprint(
                 extract_non_pc_decoder_state(args.baseline_checkpoint)
             )
@@ -229,7 +277,12 @@ if __name__ == "__main__":
             )
             cfg.legacy_migration_report = migration["report"]
             cfg.legacy_reused_parameter_names = migration["reused_parameter_names"]
-        if args.training_design == "teacher_only":
+        if encoder_profile and not decoder_warm_started:
+            cfg.baseline_fingerprint = state_dict_fingerprint(model.decoder.state_dict())
+            cfg.initialization_source = "scratch_bgfbr"
+        if encoder_profile:
+            pass
+        elif args.training_design == "teacher_only":
             configure_teacher_only_trainability(model)
         elif args.training_design == "two_stage":
             configure_two_stage_trainability(model)
@@ -254,12 +307,20 @@ if __name__ == "__main__":
                 ) from error
             model = wrap_distributed(model, context)
 
-        trainer = BasePCHBMTrainer(
-            model=model,
-            cfg=cfg,
-            pc_cfg=pc_cfg,
-            training_design=args.training_design,
-        )
+        if encoder_profile:
+            trainer = EncoderPCHBMTrainer(
+                model=model,
+                cfg=cfg,
+                pc_cfg=pc_cfg,
+                decoder_warm_started=decoder_warm_started,
+            )
+        else:
+            trainer = BasePCHBMTrainer(
+                model=model,
+                cfg=cfg,
+                pc_cfg=pc_cfg,
+                training_design=args.training_design,
+            )
         if args.resume:
             trainer.resume(args.resume)
         trainer.train()
