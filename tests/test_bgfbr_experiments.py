@@ -188,7 +188,13 @@ class _FakeDino(nn.Module):
 
     def get_intermediate_layers(self, x, **kwargs):
         batch = x.shape[0]
-        return tuple(x.new_zeros(batch, 28 * 28, 768) for _ in range(4))
+        patch_tokens = tuple(
+            x.new_zeros(batch, 28 * 28, 768) for _ in range(4)
+        )
+        if kwargs.get("return_class_token", False):
+            cls_tokens = tuple(x.new_zeros(batch, 768) for _ in range(4))
+            return tuple(zip(patch_tokens, cls_tokens))
+        return patch_tokens
 
 
 class _RecordingDecoder(nn.Module):

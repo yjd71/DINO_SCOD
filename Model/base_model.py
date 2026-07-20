@@ -3,6 +3,7 @@ import torch.nn as nn
 import warnings
 from Model.BGFBR import ImageNetRGBAdapter
 from Model.decoder import build_decoder, resolve_decoder_arch
+from Model.PC_HBM.encoder import DinoFeatureBundle
 from utils.checkpoint_pc_hbm import (
     load_decoder_compatible,
     save_decoder_checkpoint as save_decoder_artifact,
@@ -42,25 +43,47 @@ class BaseModel(nn.Module):
         return self
 
     @torch.no_grad()
-    def extract_features(self, x):
+    def extract_feature_bundle(self, x):
         if x.dim() != 4:
             raise ValueError(f'Expected image batch [B,C,H,W], got {tuple(x.shape)}.')
-        with torch.no_grad():
-            layer_indices = (
-                list(self.pc_cfg.dino_layer_indices)
-                if self.pc_cfg is not None
-                else [2, 5, 8, 11]
-            )
-            features = self.dino.get_intermediate_layers(
-                x=x,
-                n=layer_indices,
-                reshape=False,
-                return_class_token=False,
-                norm=True,
-            )
+        self.dino.eval()
+        layer_indices = (
+            tuple(self.pc_cfg.dino_layer_indices)
+            if self.pc_cfg is not None
+            else (2, 5, 8, 11)
+        )
+        features = self.dino.get_intermediate_layers(
+            x=x,
+            n=layer_indices,
+            reshape=False,
+            return_class_token=True,
+            norm=True,
+        )
         if len(features) != 4:
-            raise RuntimeError(f'DINO returned {len(features)} feature levels instead of four.')
-        return features
+            raise RuntimeError(
+                f'DINO returned {len(features)} feature levels instead of four.'
+            )
+
+        patch_tokens = []
+        cls_tokens = []
+        for level, feature_pair in enumerate(features, start=1):
+            if not isinstance(feature_pair, (tuple, list)) or len(feature_pair) != 2:
+                raise RuntimeError(
+                    f'DINO level {level} did not return a (patch_tokens, cls_token) pair.'
+                )
+            patch, cls = feature_pair
+            patch_tokens.append(patch)
+            cls_tokens.append(cls)
+        return DinoFeatureBundle(
+            patch_tokens=tuple(patch_tokens),
+            cls_tokens=tuple(cls_tokens),
+        ).validate()
+
+    @torch.no_grad()
+    def extract_features(self, x):
+        """Return the historical four-level patch-only DINO interface."""
+
+        return self.extract_feature_bundle(x).patch_tokens
 
     def _extract_features(self, x):
         """Backward-compatible alias used by the original training scripts."""
