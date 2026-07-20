@@ -223,8 +223,10 @@ if __name__ == "__main__":
         requested_profile = build_experiment_profile(args.experiment_profile)
         encoder_profile = requested_profile.pc_placement == "encoder"
         if encoder_profile:
-            experiment_profile = requested_profile
             pc_cfg = EncoderPCHBMConfig()
+            experiment_profile = apply_experiment_profile(
+                pc_cfg, args.experiment_profile
+            )
             cfg.use_amp = not args.no_amp
         else:
             pc_cfg = DinoPCHBMConfig(

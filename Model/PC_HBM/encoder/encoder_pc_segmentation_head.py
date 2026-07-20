@@ -45,12 +45,12 @@ class EncoderPCCoreResult:
         return self.outputs[3]
 
 
-def _full_stage() -> EncoderPCStageFlags:
+def _full_stage(*, enable_f2_f1: bool = True) -> EncoderPCStageFlags:
     return EncoderPCStageFlags(
         enable_f4_f3=True,
         f4_f3_progress=1.0,
-        enable_f2_f1=True,
-        f2_f1_progress=1.0,
+        enable_f2_f1=bool(enable_f2_f1),
+        f2_f1_progress=1.0 if enable_f2_f1 else 0.0,
         require_same_image_positive=False,
     )
 
@@ -188,7 +188,15 @@ class EncoderPCSegmentationHead(nn.Module):
             raise ValueError(f"role={role!r} requires bundle and image_rgb")
         if role in {"teacher_pseudo", "student_core", "inference"}:
             mode = "full"
-            stage = _full_stage() if stage is None else stage
+            stage = (
+                _full_stage(
+                    enable_f2_f1=bool(
+                        self.adapter.config.enable_f2_f1_propagation
+                    )
+                )
+                if stage is None
+                else stage
+            )
         needs_aux = return_aux or role == "teacher_pseudo"
         core = self._run_core(
             bundle,

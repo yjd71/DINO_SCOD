@@ -1,7 +1,8 @@
 """Reproducible BGFBR x PC-HBM experiment profiles.
 
-The profiles deliberately mutate only :class:`DinoPCHBMConfig`.  Model shapes
-stay fixed across component ablations, so checkpoints and DDP graphs remain
+Decoder-side profiles mutate :class:`DinoPCHBMConfig`; encoder-side profiles
+mutate the independent strict :class:`EncoderPCHBMConfig`.  Model shapes stay
+fixed across component ablations, so checkpoints and DDP graphs remain
 structurally comparable.  ``bgfbr_off`` and ``parent_only`` express Base-stage
 schedule overrides; Teacher-Student keeps its explicit pseudo/core modes while
 still consuming the architecture and component switches.
@@ -28,10 +29,35 @@ class BGFBRExperimentProfile:
     use_ode: bool = True
     use_rcab: bool = True
     use_pc_boundary_context: bool = True
+    encoder_overrides: tuple[tuple[str, Any], ...] = ()
     description: str = ""
 
     def apply(self, config: Any) -> Any:
         """Apply this profile in-place and return ``config`` for composition."""
+
+        # Encoder-side profiles use an independent strict v3 config.  Keep the
+        # old decoder-side requirements unchanged, while allowing the profile
+        # registry to apply decision-complete encoder ablations to that config.
+        if self.pc_placement == "encoder" and getattr(
+            config, "architecture", None
+        ) == "DINO_SCOD_ENCODER_PC_HBM":
+            for name in ("decoder_arch", "experiment_profile", "pc_placement"):
+                if not hasattr(config, name):
+                    raise TypeError(
+                        "Encoder experiment profiles require an "
+                        f"EncoderPCHBMConfig-like object; missing field: {name}"
+                    )
+            config.experiment_profile = self.name
+            config.decoder_arch = self.decoder_arch
+            config.pc_placement = self.pc_placement
+            for name, value in self.encoder_overrides:
+                if not hasattr(config, name):
+                    raise TypeError(
+                        "Encoder experiment profile override is unsupported by "
+                        f"the config: {name}"
+                    )
+                setattr(config, name, value)
+            return config
 
         required = (
             "decoder_arch",
@@ -86,6 +112,20 @@ _PROFILES = {
         description=(
             "Encoder-side PC-HBM with a detached, permanently off BGFBR decoder."
         ),
+    ),
+    "encoder_pc_f4_f3": BGFBRExperimentProfile(
+        name="encoder_pc_f4_f3",
+        decoder_arch="bgfbr_pc_v1",
+        pc_placement="encoder",
+        encoder_overrides=(("enable_f2_f1_propagation", False),),
+        description="Encoder PC-HBM without the F2/F1 propagation levels.",
+    ),
+    "encoder_pc_no_route_loss": BGFBRExperimentProfile(
+        name="encoder_pc_no_route_loss",
+        decoder_arch="bgfbr_pc_v1",
+        pc_placement="encoder",
+        encoder_overrides=(("lambda_route", 0.0),),
+        description="Full encoder PC-HBM with same-image route InfoNCE ablated.",
     ),
     "parent_only": BGFBRExperimentProfile(
         name="parent_only",

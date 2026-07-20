@@ -412,6 +412,7 @@ class EncoderPCHBMConfig:
     injection_alpha_init: float = 1.0
     detach_f3_refs_for_f2: bool = True
     detach_f2_refs_for_f1: bool = True
+    enable_f2_f1_propagation: bool = True
 
     lambda_coarse: float = 0.30
     lambda_boundary: float = 0.10
@@ -541,28 +542,29 @@ class EncoderPCHBMConfig:
     ) -> dict:
         if not producer_fingerprint or not split_fingerprint:
             raise ValueError("Memory compatibility requires producer and split fingerprints.")
+        # This mirrors EncoderPCMemory's schema-v3 compatibility contract.
+        # The artifact calls its split field ``split_fingerprint`` while the
+        # memory schema deliberately names it ``labeled_split_fingerprint``.
         return {
-            "format_version": self.memory_format_version,
             "schema_version": self.memory_schema_version,
             "architecture": self.architecture,
             "adapter_architecture": self.adapter_architecture,
             "feature_space": self.feature_space,
-            "route_source": (
-                "block11_cls_block11_global_block8_boundary_"
-                "block8_uncertainty_block8_environment_v1"
-            ),
+            "route_source": "block11_cls_block11_patch",
+            "parent_source": "block8_patch",
+            "child_source": "block5_patch",
+            "detail_source": "block2_patch",
             "input_size": self.input_size,
-            "token_size": self.token_size,
+            "token_hw": (self.token_size, self.token_size),
             "dino_layer_indices": tuple(self.dino_layer_indices),
             "encoder_dim": self.encoder_dim,
             "memory_dim": self.memory_dim,
             "value_dim": self.value_dim,
             "geometry_dim": self.geometry_dim,
             "storage_dtype": self.memory_storage_dtype,
-            "device": self.memory_device,
             "source": self.memory_source,
             "producer_fingerprint": str(producer_fingerprint),
-            "split_fingerprint": str(split_fingerprint),
+            "labeled_split_fingerprint": str(split_fingerprint),
         }
 
 

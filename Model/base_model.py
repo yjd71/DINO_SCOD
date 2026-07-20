@@ -215,7 +215,14 @@ class BaseModel(nn.Module):
             query_image_ids=query_image_ids,
         )
     
-    def inference(self, x, memory=None, epoch=None):
+    def inference(
+        self,
+        x,
+        memory=None,
+        epoch=None,
+        *,
+        allow_memory_fallback=False,
+    ):
         bundle = self.extract_feature_bundle(x)
         x_features = bundle.patch_tokens
         image_rgb = self.prepare_rgb(x)
@@ -225,13 +232,9 @@ class BaseModel(nn.Module):
                 bundle=bundle,
                 image_rgb=image_rgb,
                 memory=memory,
-                stage=EncoderPCStageFlags(
-                    enable_f4_f3=True,
-                    f4_f3_progress=1.0,
-                    enable_f2_f1=True,
-                    f2_f1_progress=1.0,
-                ),
+                stage=None,
                 epoch=epoch,
+                allow_memory_fallback=bool(allow_memory_fallback),
                 return_aux=False,
             )
         if self.decoder.pc_hbm is None:

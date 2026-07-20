@@ -77,7 +77,10 @@ class EncoderPCStage:
         enable_route_parent = epoch > int(cfg.bootstrap_end_epoch)
         enable_verification = epoch > int(cfg.parent_end_epoch)
         enable_f4_f3 = enable_verification
-        enable_f2_f1 = epoch > int(cfg.f4_f3_end_epoch)
+        enable_f2_f1 = (
+            epoch > int(cfg.f4_f3_end_epoch)
+            and bool(cfg.enable_f2_f1_propagation)
+        )
         enable_refiner = epoch > int(cfg.hierarchy_end_epoch)
         f4_f3_progress = (
             float(cfg.stage_progress(epoch, level="f4_f3")) if enable_f4_f3 else 0.0
