@@ -23,11 +23,17 @@ class BaseModel(nn.Module):
 
         self.pc_cfg = pc_cfg
         self.decoder_arch = resolve_decoder_arch(decoder_arch, pc_cfg)
+        self.pc_placement = str(getattr(pc_cfg, 'pc_placement', 'decoder'))
+        if self.pc_placement not in {'decoder', 'encoder'}:
+            raise ValueError(
+                f'Unsupported pc_placement={self.pc_placement!r}; expected '
+                "'decoder' or 'encoder'."
+            )
         self.rgb_adapter = ImageNetRGBAdapter()
         self.decoder = build_decoder(
             self.decoder_arch,
             pc_cfg=pc_cfg,
-            attach_pc=bool(attach_pc),
+            attach_pc=bool(attach_pc) and self.pc_placement == 'decoder',
         )
 
     def train(self, mode=True):
@@ -76,6 +82,10 @@ class BaseModel(nn.Module):
     ):
         x_features = self.extract_features(x)
         image_rgb = self.prepare_rgb(x)
+        if getattr(self, 'pc_placement', 'decoder') == 'encoder':
+            memory = None
+            pc_mode = 'off'
+            query_image_ids = None
         return self.decoder(
             features=x_features,
             image_rgb=image_rgb,

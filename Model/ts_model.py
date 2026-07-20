@@ -42,16 +42,27 @@ class TSModel(nn.Module):
         
         self.pc_cfg = pc_cfg
         self.decoder_arch = resolve_decoder_arch(decoder_arch, pc_cfg)
+        self.pc_placement = str(getattr(pc_cfg, 'pc_placement', 'decoder'))
+        if self.pc_placement not in {'decoder', 'encoder'}:
+            raise ValueError(
+                f'Unsupported pc_placement={self.pc_placement!r}; expected '
+                "'decoder' or 'encoder'."
+            )
         self.allow_legacy_pc_init = allow_legacy_pc_init
         self.training_design = training_design
         self.rgb_adapter = ImageNetRGBAdapter()
         self.teacher = build_decoder(
-            self.decoder_arch, pc_cfg=pc_cfg, attach_pc=True
+            self.decoder_arch,
+            pc_cfg=pc_cfg,
+            attach_pc=self.pc_placement == 'decoder',
         )
         self.student = build_decoder(
             self.decoder_arch,
             pc_cfg=pc_cfg,
-            attach_pc=training_design != 'teacher_only',
+            attach_pc=(
+                self.pc_placement == 'decoder'
+                and training_design != 'teacher_only'
+            ),
         )
 
         self.load_teacher(teacher_pth)
@@ -93,6 +104,15 @@ class TSModel(nn.Module):
 
     @torch.inference_mode()
     def teacher_pseudo(self, features, memory, epoch, image_rgb=None):
+        if getattr(self, 'pc_placement', 'decoder') == 'encoder':
+            _, aux = self.teacher(
+                features,
+                image_rgb=image_rgb,
+                memory=None,
+                pc_mode='off',
+                return_aux=True,
+            )
+            return aux
         _, aux = self.teacher(
             features,
             image_rgb=image_rgb,
@@ -135,6 +155,14 @@ class TSModel(nn.Module):
     def student_labeled(
         self, features, memory, epoch, query_image_ids=None, image_rgb=None
     ):
+        if getattr(self, 'pc_placement', 'decoder') == 'encoder':
+            return self.student(
+                features,
+                image_rgb=image_rgb,
+                memory=None,
+                pc_mode='off',
+                return_aux=True,
+            )
         if self.training_design == 'teacher_only':
             return self.student(
                 features, image_rgb=image_rgb, pc_mode='off', return_aux=True
@@ -150,6 +178,14 @@ class TSModel(nn.Module):
         )
 
     def student_unlabeled(self, features, memory, epoch, image_rgb=None):
+        if getattr(self, 'pc_placement', 'decoder') == 'encoder':
+            return self.student(
+                features,
+                image_rgb=image_rgb,
+                memory=None,
+                pc_mode='off',
+                return_aux=True,
+            )
         if self.training_design == 'teacher_only':
             return self.student(
                 features, image_rgb=image_rgb, pc_mode='off', return_aux=True

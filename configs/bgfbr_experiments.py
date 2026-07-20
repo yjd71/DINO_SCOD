@@ -22,6 +22,7 @@ class BGFBRExperimentProfile:
 
     name: str
     decoder_arch: Literal["bgfbr_pc_v1", "legacy_transformer"]
+    pc_placement: Literal["decoder", "encoder"] = "decoder"
     base_mode: Literal["scheduled", "off", "parent_only"] = "scheduled"
     use_gbe: bool = True
     use_ode: bool = True
@@ -51,6 +52,7 @@ class BGFBRExperimentProfile:
         config.experiment_profile = self.name
         config.experiment_base_mode = self.base_mode
         config.decoder_arch = self.decoder_arch
+        config.pc_placement = self.pc_placement
         config.use_gbe = self.use_gbe
         config.use_ode = self.use_ode
         config.use_rcab = self.use_rcab
@@ -76,6 +78,14 @@ _PROFILES = {
         decoder_arch="bgfbr_pc_v1",
         base_mode="off",
         description="BGFBR-only Base training; PC retrieval and correction stay off.",
+    ),
+    "encoder_pc": BGFBRExperimentProfile(
+        name="encoder_pc",
+        decoder_arch="bgfbr_pc_v1",
+        pc_placement="encoder",
+        description=(
+            "Encoder-side PC-HBM with a detached, permanently off BGFBR decoder."
+        ),
     ),
     "parent_only": BGFBRExperimentProfile(
         name="parent_only",
