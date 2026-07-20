@@ -149,6 +149,11 @@ def main():
         pc_cfg = DinoPCHBMConfig()
         pc_cfg.configure_training_design(args.training_design)
         experiment_profile = apply_experiment_profile(pc_cfg, args.experiment_profile)
+    if not bool(getattr(pc_cfg, "enabled", True)):
+        raise ValueError(
+            "pc_cfg.enabled=False is reserved for the supervised no-prototype "
+            "Base control; Teacher/Student training requires enabled=True."
+        )
     cfg.experiment_profile = experiment_profile.name
     model = TSModel(
         teacher_pth=args.teacher_pc_checkpoint,

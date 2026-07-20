@@ -16,6 +16,7 @@ from typing import Tuple
 class DinoPCHBMConfig:
     """Configuration shared by the decoder, memory and both trainers."""
 
+    # Master switch: False selects the frozen-DINO -> Decoder Base control.
     enabled: bool = True
 
     # Fixed RSBL/DINO contract.
@@ -181,6 +182,8 @@ class DinoPCHBMConfig:
     warn_high_gate_threshold: float = 0.50
 
     def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("enabled must be a bool.")
         if self.decoder_arch not in {"bgfbr_pc_v1", "legacy_transformer"}:
             raise ValueError(f"Unsupported decoder architecture: {self.decoder_arch!r}")
         if self.decoder_contract_version != 1:
@@ -277,6 +280,8 @@ class DinoPCHBMConfig:
     def pc_mode_for_epoch(self, epoch: int) -> str:
         """Return the 1-based Base-training mode for ``epoch``."""
 
+        if not self.enabled:
+            return "off"
         epoch = int(epoch)
         if epoch < self.parent_start_epoch:
             return "off"
@@ -287,6 +292,8 @@ class DinoPCHBMConfig:
     def injection_scale(self, epoch: int) -> float:
         """Linear full-PC ramp: epochs 11/12/13 become 1/3, 2/3 and 1."""
 
+        if not self.enabled:
+            return 0.0
         if int(epoch) < self.full_pc_start_epoch:
             return 0.0
         progress = int(epoch) - self.full_pc_start_epoch + 1
@@ -356,6 +363,7 @@ DEFAULT_PC_HBM_CONFIG = DinoPCHBMConfig()
 class EncoderPCHBMConfig:
     """Strict configuration for the encoder-side PC-HBM v3 profile."""
 
+    # Master switch: False removes Adapter/Refiner/memory and trains Base only.
     enabled: bool = True
     experiment_profile: str = "encoder_pc"
     pc_placement: str = "encoder"
@@ -455,6 +463,8 @@ class EncoderPCHBMConfig:
         return float(self.lambda_reg)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise TypeError("enabled must be a bool.")
         fixed = {
             "pc_placement": (self.pc_placement, "encoder"),
             "decoder_arch": (self.decoder_arch, "bgfbr_pc_v1"),

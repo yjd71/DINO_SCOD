@@ -149,19 +149,27 @@ def validate_training_args(args: argparse.Namespace) -> None:
             "--legacy-warm-start conflicts with baseline/decoder/resume initialization"
         )
     if build_experiment_profile(args.experiment_profile).pc_placement == "encoder":
+        from configs.pc_hbm_dino_config import EncoderPCHBMConfig
+
+        encoder_pc_enabled = bool(EncoderPCHBMConfig().enabled)
         if args.training_design != "two_stage":
-            raise ValueError("encoder_pc uses its fixed five-stage Base curriculum.")
+            message = (
+                "encoder_pc uses its fixed five-stage Base curriculum."
+                if encoder_pc_enabled
+                else "enabled=False is a Decoder-only Base control and requires two_stage."
+            )
+            raise ValueError(message)
         if args.decoder_checkpoint or args.legacy_warm_start:
             raise ValueError(
                 "encoder_pc accepts only --baseline-checkpoint for optional BGFBR warm-start."
             )
-        if args.allow_self_match:
+        if encoder_pc_enabled and args.allow_self_match:
             raise ValueError("encoder_pc always excludes retrieval self-matches.")
-        if args.learning_rate is not None:
+        if encoder_pc_enabled and args.learning_rate is not None:
             raise ValueError(
                 "encoder_pc uses fixed per-module learning rates; omit --learning-rate."
             )
-        if not 1 <= int(args.epochs) <= 30:
+        if encoder_pc_enabled and not 1 <= int(args.epochs) <= 30:
             raise ValueError("encoder_pc Base epochs must be in [1, 30].")
 
 
@@ -194,6 +202,10 @@ if __name__ == "__main__":
         configure_two_stage_trainability,
     )
     from utils.trainer_base_model_encoder_pc import EncoderPCHBMTrainer
+    from utils.trainer_base_model_no_pc import (
+        NoPCBaseTrainer,
+        configure_no_pc_base_trainability,
+    )
 
     context = init_distributed()
     try:
@@ -237,6 +249,12 @@ if __name__ == "__main__":
             experiment_profile = apply_experiment_profile(pc_cfg, args.experiment_profile)
         cfg.experiment_profile = experiment_profile.name
         model = BaseModel(pc_cfg=pc_cfg).to(cfg.device)
+        pc_enabled = bool(pc_cfg.enabled)
+        if not pc_enabled and args.training_design != "two_stage":
+            raise ValueError(
+                "pc_cfg.enabled=False selects the no-prototype Base control and "
+                "requires --training-design two_stage."
+            )
         decoder_warm_started = False
         if encoder_profile and args.baseline_checkpoint:
             cfg.baseline_fingerprint = state_dict_fingerprint(
@@ -282,7 +300,9 @@ if __name__ == "__main__":
         if encoder_profile and not decoder_warm_started:
             cfg.baseline_fingerprint = state_dict_fingerprint(model.decoder.state_dict())
             cfg.initialization_source = "scratch_bgfbr"
-        if encoder_profile:
+        if not pc_enabled:
+            configure_no_pc_base_trainability(model)
+        elif encoder_profile:
             pass
         elif args.training_design == "teacher_only":
             configure_teacher_only_trainability(model)
@@ -309,7 +329,14 @@ if __name__ == "__main__":
                 ) from error
             model = wrap_distributed(model, context)
 
-        if encoder_profile:
+        if not pc_enabled:
+            trainer = NoPCBaseTrainer(
+                model=model,
+                cfg=cfg,
+                pc_cfg=pc_cfg,
+                decoder_warm_started=decoder_warm_started,
+            )
+        elif encoder_profile:
             trainer = EncoderPCHBMTrainer(
                 model=model,
                 cfg=cfg,

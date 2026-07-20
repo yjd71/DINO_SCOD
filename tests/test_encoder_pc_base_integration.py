@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from configs.pc_hbm_dino_config import EncoderPCHBMConfig
+from configs.pc_hbm_dino_config import DinoPCHBMConfig, EncoderPCHBMConfig
 import Model.base_model as base_model_module
 from Model.PC_HBM.training.encoder_losses import encoder_bootstrap_loss
 from Model.PC_HBM.training.supervision import build_gt_boundary
@@ -12,6 +14,7 @@ from Model.PC_HBM.encoder import (
     EncoderPCSegmentationHead,
     TeacherPseudoLabelRefiner,
 )
+from utils.trainer_base_model_no_pc import NoPCBaseTrainer
 
 
 class _FakeDino(nn.Module):
@@ -139,3 +142,121 @@ def test_bootstrap_aux_loss_trains_adapter_but_never_dino(monkeypatch) -> None:
         for parameter in model.encoder_pc_hbm.bootstrap.parameters()
         if parameter.requires_grad
     )
+
+
+def test_enabled_false_is_structural_no_prototype_base(monkeypatch) -> None:
+    monkeypatch.setattr(
+        base_model_module.torch.hub,
+        "load",
+        lambda *args, **kwargs: _FakeDino(),
+    )
+    monkeypatch.setattr(base_model_module.torch, "load", lambda *args, **kwargs: {})
+    decoder = _RecordingDecoder()
+    build_kwargs = {}
+
+    def _build_decoder(*args, **kwargs):
+        build_kwargs.update(kwargs)
+        return decoder
+
+    monkeypatch.setattr(base_model_module, "build_decoder", _build_decoder)
+    cfg = EncoderPCHBMConfig(enabled=False)
+    model = base_model_module.BaseModel(pc_cfg=cfg)
+
+    assert model.pc_enabled is False
+    assert build_kwargs["attach_pc"] is False
+    assert model.encoder_pc_hbm is None
+    assert model.pseudo_refiner is None
+    assert model.encoder_pc_head is None
+    assert model.encoder_pc_profile_v3 is False
+    assert not any("encoder_pc_hbm." in name for name in model.state_dict())
+    assert not any("pseudo_refiner." in name for name in model.state_dict())
+
+    marker_memory = object()
+    _, aux = model(
+        torch.randn(1, 3, 392, 392),
+        memory=marker_memory,
+        pc_mode="full",
+        return_aux=True,
+        query_image_ids=["self"],
+        run_labeled_refiner=True,
+    )
+    call = decoder.calls[-1]
+    assert call["memory"] is None
+    assert call["pc_mode"] == "off"
+    assert call["query_image_ids"] is None
+    assert aux["pc_enabled"] is False
+    assert aux["pc_active"] is False
+    assert aux["fallback_reason"] == "pc_hbm_disabled_by_config"
+
+
+def test_legacy_config_enabled_false_locks_schedule_off() -> None:
+    cfg = DinoPCHBMConfig(enabled=False)
+
+    assert cfg.pc_mode_for_epoch(1) == "off"
+    assert cfg.pc_mode_for_epoch(1_000_000) == "off"
+    assert cfg.injection_scale(1_000_000) == 0.0
+
+
+class _NoPCDecoder(nn.Module):
+    decoder_arch = "bgfbr_pc_v1"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.pc_hbm = None
+        self.bias = nn.Parameter(torch.zeros(()))
+
+    def forward(self, images):
+        logits = images.mean(dim=1, keepdim=True)
+        logits = F.interpolate(logits, size=(98, 98)) + self.bias
+        return (logits, logits, logits, logits, logits)
+
+
+class _NoPCTrainingModel(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.dino = nn.Linear(1, 1)
+        self.decoder = _NoPCDecoder()
+        self.encoder_pc_hbm = None
+        self.pseudo_refiner = None
+        self.calls = []
+
+    def forward(self, x, **kwargs):
+        self.calls.append(kwargs)
+        return self.decoder(x)
+
+
+def test_no_pc_trainer_updates_only_decoder_and_never_builds_memory(tmp_path) -> None:
+    model = _NoPCTrainingModel()
+    cfg = SimpleNamespace(
+        device=torch.device("cpu"),
+        use_amp=False,
+        epochs=1,
+        learning_rate=1.0e-3,
+        min_lr=1.0e-7,
+        weight_decay=0.0,
+        checkpoint_interval=999,
+        save_dir=str(tmp_path),
+    )
+    batch = (
+        torch.randn(2, 3, 32, 32),
+        torch.rand(2, 1, 98, 98).round(),
+        ["a", "b"],
+    )
+    trainer = NoPCBaseTrainer(
+        model,
+        cfg,
+        EncoderPCHBMConfig(enabled=False),
+        labeled_loader=[batch],
+    )
+    old_bias = model.decoder.bias.detach().clone()
+
+    metrics = trainer.train_epoch(1)
+
+    assert metrics["pc_enabled"] == 0.0
+    assert not torch.equal(model.decoder.bias.detach(), old_bias)
+    assert all(parameter.grad is None for parameter in model.dino.parameters())
+    assert model.calls[-1]["memory"] is None
+    assert model.calls[-1]["pc_mode"] == "off"
+    assert model.calls[-1]["query_image_ids"] is None
+    assert not hasattr(trainer, "memory")
+    assert not hasattr(trainer, "memory_loader")

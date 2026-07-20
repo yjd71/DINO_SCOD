@@ -384,10 +384,11 @@ def parse_args():
     return parser.parse_args()
 
 
-def validate_inference_args(args):
+def validate_inference_args(args, *, pc_enabled=None):
     """Validate profile-specific checkpoint contracts before model creation."""
 
     profile = build_experiment_profile(args.experiment_profile)
+    prototype_disabled = pc_enabled is False
     if profile.pc_placement == 'encoder':
         if not args.model_checkpoint:
             raise ValueError('encoder_pc requires canonical --model-checkpoint.')
@@ -396,11 +397,21 @@ def validate_inference_args(args):
                 '--checkpoint/--decoder-checkpoint are legacy decoder-side options '
                 'and cannot be combined with encoder_pc.'
             )
-        if not args.memory_checkpoint and not args.diagnostic_identity_fallback:
+        if prototype_disabled and args.memory_checkpoint:
+            raise ValueError('enabled=False is a no-prototype Base run; omit --memory-checkpoint.')
+        if prototype_disabled and args.diagnostic_identity_fallback:
+            raise ValueError(
+                'enabled=False already uses the exact Base path; diagnostic fallback is invalid.'
+            )
+        if (
+            not prototype_disabled
+            and not args.memory_checkpoint
+            and not args.diagnostic_identity_fallback
+        ):
             raise ValueError(
                 'Formal encoder_pc inference requires --memory-checkpoint.'
             )
-        if not args.require_producer_match:
+        if not prototype_disabled and not args.require_producer_match:
             raise ValueError(
                 'encoder_pc always requires producer and split matching; '
                 '--no-require-producer-match is invalid.'
@@ -416,6 +427,8 @@ def validate_inference_args(args):
                 '--diagnostic-identity-fallback is encoder_pc-only; legacy profiles '
                 'retain their existing warning fallback.'
             )
+        if prototype_disabled and args.memory_checkpoint:
+            raise ValueError('enabled=False is a no-prototype Base run; omit --memory-checkpoint.')
     return profile
 
 
@@ -599,16 +612,31 @@ if __name__ == '__main__':
     from configs.base_model_config import Config
     from Model.base_model import BaseModel
     args = parse_args()
-    experiment_profile = validate_inference_args(args)
-    cfg = Config()
-    if experiment_profile.pc_placement == 'encoder':
+    requested_profile = build_experiment_profile(args.experiment_profile)
+    if requested_profile.pc_placement == 'encoder':
         pc_cfg = EncoderPCHBMConfig()
     else:
         pc_cfg = DinoPCHBMConfig()
+    experiment_profile = validate_inference_args(
+        args, pc_enabled=bool(pc_cfg.enabled)
+    )
+    cfg = Config()
     experiment_profile = apply_experiment_profile(pc_cfg, args.experiment_profile)
     cfg.experiment_profile = experiment_profile.name
     model = BaseModel(pc_cfg=pc_cfg)
-    if experiment_profile.pc_placement == 'encoder':
+    if not pc_cfg.enabled:
+        checkpoint = (
+            args.model_checkpoint
+            if experiment_profile.pc_placement == 'encoder'
+            else (args.decoder_checkpoint or LEGACY_DEFAULT_DECODER_CHECKPOINT)
+        )
+        load_decoder_compatible(
+            model.decoder,
+            checkpoint,
+            require_pc_complete=False,
+        )
+        memory = None
+    elif experiment_profile.pc_placement == 'encoder':
         model_artifact = load_encoder_pc_model_for_inference(
             args.model_checkpoint, model, pc_cfg
         )

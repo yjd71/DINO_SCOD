@@ -31,6 +31,9 @@ class BaseModel(nn.Module):
         self.dino.eval()
 
         self.pc_cfg = pc_cfg
+        # Missing ``enabled`` preserves the historical behavior; only an
+        # explicit False selects the structural no-prototype Base control.
+        self.pc_enabled = bool(getattr(pc_cfg, 'enabled', True))
         self.decoder_arch = resolve_decoder_arch(decoder_arch, pc_cfg)
         self.pc_placement = str(getattr(pc_cfg, 'pc_placement', 'decoder'))
         if self.pc_placement not in {'decoder', 'encoder'}:
@@ -42,7 +45,11 @@ class BaseModel(nn.Module):
         self.decoder = build_decoder(
             self.decoder_arch,
             pc_cfg=pc_cfg,
-            attach_pc=bool(attach_pc) and self.pc_placement == 'decoder',
+            attach_pc=(
+                bool(attach_pc)
+                and self.pc_enabled
+                and self.pc_placement == 'decoder'
+            ),
         )
         self.encoder_pc_hbm = None
         self.pseudo_refiner = None
@@ -53,7 +60,9 @@ class BaseModel(nn.Module):
             # The legacy profile registry can still stamp pc_placement onto a
             # v2 config for contract/isolation tests.  Production encoder-PC
             # execution requires the independent strict v3 config.
-            self.encoder_pc_profile_v3 = isinstance(pc_cfg, EncoderPCHBMConfig)
+            self.encoder_pc_profile_v3 = (
+                self.pc_enabled and isinstance(pc_cfg, EncoderPCHBMConfig)
+            )
             if self.encoder_pc_profile_v3:
                 self.encoder_pc_config = pc_cfg
                 self.encoder_pc_hbm = EncoderPCHBMAdapter(self.encoder_pc_config)
@@ -147,6 +156,31 @@ class BaseModel(nn.Module):
         bundle = self.extract_feature_bundle(x)
         x_features = bundle.patch_tokens
         image_rgb = self.prepare_rgb(x)
+        if not self.pc_enabled:
+            decoder_result = self.decoder(
+                features=x_features,
+                image_rgb=image_rgb,
+                memory=None,
+                pc_mode='off',
+                epoch=epoch,
+                return_aux=return_aux,
+                query_image_ids=None,
+            )
+            if not return_aux:
+                return decoder_result
+            if not isinstance(decoder_result, (tuple, list)) or len(decoder_result) != 2:
+                raise RuntimeError('Decoder must return (outputs, aux) when return_aux=True.')
+            outputs, decoder_aux = decoder_result
+            combined_aux = dict(decoder_aux or {})
+            combined_aux.update(
+                {
+                    'pc_enabled': False,
+                    'pc_active': False,
+                    'pc_mode': 'off',
+                    'fallback_reason': 'pc_hbm_disabled_by_config',
+                }
+            )
+            return outputs, combined_aux
         if getattr(self, 'pc_placement', 'decoder') == 'encoder':
             encoder_aux = {'mode': 'off', 'pc_active': False}
             if self.encoder_pc_profile_v3:
