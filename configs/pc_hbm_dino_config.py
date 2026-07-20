@@ -350,3 +350,180 @@ class DinoPCHBMConfig:
 
 
 DEFAULT_PC_HBM_CONFIG = DinoPCHBMConfig()
+
+
+@dataclass
+class EncoderPCHBMConfig:
+    """Strict configuration for the encoder-side PC-HBM v3 profile."""
+
+    enabled: bool = True
+    experiment_profile: str = "encoder_pc"
+    pc_placement: str = "encoder"
+    decoder_arch: str = "bgfbr_pc_v1"
+    architecture: str = "DINO_SCOD_ENCODER_PC_HBM"
+    adapter_architecture: str = "encoder_pc_hbm_v1"
+    feature_space: str = "frozen_dinov2_projected_encoder_v1"
+
+    input_size: int = 392
+    token_size: int = 28
+    output_size: int = 98
+    encoder_dim: int = 768
+    memory_dim: int = 128
+    value_dim: int = 8
+    geometry_dim: int = 6
+    dino_layer_indices: Tuple[int, int, int, int] = (2, 5, 8, 11)
+
+    memory_format_version: int = 3
+    memory_schema_version: int = 3
+    memory_source: str = "labeled_only"
+    memory_storage_dtype: str = "float16"
+    memory_device: str = "cpu"
+    use_unlabeled_memory_update: bool = False
+    memory_rebuild_interval: int = 1
+
+    boundary_token_ratio: float = 0.20
+    boundary_min_tokens: int = 32
+    boundary_max_tokens: int = 128
+    route_top_img_k: int = 8
+    parent_topk: int = 16
+    query_chunk_size: int = 512
+    tau_route: float = 0.07
+    tau_parent: float = 0.07
+    route_margin_temperature: float = 0.03
+    route_confidence_floor: float = 0.20
+    semantic_window_size: int = 5
+    detail_window_size: int = 3
+    propagation_window_size: int = 3
+    attention_heads: int = 8
+
+    bootstrap_end_epoch: int = 5
+    parent_end_epoch: int = 10
+    f4_f3_end_epoch: int = 15
+    hierarchy_end_epoch: int = 20
+    final_epoch: int = 30
+    memory_adapter_ema_decay: float = 0.995
+
+    max_f4_injection: float = 0.25
+    max_f3_injection: float = 1.0
+    max_f2_injection: float = 0.75
+    max_f1_injection: float = 0.50
+    injection_alpha_init: float = 1.0
+    detach_f3_refs_for_f2: bool = True
+    detach_f2_refs_for_f1: bool = True
+
+    lambda_coarse: float = 0.30
+    lambda_boundary: float = 0.10
+    lambda_route: float = 0.05
+    lambda_parent: float = 0.10
+    lambda_child_semantic: float = 0.10
+    lambda_child_detail: float = 0.05
+    lambda_geometry: float = 0.05
+    lambda_gate: float = 0.05
+    lambda_injection: float = 0.01
+    lambda_refiner_final: float = 1.0
+    lambda_mix_oracle: float = 0.10
+    lambda_branch: float = 0.10
+    lambda_quality: float = 0.025
+    lambda_usage: float = 0.01
+    lambda_reg: float = 0.02
+
+    pseudo_fg_threshold: float = 0.70
+    pseudo_bg_threshold: float = 0.30
+    pseudo_hard_ramp_epochs: int = 3
+    hard_coverage_target: float = 0.20
+
+    def __post_init__(self) -> None:
+        fixed = {
+            "pc_placement": (self.pc_placement, "encoder"),
+            "decoder_arch": (self.decoder_arch, "bgfbr_pc_v1"),
+            "architecture": (self.architecture, "DINO_SCOD_ENCODER_PC_HBM"),
+            "input_size": (self.input_size, 392),
+            "token_size": (self.token_size, 28),
+            "output_size": (self.output_size, 98),
+            "encoder_dim": (self.encoder_dim, 768),
+            "memory_dim": (self.memory_dim, 128),
+            "value_dim": (self.value_dim, 8),
+            "geometry_dim": (self.geometry_dim, 6),
+            "memory_format_version": (self.memory_format_version, 3),
+            "memory_schema_version": (self.memory_schema_version, 3),
+            "memory_source": (self.memory_source, "labeled_only"),
+            "memory_storage_dtype": (self.memory_storage_dtype, "float16"),
+            "memory_device": (self.memory_device, "cpu"),
+        }
+        invalid = [name for name, (actual, expected) in fixed.items() if actual != expected]
+        if invalid:
+            raise ValueError(f"Encoder PC-HBM fixed contract mismatch: {invalid}.")
+        if tuple(self.dino_layer_indices) != (2, 5, 8, 11):
+            raise ValueError("Encoder PC-HBM requires DINO layers (2, 5, 8, 11).")
+        if self.use_unlabeled_memory_update:
+            raise ValueError("Encoder PC-HBM memory is strictly labeled-only.")
+        if not 0.0 < self.route_confidence_floor <= 1.0:
+            raise ValueError("route_confidence_floor must be in (0, 1].")
+        if self.attention_heads <= 0 or self.memory_dim % self.attention_heads:
+            raise ValueError("attention_heads must divide memory_dim.")
+        if not (
+            0 < self.bootstrap_end_epoch < self.parent_end_epoch
+            < self.f4_f3_end_epoch < self.hierarchy_end_epoch < self.final_epoch
+        ):
+            raise ValueError("Encoder PC-HBM stage boundaries must be strictly increasing.")
+
+    def stage_for_epoch(self, epoch: int) -> str:
+        if not 1 <= int(epoch) <= self.final_epoch:
+            raise ValueError(f"epoch must be in [1, {self.final_epoch}], got {epoch}.")
+        if epoch <= self.bootstrap_end_epoch:
+            return "bootstrap"
+        if epoch <= self.parent_end_epoch:
+            return "parent_only"
+        if epoch <= self.f4_f3_end_epoch:
+            return "parent_child_f3"
+        if epoch <= self.hierarchy_end_epoch:
+            return "hierarchical_full"
+        return "hierarchical_refiner"
+
+    def stage_progress(self, epoch: int, *, level: str) -> float:
+        if level == "f4_f3":
+            start, end = self.parent_end_epoch + 1, self.f4_f3_end_epoch
+        elif level == "f2_f1":
+            start, end = self.f4_f3_end_epoch + 1, self.hierarchy_end_epoch
+        else:
+            raise ValueError("level must be 'f4_f3' or 'f2_f1'.")
+        if epoch < start:
+            return 0.0
+        if epoch >= end:
+            return 1.0
+        return float(epoch - start + 1) / float(end - start + 1)
+
+    def expected_memory_meta(
+        self,
+        *,
+        producer_fingerprint: str,
+        split_fingerprint: str,
+    ) -> dict:
+        if not producer_fingerprint or not split_fingerprint:
+            raise ValueError("Memory compatibility requires producer and split fingerprints.")
+        return {
+            "format_version": self.memory_format_version,
+            "schema_version": self.memory_schema_version,
+            "architecture": self.architecture,
+            "adapter_architecture": self.adapter_architecture,
+            "feature_space": self.feature_space,
+            "route_source": (
+                "block11_cls_block11_global_block8_boundary_"
+                "block8_uncertainty_block8_environment_v1"
+            ),
+            "input_size": self.input_size,
+            "token_size": self.token_size,
+            "dino_layer_indices": tuple(self.dino_layer_indices),
+            "encoder_dim": self.encoder_dim,
+            "memory_dim": self.memory_dim,
+            "value_dim": self.value_dim,
+            "geometry_dim": self.geometry_dim,
+            "storage_dtype": self.memory_storage_dtype,
+            "device": self.memory_device,
+            "source": self.memory_source,
+            "producer_fingerprint": str(producer_fingerprint),
+            "split_fingerprint": str(split_fingerprint),
+        }
+
+
+DEFAULT_ENCODER_PC_HBM_CONFIG = EncoderPCHBMConfig()
