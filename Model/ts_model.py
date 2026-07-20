@@ -1,14 +1,25 @@
 import torch
 import torch.nn as nn
 import warnings
+from collections.abc import Mapping
 from Model.BGFBR import ImageNetRGBAdapter
 from Model.decoder import build_decoder, resolve_decoder_arch
-from Model.PC_HBM.encoder import DinoFeatureBundle
+from configs.pc_hbm_dino_config import EncoderPCHBMConfig
+from Model.PC_HBM.encoder import (
+    DinoFeatureBundle,
+    EncoderPCCoreResult,
+    EncoderPCHBMAdapter,
+    EncoderPCSegmentationHead,
+    EncoderPCStageFlags,
+    TeacherPseudoLabelRefiner,
+)
 from Model.PC_HBM.training.ema import update_ema_module
 from utils.checkpoint_pc_hbm import (
+    load_encoder_pc_checkpoint,
     load_decoder_compatible,
     save_decoder_checkpoint as save_decoder_artifact,
 )
+from utils.pc_memory_runner import module_fingerprint
 
 class TSModel(nn.Module):
     VALID_TRAINING_DESIGNS = {'teacher_only', 'joint'}
@@ -66,6 +77,57 @@ class TSModel(nn.Module):
             ),
         )
 
+        self.encoder_pc_profile_v3 = (
+            self.pc_placement == 'encoder'
+            and isinstance(pc_cfg, EncoderPCHBMConfig)
+        )
+        self.teacher_encoder_pc_hbm = None
+        self.student_encoder_pc_hbm = None
+        self.teacher_pseudo_refiner = None
+        self.student_pseudo_refiner = None
+        self.teacher_encoder_pc_head = None
+        self.student_encoder_pc_head = None
+        self.encoder_base_artifact_meta = None
+
+        if getattr(self, 'encoder_pc_profile_v3', False):
+            if training_design != 'teacher_only':
+                raise ValueError(
+                    'encoder_pc TS uses the fixed EMA Teacher/Student protocol; '
+                    "set training_design='teacher_only'."
+                )
+            if allow_legacy_pc_init:
+                raise ValueError('encoder_pc TS never permits legacy PC initialization.')
+            if student_pth is not None:
+                raise ValueError(
+                    'encoder_pc TS initializes both roles from one Base v3 artifact; '
+                    'student_pth is not supported.'
+                )
+            self.teacher_encoder_pc_hbm = EncoderPCHBMAdapter(pc_cfg)
+            self.student_encoder_pc_hbm = EncoderPCHBMAdapter(pc_cfg)
+            self.teacher_pseudo_refiner = TeacherPseudoLabelRefiner(pc_cfg)
+            self.student_pseudo_refiner = TeacherPseudoLabelRefiner(pc_cfg)
+            object.__setattr__(
+                self,
+                'teacher_encoder_pc_head',
+                EncoderPCSegmentationHead(
+                    self.teacher_encoder_pc_hbm,
+                    self.teacher,
+                    self.teacher_pseudo_refiner,
+                ),
+            )
+            object.__setattr__(
+                self,
+                'student_encoder_pc_head',
+                EncoderPCSegmentationHead(
+                    self.student_encoder_pc_hbm,
+                    self.student,
+                    self.student_pseudo_refiner,
+                ),
+            )
+            self._load_encoder_pc_base(teacher_pth)
+            self._freeze_encoder_teacher()
+            return
+
         self.load_teacher(teacher_pth)
         if student_pth is not None:
             self.load_student(student_pth)
@@ -78,6 +140,9 @@ class TSModel(nn.Module):
         super().train(mode)
         self.dino.eval()
         self.teacher.eval()
+        if getattr(self, 'encoder_pc_profile_v3', False):
+            self.teacher_encoder_pc_hbm.eval()
+            self.teacher_pseudo_refiner.eval()
         return self
 
     @torch.no_grad()
@@ -133,6 +198,25 @@ class TSModel(nn.Module):
 
     @torch.inference_mode()
     def teacher_pseudo(self, features, memory, epoch, image_rgb=None):
+        if getattr(self, 'encoder_pc_profile_v3', False):
+            if not isinstance(features, DinoFeatureBundle):
+                raise TypeError('encoder_pc teacher_pseudo requires DinoFeatureBundle.')
+            payload = self.teacher_encoder_pc_head(
+                role='teacher_pseudo',
+                bundle=features,
+                image_rgb=image_rgb,
+                memory=memory,
+                stage=self._encoder_full_stage(require_same_image_positive=False),
+                epoch=epoch,
+                return_aux=True,
+            )
+            encoder_aux = payload['aux'].get('encoder_pc_hbm')
+            if not isinstance(encoder_aux, Mapping):
+                raise RuntimeError('Teacher pseudo payload is missing encoder evidence.')
+            return {
+                **payload,
+                'encoder_pc_hbm': encoder_aux,
+            }
         if getattr(self, 'pc_placement', 'decoder') == 'encoder':
             _, aux = self.teacher(
                 features,
@@ -184,6 +268,31 @@ class TSModel(nn.Module):
     def student_labeled(
         self, features, memory, epoch, query_image_ids=None, image_rgb=None
     ):
+        if self.encoder_pc_profile_v3:
+            if not isinstance(features, DinoFeatureBundle):
+                raise TypeError('encoder_pc student_labeled requires DinoFeatureBundle.')
+            core = self.student_encoder_pc_head(
+                role='labeled_core',
+                bundle=features,
+                image_rgb=image_rgb,
+                memory=memory,
+                mode='full',
+                stage=self._encoder_full_stage(require_same_image_positive=True),
+                epoch=epoch,
+                query_image_ids=query_image_ids,
+                return_aux=True,
+            )
+            if not isinstance(core, EncoderPCCoreResult):
+                raise RuntimeError('Student labeled core returned an invalid result.')
+            refined = self.student_encoder_pc_head(
+                role='labeled_refiner',
+                core_result=core,
+                epoch=epoch,
+            )
+            aux = dict(core.aux)
+            aux['z_core'] = core.z_core
+            aux['pseudo_refiner'] = refined
+            return core.outputs, aux
         if getattr(self, 'pc_placement', 'decoder') == 'encoder':
             return self.student(
                 features,
@@ -207,6 +316,25 @@ class TSModel(nn.Module):
         )
 
     def student_unlabeled(self, features, memory, epoch, image_rgb=None):
+        if self.encoder_pc_profile_v3:
+            if not isinstance(features, DinoFeatureBundle):
+                raise TypeError('encoder_pc student_unlabeled requires DinoFeatureBundle.')
+            core = self.student_encoder_pc_head(
+                role='student_core',
+                bundle=features,
+                image_rgb=image_rgb,
+                memory=memory,
+                stage=self._encoder_full_stage(require_same_image_positive=False),
+                epoch=epoch,
+                return_aux=True,
+            )
+            if not isinstance(core, EncoderPCCoreResult):
+                raise RuntimeError('Student unlabeled core returned an invalid result.')
+            aux = dict(core.aux)
+            aux['z_core'] = core.z_core
+            # This explicit sentinel is checked by encoder_pc_unlabeled_loss.
+            aux['pseudo_refiner'] = None
+            return core.outputs, aux
         if getattr(self, 'pc_placement', 'decoder') == 'encoder':
             return self.student(
                 features,
@@ -257,6 +385,12 @@ class TSModel(nn.Module):
                 )
             raise ValueError(f'Unsupported TS forward branch: {branch!r}.')
 
+        if getattr(self, 'encoder_pc_profile_v3', False):
+            raise ValueError(
+                'encoder_pc v3 requires explicit student_labeled or '
+                'student_unlabeled branch dispatch.'
+            )
+
         # Original combined/off API retained for the legacy SAM and pseudo trainers.
         if l_x is None or u_x is None:
             raise ValueError('Legacy TS forward requires both l_x and u_x.')
@@ -274,6 +408,18 @@ class TSModel(nn.Module):
 
     
     def inference(self, x, memory=None, epoch=None):
+        if self.encoder_pc_profile_v3:
+            bundle = self.extract_feature_bundle(x)
+            image_rgb = self.prepare_rgb(x)
+            return self.student_encoder_pc_head(
+                role='inference',
+                bundle=bundle,
+                image_rgb=image_rgb,
+                memory=memory,
+                stage=self._encoder_full_stage(require_same_image_positive=False),
+                epoch=epoch,
+                return_aux=False,
+            )
         x_features = self.extract_features(x)
         image_rgb = self.prepare_rgb(x)
         if self.training_design == 'teacher_only' or self.student.pc_hbm is None:
@@ -304,6 +450,8 @@ class TSModel(nn.Module):
         return aux['z_final'] if aux['z_final'] is not None else aux['z_main']
 
     def load_teacher(self, path):
+        if self.encoder_pc_profile_v3:
+            raise RuntimeError('encoder_pc Teacher must be loaded from a complete Base v3 artifact.')
         if path is None:
             raise ValueError('Teacher checkpoint path is required.')
         assert path.endswith('.pth'), f'Teacher parameters path should end with ".pth", but got: "{path}"'
@@ -313,6 +461,8 @@ class TSModel(nn.Module):
         print('Teacher parameters are not trainable.')
 
     def load_student(self, path):
+        if self.encoder_pc_profile_v3:
+            raise RuntimeError('encoder_pc Student must be loaded from a complete Base v3 artifact.')
         if path is None:
             raise ValueError('Student initialization checkpoint path is required.')
         assert path.endswith('.pth'), f'Student parameters path should end with ".pth", but got: "{path}"'
@@ -347,12 +497,30 @@ class TSModel(nn.Module):
             raise RuntimeError(f'Incompatible {role} checkpoint: {error}') from error
 
     def save_student(self, path):
+        if self.encoder_pc_profile_v3:
+            raise RuntimeError(
+                'encoder_pc Student must be saved as a complete v3 adapter/decoder/refiner artifact.'
+            )
         assert path.endswith('.pth'), f'Student parameters path should end with ".pth", but got: "{path}"'
         save_decoder_artifact(path, self.student, self.pc_cfg, epoch=0)
         print(f'Successfully save student parameters to {path}.')
 
     @torch.no_grad()
     def update_teacher(self, momentum=0.995):
+        if self.encoder_pc_profile_v3:
+            for student_module, teacher_module in (
+                (self.student_encoder_pc_hbm, self.teacher_encoder_pc_hbm),
+                (self.student, self.teacher),
+                (self.student_pseudo_refiner, self.teacher_pseudo_refiner),
+            ):
+                update_ema_module(
+                    student_module,
+                    teacher_module,
+                    momentum=momentum,
+                    shared_only=False,
+                )
+            self._freeze_encoder_teacher()
+            return
         update_ema_module(
             self.student,
             self.teacher,
@@ -363,3 +531,62 @@ class TSModel(nn.Module):
 
     def EMA(self, alpha=0.995):
         self.update_teacher(momentum=alpha)
+
+    @staticmethod
+    def _encoder_full_stage(*, require_same_image_positive=False):
+        return EncoderPCStageFlags(
+            enable_f4_f3=True,
+            f4_f3_progress=1.0,
+            enable_f2_f1=True,
+            f2_f1_progress=1.0,
+            require_same_image_positive=bool(require_same_image_positive),
+        )
+
+    def _load_encoder_pc_base(self, path):
+        if path is None:
+            raise ValueError('encoder_pc TS requires a Base encoder-PC v3 artifact.')
+        checkpoint = load_encoder_pc_checkpoint(
+            path,
+            encoder_pc_hbm=self.student_encoder_pc_hbm,
+            decoder=self.student,
+            pseudo_refiner=self.student_pseudo_refiner,
+            expected_model_role='base',
+            expected_training_design='two_stage',
+            expected_config=self.pc_cfg,
+        )
+        if int(checkpoint.get('epoch', -1)) != int(self.pc_cfg.final_epoch):
+            raise RuntimeError(
+                'encoder_pc TS requires the final Base v3 artifact at epoch '
+                f'{self.pc_cfg.final_epoch}.'
+            )
+        artifact_meta = checkpoint.get('artifact_meta')
+        if not isinstance(artifact_meta, Mapping):
+            raise RuntimeError('Base encoder-PC v3 artifact has no metadata mapping.')
+        for field in ('split_fingerprint', 'producer_fingerprint'):
+            if not isinstance(artifact_meta.get(field), str) or not artifact_meta[field]:
+                raise RuntimeError(
+                    f'Final Base encoder-PC v3 artifact is missing {field}.'
+                )
+        loaded_producer = module_fingerprint(self.student_encoder_pc_hbm)
+        if artifact_meta['producer_fingerprint'] != loaded_producer:
+            raise RuntimeError(
+                'Base encoder-PC artifact producer fingerprint does not match '
+                'its loaded Adapter.'
+            )
+        self.teacher_encoder_pc_hbm.load_state_dict(
+            self.student_encoder_pc_hbm.state_dict(), strict=True
+        )
+        self.teacher.load_state_dict(self.student.state_dict(), strict=True)
+        self.teacher_pseudo_refiner.load_state_dict(
+            self.student_pseudo_refiner.state_dict(), strict=True
+        )
+        self.encoder_base_artifact_meta = dict(artifact_meta)
+
+    def _freeze_encoder_teacher(self):
+        for module in (
+            self.teacher_encoder_pc_hbm,
+            self.teacher,
+            self.teacher_pseudo_refiner,
+        ):
+            module.requires_grad_(False)
+            module.eval()

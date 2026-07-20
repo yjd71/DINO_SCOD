@@ -2,6 +2,13 @@
 
 from .diagnostics import DIAGNOSTIC_NAMES, DiagnosticWarningTracker, collect_pc_diagnostics
 from .ema import make_ema_copy, update_ema_module
+from .encoder_pseudo import (
+    build_encoder_pc_confidence,
+    confidence_weighted_logit_bce,
+    confidence_weighted_structure_loss,
+    encoder_pc_unlabeled_loss,
+    prepare_encoder_pc_pseudo_targets,
+)
 from .encoder_training import (
     EncoderPCStage,
     build_encoder_pc_optimizer,
@@ -38,8 +45,11 @@ __all__ = [
     "decoder_base_loss",
     "build_pc_confidence",
     "build_encoder_pc_optimizer",
+    "build_encoder_pc_confidence",
     "collect_pc_diagnostics",
     "confidence_weighted_feature_cosine_loss",
+    "confidence_weighted_logit_bce",
+    "confidence_weighted_structure_loss",
     "compute_pc_hbm_labeled_loss",
     "compute_pc_hbm_unlabeled_loss",
     "configure_encoder_pc_stage",
@@ -52,6 +62,8 @@ __all__ = [
     "pc_injection_strength",
     "pc_mode_for_epoch",
     "pc_unlabeled_loss",
+    "encoder_pc_unlabeled_loss",
+    "prepare_encoder_pc_pseudo_targets",
     "prepare_pseudo_targets",
     "structure_loss",
     "update_ema_module",

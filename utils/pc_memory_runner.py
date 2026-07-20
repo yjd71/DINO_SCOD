@@ -193,6 +193,7 @@ def rebuild_encoder_memory(
     config: Any | None = None,
     compat_meta: Mapping[str, Any] | None = None,
     use_amp: bool = True,
+    producer_source: str = "ema_encoder_adapter",
 ):
     """Rebuild schema-v3 memory from raw DINO bundles and an EMA Adapter only.
 
@@ -273,7 +274,7 @@ def rebuild_encoder_memory(
     )
     generated_meta.update(
         {
-            "producer_source": "ema_encoder_adapter",
+            "producer_source": str(producer_source),
             "labeled_image_count": len(seen_ids),
         }
     )

@@ -368,6 +368,7 @@ class EncoderPCHBMConfig:
     token_size: int = 28
     output_size: int = 98
     encoder_dim: int = 768
+    decoder_dim: int = 128
     memory_dim: int = 128
     value_dim: int = 8
     geometry_dim: int = 6
@@ -402,6 +403,7 @@ class EncoderPCHBMConfig:
     hierarchy_end_epoch: int = 20
     final_epoch: int = 30
     memory_adapter_ema_decay: float = 0.995
+    ema_momentum: float = 0.995
 
     max_f4_injection: float = 0.25
     max_f3_injection: float = 1.0
@@ -431,6 +433,13 @@ class EncoderPCHBMConfig:
     pseudo_bg_threshold: float = 0.30
     pseudo_hard_ramp_epochs: int = 3
     hard_coverage_target: float = 0.20
+    hard_loss_weight: float = 2.0
+    refiner_start_epoch: int = 21
+    mixture_schedule_end_epoch: int = 30
+    mixture_temperature_start: float = 1.50
+    mixture_temperature_end: float = 0.80
+    mixture_eps_start: float = 0.10
+    mixture_eps_end: float = 0.0
 
     @property
     def lambda_refined_final(self) -> float:
@@ -453,6 +462,7 @@ class EncoderPCHBMConfig:
             "token_size": (self.token_size, 28),
             "output_size": (self.output_size, 98),
             "encoder_dim": (self.encoder_dim, 768),
+            "decoder_dim": (self.decoder_dim, 128),
             "memory_dim": (self.memory_dim, 128),
             "value_dim": (self.value_dim, 8),
             "geometry_dim": (self.geometry_dim, 6),
@@ -471,6 +481,14 @@ class EncoderPCHBMConfig:
             raise ValueError("Encoder PC-HBM memory is strictly labeled-only.")
         if not 0.0 < self.route_confidence_floor <= 1.0:
             raise ValueError("route_confidence_floor must be in (0, 1].")
+        if not 0.0 <= self.ema_momentum <= 1.0:
+            raise ValueError("ema_momentum must be in [0, 1].")
+        if self.hard_loss_weight < 0.0:
+            raise ValueError("hard_loss_weight must be non-negative.")
+        if self.refiner_start_epoch != self.hierarchy_end_epoch + 1:
+            raise ValueError("refiner_start_epoch must immediately follow hierarchy training.")
+        if self.mixture_schedule_end_epoch != self.final_epoch:
+            raise ValueError("mixture_schedule_end_epoch must equal final_epoch.")
         if self.attention_heads <= 0 or self.memory_dim % self.attention_heads:
             raise ValueError("attention_heads must divide memory_dim.")
         if self.attention_heads != 8:

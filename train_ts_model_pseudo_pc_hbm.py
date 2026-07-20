@@ -8,8 +8,12 @@ import random
 import numpy as np
 import torch
 
-from configs.bgfbr_experiments import apply_experiment_profile, experiment_profile_names
-from configs.pc_hbm_dino_config import DinoPCHBMConfig
+from configs.bgfbr_experiments import (
+    apply_experiment_profile,
+    build_experiment_profile,
+    experiment_profile_names,
+)
+from configs.pc_hbm_dino_config import DinoPCHBMConfig, EncoderPCHBMConfig
 from configs.ts_model_config import Config
 from Model.ts_model import TSModel
 from utils.distributed import (
@@ -19,6 +23,7 @@ from utils.distributed import (
     wrap_distributed,
 )
 from utils.trainer_ts_model_pseudo_pc_hbm import PCHBMPseudoTrainer
+from utils.trainer_ts_model_encoder_pc import EncoderPCTSTrainer
 
 
 def set_seed(seed=2025, deterministic=False):
@@ -60,7 +65,7 @@ def parse_args():
     )
     parser.add_argument(
         "--output-dir",
-        default="./results/pc_hbm/ts_model",
+        default=None,
         help="Directory for Student, memory, and resume checkpoints.",
     )
     parser.add_argument("--resume", default=None, help="Optional TS PC-HBM resume checkpoint.")
@@ -91,6 +96,14 @@ def validate_training_args(args) -> None:
     if args.training_design == "teacher_only":
         if args.allow_legacy_pc_init:
             raise ValueError("--allow-legacy-pc-init is only valid with --training-design joint")
+    profile_name = getattr(args, "experiment_profile", "bgfbr_pc")
+    if build_experiment_profile(profile_name).pc_placement == "encoder":
+        if args.training_design != "teacher_only":
+            raise ValueError("encoder_pc uses its fixed EMA Teacher/Student design")
+        if getattr(args, "allow_legacy_pc_init", False):
+            raise ValueError("encoder_pc rejects legacy PC initialization")
+        if getattr(args, "student_checkpoint", None) is not None:
+            raise ValueError("encoder_pc initializes Student from the Base v3 artifact only")
 
 
 def main():
@@ -106,7 +119,13 @@ def main():
     cfg.memory_batch_size = int(args.memory_batch_size)
     cfg.memory_num_workers = int(args.memory_num_workers)
     cfg.train_labeled_indices_pt = args.labeled_indices_pt
-    cfg.save_dir = args.output_dir
+    requested_profile = build_experiment_profile(args.experiment_profile)
+    encoder_profile = requested_profile.pc_placement == "encoder"
+    cfg.save_dir = args.output_dir or (
+        "./results/encoder_pc/ts_model"
+        if encoder_profile
+        else "./results/pc_hbm/ts_model"
+    )
     cfg.pc_training_design = str(args.training_design)
     cfg.teacher_pc_checkpoint = args.teacher_pc_checkpoint
     cfg.student_checkpoint = args.student_checkpoint
@@ -115,9 +134,21 @@ def main():
     cfg.u_batch_size = 32
     configure_distributed(cfg, context, seed=int(args.seed))
 
-    pc_cfg = DinoPCHBMConfig()
-    pc_cfg.configure_training_design(args.training_design)
-    experiment_profile = apply_experiment_profile(pc_cfg, args.experiment_profile)
+    if encoder_profile:
+        pc_cfg = EncoderPCHBMConfig()
+        # Commit 1's canonical encoder profile has no overrides and predates
+        # the encoder-aware registry application added with the ablations.
+        # Future encoder profiles must still apply their explicit overrides.
+        experiment_profile = (
+            requested_profile
+            if args.experiment_profile == "encoder_pc"
+            else apply_experiment_profile(pc_cfg, args.experiment_profile)
+        )
+        cfg.use_amp = True
+    else:
+        pc_cfg = DinoPCHBMConfig()
+        pc_cfg.configure_training_design(args.training_design)
+        experiment_profile = apply_experiment_profile(pc_cfg, args.experiment_profile)
     cfg.experiment_profile = experiment_profile.name
     model = TSModel(
         teacher_pth=args.teacher_pc_checkpoint,
@@ -136,7 +167,8 @@ def main():
         # joint Students alike.
         find_unused_parameters=True,
     )
-    trainer = PCHBMPseudoTrainer(
+    trainer_cls = EncoderPCTSTrainer if encoder_profile else PCHBMPseudoTrainer
+    trainer = trainer_cls(
         model,
         cfg,
         pc_cfg,
