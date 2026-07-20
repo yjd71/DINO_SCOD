@@ -8,6 +8,10 @@ from configs.pc_hbm_dino_config import EncoderPCHBMConfig
 import Model.base_model as base_model_module
 from Model.PC_HBM.training.encoder_losses import encoder_bootstrap_loss
 from Model.PC_HBM.training.supervision import build_gt_boundary
+from Model.PC_HBM.encoder import (
+    EncoderPCSegmentationHead,
+    TeacherPseudoLabelRefiner,
+)
 
 
 class _FakeDino(nn.Module):
@@ -83,6 +87,16 @@ def test_v3_base_bootstrap_runs_adapter_then_decoder_permanently_off(monkeypatch
     assert decoder.calls[-1]["memory"] is None
     assert decoder.calls[-1]["query_image_ids"] is None
     assert all(feature.shape == (2, 784, 768) for feature in decoder.calls[-1]["features"])
+
+
+def test_v3_base_constructs_real_refiner_and_role_head(monkeypatch) -> None:
+    model, decoder = _model(monkeypatch)
+
+    assert isinstance(model.pseudo_refiner, TeacherPseudoLabelRefiner)
+    assert isinstance(model.encoder_pc_head, EncoderPCSegmentationHead)
+    assert model.encoder_pc_head.adapter is model.encoder_pc_hbm
+    assert model.encoder_pc_head.decoder is decoder
+    assert model.encoder_pc_head.pseudo_refiner is model.pseudo_refiner
 
 
 def test_v3_off_path_is_elementwise_equal_to_bare_decoder(monkeypatch) -> None:

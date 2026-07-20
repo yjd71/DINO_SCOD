@@ -432,6 +432,18 @@ class EncoderPCHBMConfig:
     pseudo_hard_ramp_epochs: int = 3
     hard_coverage_target: float = 0.20
 
+    @property
+    def lambda_refined_final(self) -> float:
+        """Canonical refiner-final weight (legacy field kept in artifacts)."""
+
+        return float(self.lambda_refiner_final)
+
+    @property
+    def lambda_refiner_reg(self) -> float:
+        """Canonical refiner-regularization weight alias."""
+
+        return float(self.lambda_reg)
+
     def __post_init__(self) -> None:
         fixed = {
             "pc_placement": (self.pc_placement, "encoder"),

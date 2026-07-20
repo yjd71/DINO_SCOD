@@ -6,8 +6,11 @@ from Model.decoder import build_decoder, resolve_decoder_arch
 from configs.pc_hbm_dino_config import EncoderPCHBMConfig
 from Model.PC_HBM.encoder import (
     DinoFeatureBundle,
+    EncoderPCCoreResult,
     EncoderPCHBMAdapter,
+    EncoderPCSegmentationHead,
     EncoderPCStageFlags,
+    TeacherPseudoLabelRefiner,
 )
 from utils.checkpoint_pc_hbm import (
     load_decoder_compatible,
@@ -42,6 +45,8 @@ class BaseModel(nn.Module):
             attach_pc=bool(attach_pc) and self.pc_placement == 'decoder',
         )
         self.encoder_pc_hbm = None
+        self.pseudo_refiner = None
+        self.encoder_pc_head = None
         self.encoder_pc_config = None
         self.encoder_pc_profile_v3 = False
         if self.pc_placement == 'encoder':
@@ -52,6 +57,22 @@ class BaseModel(nn.Module):
             if self.encoder_pc_profile_v3:
                 self.encoder_pc_config = pc_cfg
                 self.encoder_pc_hbm = EncoderPCHBMAdapter(self.encoder_pc_config)
+                self.pseudo_refiner = TeacherPseudoLabelRefiner(
+                    self.encoder_pc_config
+                )
+                # The Adapter/Decoder/Refiner remain registered directly on
+                # BaseModel for stable optimizer and checkpoint interfaces.
+                # The role head is a policy dispatcher over those same module
+                # objects, so it is intentionally not registered a second time.
+                object.__setattr__(
+                    self,
+                    "encoder_pc_head",
+                    EncoderPCSegmentationHead(
+                        self.encoder_pc_hbm,
+                        self.decoder,
+                        self.pseudo_refiner,
+                    ),
+                )
 
     def train(self, mode=True):
         super().train(mode)
@@ -120,6 +141,8 @@ class BaseModel(nn.Module):
         query_image_ids=None,
         encoder_stage=None,
         allow_memory_fallback=False,
+        encoder_role='labeled_core',
+        run_labeled_refiner=False,
     ):
         bundle = self.extract_feature_bundle(x)
         x_features = bundle.patch_tokens
@@ -131,16 +154,38 @@ class BaseModel(nn.Module):
                     encoder_stage, EncoderPCStageFlags
                 ):
                     raise TypeError('encoder_stage must be EncoderPCStageFlags or None.')
-                adapter_output = self.encoder_pc_hbm(
-                    bundle,
+                if run_labeled_refiner and not return_aux:
+                    raise ValueError(
+                        'run_labeled_refiner requires return_aux=True.'
+                    )
+                head_result = self.encoder_pc_head(
+                    role=encoder_role,
+                    bundle=bundle,
+                    image_rgb=image_rgb,
                     memory=memory,
                     mode=pc_mode,
                     stage=encoder_stage,
+                    epoch=epoch,
                     query_image_ids=query_image_ids,
                     allow_memory_fallback=allow_memory_fallback,
+                    return_aux=return_aux or run_labeled_refiner,
                 )
-                x_features = adapter_output.features
-                encoder_aux = adapter_output.aux
+                if not isinstance(head_result, EncoderPCCoreResult):
+                    return head_result
+                if run_labeled_refiner:
+                    refiner_output = self.encoder_pc_head(
+                        role='labeled_refiner',
+                        core_result=head_result,
+                        epoch=epoch,
+                    )
+                    combined_aux = dict(head_result.aux)
+                    combined_aux['pseudo_refiner'] = refiner_output
+                    head_result = EncoderPCCoreResult(
+                        head_result.outputs, combined_aux
+                    )
+                if return_aux:
+                    return head_result.outputs, head_result.aux
+                return head_result.outputs
             decoder_result = self.decoder(
                 features=x_features,
                 image_rgb=image_rgb,
@@ -175,23 +220,20 @@ class BaseModel(nn.Module):
         x_features = bundle.patch_tokens
         image_rgb = self.prepare_rgb(x)
         if self.pc_placement == 'encoder' and self.encoder_pc_profile_v3:
-            adapter_output = self.encoder_pc_hbm(
-                bundle,
+            return self.encoder_pc_head(
+                role='inference',
+                bundle=bundle,
+                image_rgb=image_rgb,
                 memory=memory,
-                mode='full',
                 stage=EncoderPCStageFlags(
                     enable_f4_f3=True,
                     f4_f3_progress=1.0,
                     enable_f2_f1=True,
                     f2_f1_progress=1.0,
                 ),
+                epoch=epoch,
+                return_aux=False,
             )
-            return self.decoder(
-                features=adapter_output.features,
-                image_rgb=image_rgb,
-                memory=None,
-                pc_mode='off',
-            )[3]
         if self.decoder.pc_hbm is None:
             return self.decoder(features=x_features, image_rgb=image_rgb, pc_mode='off')[3]
         if memory is None:

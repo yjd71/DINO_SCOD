@@ -41,6 +41,11 @@ from .encoder_pc_adapter import (
     EncoderPCHBMAdapter,
     EncoderPCStageFlags,
 )
+from .encoder_pc_segmentation_head import (
+    ENCODER_PC_SEGMENTATION_ROLES,
+    EncoderPCCoreResult,
+    EncoderPCSegmentationHead,
+)
 from .encoder_level_propagation import (
     EncoderLevelPropagation,
     EncoderPropagationOutput,
@@ -52,6 +57,13 @@ from .route_context_adapter import (
     EncoderRouteContextOutput,
     EncoderStructuredGate,
     scatter_query_tokens,
+)
+from .teacher_pseudo_refiner import (
+    EncoderRefinerEvidence,
+    RefinerLossWeights,
+    TeacherPseudoLabelRefiner,
+    TeacherPseudoRefinerOutput,
+    teacher_pseudo_refiner_labeled_loss,
 )
 
 __all__ = [
@@ -82,6 +94,9 @@ __all__ = [
     "EncoderPCAdapterOutput",
     "EncoderPCHBMAdapter",
     "EncoderPCStageFlags",
+    "ENCODER_PC_SEGMENTATION_ROLES",
+    "EncoderPCCoreResult",
+    "EncoderPCSegmentationHead",
     "EncoderLevelPropagation",
     "EncoderPropagationOutput",
     "SameGridLocalCrossAttention",
@@ -97,4 +112,9 @@ __all__ = [
     "NormalizedStructuredPrior",
     "build_encoder_memory_compat_meta",
     "build_support_targets",
+    "EncoderRefinerEvidence",
+    "RefinerLossWeights",
+    "TeacherPseudoLabelRefiner",
+    "TeacherPseudoRefinerOutput",
+    "teacher_pseudo_refiner_labeled_loss",
 ]

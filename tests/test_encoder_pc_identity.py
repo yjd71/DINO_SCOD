@@ -109,6 +109,18 @@ def test_initial_full_adapter_is_exact_feature_identity_with_structured_maps() -
     assert torch.count_nonzero(output.aux["injection"].f4_delta) == 0
     assert output.aux["route_context"].verified_f3_map.shape == (1, 128, 28, 28)
     assert output.aux["C23_map"].shape == (1, 1, 28, 28)
+    evidence = output.aux["refiner_evidence"]
+    assert evidence["verified_evidence"].shape == (1, 128, 28, 28)
+    assert evidence["boundary_probability"].shape == (1, 1, 28, 28)
+    for name in (
+        "pc_gate",
+        "contradiction",
+        "semantic_support",
+        "detail_support",
+        "valid_map",
+    ):
+        assert evidence[name].shape == (1, 1, 28, 28)
+    assert evidence["route_confidence"].shape == (1,)
     assert output.aux["injection"].f4_strength.item() > 0.0
     assert output.aux["injection"].f3_strength.item() > 0.0
 

@@ -13,7 +13,10 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, DistributedSampler
 
 from configs.pc_hbm_dino_config import EncoderPCHBMConfig
-from Model.PC_HBM.encoder import EncoderPCMemory
+from Model.PC_HBM.encoder import (
+    EncoderPCMemory,
+    teacher_pseudo_refiner_labeled_loss,
+)
 from Model.PC_HBM.training.encoder_training import (
     EncoderPCStage,
     build_encoder_pc_optimizer,
@@ -239,6 +242,7 @@ class EncoderPCHBMTrainer:
                     encoder_stage=stage.adapter_flags(
                         require_same_image_positive=stage.mode != "bootstrap"
                     ),
+                    run_labeled_refiner=stage.enable_refiner,
                 )
                 if not isinstance(result, (tuple, list)) or len(result) != 2:
                     raise RuntimeError("Encoder Base model must return (outputs, aux).")
@@ -246,6 +250,19 @@ class EncoderPCHBMTrainer:
                 loss, terms = encoder_pc_labeled_loss(
                     outputs, aux, gt, self.pc_cfg, stage
                 )
+                if stage.enable_refiner:
+                    refiner_output = aux.get("pseudo_refiner")
+                    if not isinstance(refiner_output, Mapping):
+                        raise RuntimeError(
+                            "Epochs 21-30 require labeled pseudo-refiner output."
+                        )
+                    refiner_loss, refiner_terms = (
+                        teacher_pseudo_refiner_labeled_loss(
+                            refiner_output, gt, self.pc_cfg
+                        )
+                    )
+                    loss = loss + refiner_loss
+                    terms = {**terms, **refiner_terms}
             if not bool(torch.isfinite(loss.detach())):
                 raise FloatingPointError(
                     f"Non-finite encoder-PC loss at epoch {epoch}."

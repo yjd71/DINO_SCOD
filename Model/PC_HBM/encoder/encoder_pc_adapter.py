@@ -276,6 +276,20 @@ class EncoderPCHBMAdapter(nn.Module):
                 "semantic_support_map": context.semantic_support_map,
                 "detail_support_map": context.detail_support_map,
                 "geometry_support_map": context.geometry_support_map,
+                "refiner_evidence": {
+                    "verified_evidence": context.verified_f3_map,
+                    "boundary_probability": (
+                        bootstrap.boundary_output.boundary_probability
+                    ),
+                    "pc_gate": context.gate_map,
+                    "contradiction": context.c23_map,
+                    "semantic_support": context.semantic_support_map,
+                    "detail_support": context.detail_support_map,
+                    "valid_map": context.valid3_map.to(
+                        dtype=context.verified_f3_map.dtype
+                    ),
+                    "route_confidence": route["route_confidence"],
+                },
             }
         )
         return EncoderPCAdapterOutput(enhanced, aux)
