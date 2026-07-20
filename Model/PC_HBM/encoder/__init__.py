@@ -1,5 +1,14 @@
 """Encoder-side PC-HBM components, isolated from the legacy decoder engine."""
 
+from .child_semantic_detail_verifier import (
+    ChildSemanticDetailVerifier,
+    EncoderParentChildDetailVerifier,
+    EncoderParentRetriever,
+    EncoderPCVerifier,
+    EncoderSemanticDetailVerifier,
+    NormalizedStructuredPrior,
+    build_support_targets,
+)
 from .contracts import DinoFeatureBundle
 from .encoder_boundary_query import EncoderBoundaryOutput, EncoderBoundaryQuery
 from .encoder_global_fusion import (
@@ -19,9 +28,9 @@ from .encoder_memory import (
     EncoderPCMemory,
     build_encoder_memory_compat_meta,
 )
-from .feature_projector import DinoFeatureProjector, ProjectedDinoFeatures
 from .encoder_memory_builder import EncoderMemoryBuilder
 from .encoder_router import EncoderPCRouter, EncoderRouter
+from .feature_projector import DinoFeatureProjector, ProjectedDinoFeatures
 
 __all__ = [
     "DinoFeatureBundle",
@@ -44,5 +53,12 @@ __all__ = [
     "EncoderPCMemory",
     "EncoderPCRouter",
     "EncoderRouter",
+    "ChildSemanticDetailVerifier",
+    "EncoderParentChildDetailVerifier",
+    "EncoderParentRetriever",
+    "EncoderPCVerifier",
+    "EncoderSemanticDetailVerifier",
+    "NormalizedStructuredPrior",
     "build_encoder_memory_compat_meta",
+    "build_support_targets",
 ]
