@@ -26,7 +26,7 @@ from utils.trainer_ts_model_pseudo_pc_hbm import PCHBMPseudoTrainer
 from utils.trainer_ts_model_encoder_pc import EncoderPCTSTrainer
 
 
-def set_seed(seed=2025, deterministic=False):
+def set_seed(seed=2027, deterministic=False):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -83,7 +83,7 @@ def parse_args():
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--memory-batch-size", type=int, default=16)
     parser.add_argument("--memory-num-workers", type=int, default=0)
-    parser.add_argument("--seed", type=int, default=2025)
+    parser.add_argument("--seed", type=int, default=2027)
     parser.add_argument(
         "--deterministic",
         action="store_true",

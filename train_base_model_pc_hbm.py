@@ -14,7 +14,7 @@ from configs.bgfbr_experiments import (
 )
 
 
-def set_seed(seed: int = 2025, deterministic: bool = False) -> None:
+def set_seed(seed: int = 2027, deterministic: bool = False) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
             "a BGFBR target; reuses projectors but never legacy PC weights."
         ),
     )
-    parser.add_argument("--seed", type=int, default=2025)
+    parser.add_argument("--seed", type=int, default=2027)
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument(
         "--labeled-indices-pt",

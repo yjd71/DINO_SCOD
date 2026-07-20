@@ -29,6 +29,7 @@ class BGFBRExperimentProfile:
     use_ode: bool = True
     use_rcab: bool = True
     use_pc_boundary_context: bool = True
+    boundary_feature_channels: tuple[int, int, int, int] | None = None
     encoder_overrides: tuple[tuple[str, Any], ...] = ()
     description: str = ""
 
@@ -83,6 +84,12 @@ class BGFBRExperimentProfile:
         config.use_ode = self.use_ode
         config.use_rcab = self.use_rcab
         config.use_pc_boundary_context = self.use_pc_boundary_context
+        if self.boundary_feature_channels is not None:
+            if not hasattr(config, "boundary_feature_channels"):
+                raise TypeError(
+                    "Experiment profile requires boundary_feature_channels support"
+                )
+            config.boundary_feature_channels = self.boundary_feature_channels
 
         if self.base_mode == "off":
             config.parent_start_epoch = _DISABLED_STAGE_EPOCH
@@ -166,6 +173,19 @@ _PROFILES = {
         use_rcab=False,
         use_pc_boundary_context=False,
         description="Legacy Transformer decoder with PC-HBM disabled.",
+    ),
+    "legacy_pc": BGFBRExperimentProfile(
+        name="legacy_pc",
+        decoder_arch="legacy_transformer",
+        use_gbe=False,
+        use_ode=False,
+        use_rcab=False,
+        use_pc_boundary_context=False,
+        boundary_feature_channels=(5, 8, 8, 14),
+        description=(
+            "Legacy Transformer decoder with the original PC-HBM boundary "
+            "descriptor widths and full memory retrieval enabled."
+        ),
     ),
 }
 

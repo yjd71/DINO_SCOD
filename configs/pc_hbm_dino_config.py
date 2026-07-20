@@ -70,7 +70,7 @@ class DinoPCHBMConfig:
     exclude_self_match: bool = True
 
     route_top_img_k: int = 8
-    parent_topk: int = 16
+    parent_topk: int = 32
     query_chunk_size: int = 512
 
     # Boundary token selection.
