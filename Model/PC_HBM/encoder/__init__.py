@@ -21,6 +21,7 @@ from .encoder_memory import (
 )
 from .feature_projector import DinoFeatureProjector, ProjectedDinoFeatures
 from .encoder_memory_builder import EncoderMemoryBuilder
+from .encoder_router import EncoderPCRouter, EncoderRouter
 
 __all__ = [
     "DinoFeatureBundle",
@@ -41,5 +42,7 @@ __all__ = [
     "EncoderMemoryCompatibilityResult",
     "EncoderMemoryBuilder",
     "EncoderPCMemory",
+    "EncoderPCRouter",
+    "EncoderRouter",
     "build_encoder_memory_compat_meta",
 ]
