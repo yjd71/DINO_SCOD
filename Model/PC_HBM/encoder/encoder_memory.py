@@ -9,19 +9,31 @@ import torch
 ENCODER_PC_MEMORY_ARCHITECTURE = "DINO_SCOD_ENCODER_PC_HBM"
 ENCODER_PC_MEMORY_SCHEMA_VERSION = 3
 ENCODER_PC_MEMORY_FORMAT_VERSION = 3
+ENCODER_PC_ROUTE_SOURCES = (
+    "encoder_route_key_v1",
+    "route_mlp_640_to_128_v1",
+    (
+        "block11_cls",
+        "block11_f4_global",
+        "block8_f3_boundary",
+        "block8_f3_uncertainty",
+        "block8_f3_environment",
+    ),
+)
 
 ENCODER_PC_STATIC_COMPAT_META: dict[str, Any] = {
     "architecture": ENCODER_PC_MEMORY_ARCHITECTURE,
     "schema_version": ENCODER_PC_MEMORY_SCHEMA_VERSION,
     "adapter_architecture": "encoder_pc_hbm_v1",
     "feature_space": "frozen_dinov2_projected_encoder_v1",
-    "route_source": "block11_cls_block11_patch",
+    "route_source": ENCODER_PC_ROUTE_SOURCES,
     "parent_source": "block8_patch",
     "child_source": "block5_patch",
     "detail_source": "block2_patch",
     "input_size": 392,
     "token_hw": (28, 28),
     "dino_layer_indices": (2, 5, 8, 11),
+    "dino_checkpoint": "weight/dinov2_vitb14_pretrain.pth",
     "encoder_dim": 768,
     "memory_dim": 128,
     "value_dim": 8,
@@ -33,6 +45,7 @@ ENCODER_PC_STATIC_COMPAT_META: dict[str, Any] = {
 ENCODER_PC_STATIC_COMPAT_KEYS = tuple(ENCODER_PC_STATIC_COMPAT_META)
 ENCODER_PC_REQUIRED_COMPAT_KEYS = (
     *ENCODER_PC_STATIC_COMPAT_KEYS,
+    "dino_weight_fingerprint",
     "producer_fingerprint",
     "labeled_split_fingerprint",
 )
@@ -78,6 +91,7 @@ class EncoderMemoryCompatibilityResult:
 
 def build_encoder_memory_compat_meta(
     *,
+    dino_weight_fingerprint: str,
     producer_fingerprint: str,
     labeled_split_fingerprint: str,
     overrides: Mapping[str, Any] | None = None,
@@ -87,6 +101,9 @@ def build_encoder_memory_compat_meta(
     meta = dict(ENCODER_PC_STATIC_COMPAT_META)
     if overrides:
         meta.update(dict(overrides))
+    meta["dino_weight_fingerprint"] = _required_fingerprint(
+        dino_weight_fingerprint, "dino_weight_fingerprint"
+    )
     meta["producer_fingerprint"] = _required_fingerprint(
         producer_fingerprint, "producer_fingerprint"
     )
@@ -783,6 +800,9 @@ def _validate_compat_meta(meta: Mapping[str, Any]) -> None:
         if _canonical_meta(meta[key]) != _canonical_meta(expected):
             raise ValueError(f"Invalid encoder memory compatibility value for {key}")
     _required_fingerprint(meta["producer_fingerprint"], "producer_fingerprint")
+    _required_fingerprint(
+        meta["dino_weight_fingerprint"], "dino_weight_fingerprint"
+    )
     _required_fingerprint(
         meta["labeled_split_fingerprint"], "labeled_split_fingerprint"
     )

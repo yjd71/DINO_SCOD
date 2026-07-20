@@ -53,6 +53,7 @@ class EncoderMemoryBuilder:
         ):
             raise ValueError("Encoder memory builder requires dimensions 128/8/6 and 28x28 tokens")
 
+    @torch.inference_mode()
     def __call__(
         self,
         *,

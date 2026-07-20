@@ -210,6 +210,14 @@ def rebuild_encoder_memory(
         raise AttributeError(
             "Encoder memory rebuild model must provide extract_feature_bundle(images)"
         )
+    dino = getattr(feature_model, "dino", None)
+    if not isinstance(dino, nn.Module):
+        raise AttributeError(
+            "Encoder memory rebuild model must expose the frozen DINO module"
+        )
+    if any(parameter.requires_grad for parameter in dino.parameters()):
+        raise RuntimeError("Encoder memory rebuild requires frozen DINO weights")
+    dino_weight_fingerprint = module_fingerprint(dino)
     adapter = _unwrap_module(memory_adapter)
     forward_memory_features = getattr(adapter, "forward_memory_features", None)
     if not callable(forward_memory_features):
@@ -269,6 +277,7 @@ def rebuild_encoder_memory(
     producer_fingerprint = module_fingerprint(adapter)
     split_fingerprint = compute_labeled_split_fingerprint(ordered_ids)
     generated_meta = _build_encoder_memory_compat_meta(
+        dino_weight_fingerprint=dino_weight_fingerprint,
         producer_fingerprint=producer_fingerprint,
         labeled_split_fingerprint=split_fingerprint,
     )

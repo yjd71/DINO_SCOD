@@ -79,6 +79,7 @@ def _patch_encoder_model_construction(monkeypatch, *, loader=None):
                 "training_design": "two_stage",
                 "split_fingerprint": "split",
                 "producer_fingerprint": producer,
+                "dino_weight_fingerprint": module_fingerprint(_TinyDino()),
             }
         }
 
@@ -154,9 +155,21 @@ def test_encoder_ts_propagates_strict_v3_loader_rejection(monkeypatch):
                 "artifact_meta": {
                     "split_fingerprint": "split",
                     "producer_fingerprint": "forged",
+                    "dino_weight_fingerprint": "dino-test-fingerprint",
                 },
             },
             "producer fingerprint",
+        ),
+        (
+            {
+                "epoch": 30,
+                "artifact_meta": {
+                    "split_fingerprint": "split",
+                    "producer_fingerprint": module_fingerprint(_TinyModule()),
+                    "dino_weight_fingerprint": "forged-dino",
+                },
+            },
+            "DINO fingerprint",
         ),
     ),
 )
@@ -347,6 +360,7 @@ class _TinyTS(nn.Module):
         self.teacher_pseudo_refiner = _TinyModule(0.5)
         self.encoder_base_artifact_meta = {
             "split_fingerprint": split_fingerprint,
+            "dino_weight_fingerprint": module_fingerprint(self.dino),
             "baseline_fingerprint": "baseline",
         }
         self.ema_calls = 0
@@ -548,6 +562,9 @@ def test_encoder_ts_final_memory_is_rebuilt_from_online_student_and_fingerprinte
     fingerprint = module_fingerprint(core.student_encoder_pc_hbm)
     assert memory.compat_meta["producer_fingerprint"] == fingerprint
     assert captured["artifact_meta"]["producer_fingerprint"] == fingerprint
+    assert captured["artifact_meta"]["dino_weight_fingerprint"] == module_fingerprint(
+        core.dino
+    )
     assert captured["encoder_pc_hbm"] is core.student_encoder_pc_hbm
     assert captured["model_role"] == "student"
     assert captured["training_design"] == "teacher_student"

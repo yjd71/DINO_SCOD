@@ -10,6 +10,7 @@ from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
 from Model.PC_HBM.encoder.encoder_memory import EncoderPCMemory
+import Model.PC_HBM.encoder.encoder_memory_builder as builder_module
 from Model.PC_HBM.encoder.encoder_memory_builder import EncoderMemoryBuilder
 from utils.checkpoint_pc_hbm import compute_labeled_split_fingerprint
 from utils.pc_memory_runner import module_fingerprint, rebuild_encoder_memory
@@ -70,6 +71,10 @@ class _TrapDecoder(nn.Module):
 class _FeatureModel(nn.Module):
     def __init__(self) -> None:
         super().__init__()
+        self.dino = nn.Linear(1, 1, bias=False)
+        with torch.no_grad():
+            self.dino.weight.fill_(0.125)
+        self.dino.requires_grad_(False).eval()
         self.decoder = _TrapDecoder()
         self.bundle_calls = 0
         self.forward_calls = 0
@@ -163,6 +168,23 @@ def test_rebuild_uses_raw_bundle_and_ema_adapter_without_decoder() -> None:
     assert adapter.forward_calls == 0
     assert adapter.last_bundle is model.last_bundle
     assert memory.compat_meta["producer_fingerprint"] == module_fingerprint(adapter)
+    assert memory.compat_meta["dino_weight_fingerprint"] == module_fingerprint(
+        model.dino
+    )
+    assert memory.compat_meta["route_source"][:2] == (
+        "encoder_route_key_v1",
+        "route_mlp_640_to_128_v1",
+    )
+    assert memory.compat_meta["route_source"][2] == (
+        "block11_cls",
+        "block11_f4_global",
+        "block8_f3_boundary",
+        "block8_f3_uncertainty",
+        "block8_f3_environment",
+    )
+    assert memory.compat_meta["dino_checkpoint"] == (
+        "weight/dinov2_vitb14_pretrain.pth"
+    )
     assert memory.compat_meta["labeled_split_fingerprint"] == (
         compute_labeled_split_fingerprint(("A.png", "B.png"))
     )
@@ -170,12 +192,21 @@ def test_rebuild_uses_raw_bundle_and_ema_adapter_without_decoder() -> None:
     assert memory.compat_meta["labeled_image_count"] == 2
 
 
-def test_builder_route_keys_are_gt_independent_and_metadata_is_tensorized() -> None:
+def test_builder_route_keys_are_gt_independent_and_metadata_is_tensorized(
+    monkeypatch,
+) -> None:
     adapter = _MemoryAdapter().eval()
     images = torch.stack((_MemoryDataset()[0][1], _MemoryDataset()[1][1]))
     with torch.inference_mode():
         features = adapter.forward_memory_features(_RawBundle(images))
     builder = EncoderMemoryBuilder(_config())
+    original_build_regions = builder_module.build_pc_regions
+
+    def checked_build_regions(*args, **kwargs):
+        assert torch.is_inference_mode_enabled()
+        return original_build_regions(*args, **kwargs)
+
+    monkeypatch.setattr(builder_module, "build_pc_regions", checked_build_regions)
     gt_square = torch.stack((_MemoryDataset()[0][2], _MemoryDataset()[1][2]))
     gt_background = torch.zeros_like(gt_square)
 
@@ -212,6 +243,12 @@ def test_builder_route_keys_are_gt_independent_and_metadata_is_tensorized() -> N
     }
     assert all(torch.is_tensor(value) for value in square_entries["parent"].values())
     assert all(torch.is_tensor(value) for value in square_entries["child"].values())
+    assert all(
+        not value.requires_grad
+        for group in ("route", "parent", "child")
+        for value in square_entries[group].values()
+        if torch.is_tensor(value) and value.is_floating_point()
+    )
     values = square_entries["parent"]["values"]
     assert values.shape[1] == 8
     assert torch.equal(values[:, 7], square_entries["parent"]["reliability"])

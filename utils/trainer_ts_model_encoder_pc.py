@@ -293,6 +293,16 @@ class EncoderPCTSTrainer:
             raise RuntimeError(
                 "Base encoder-PC split fingerprint differs from the TS labeled split"
             )
+        saved_dino = metadata.get("dino_weight_fingerprint")
+        live_dino = module_fingerprint(self.core_model.dino)
+        if not isinstance(saved_dino, str) or not saved_dino:
+            raise RuntimeError(
+                "Base encoder-PC v3 artifact is missing dino_weight_fingerprint"
+            )
+        if saved_dino != live_dino:
+            raise RuntimeError(
+                "Base encoder-PC DINO fingerprint differs from the live frozen DINO"
+            )
 
     @staticmethod
     def _cycle(loader):
@@ -494,6 +504,9 @@ class EncoderPCTSTrainer:
         base_meta = self.core_model.encoder_base_artifact_meta
         metadata = {
             "split_fingerprint": self.split_state["fingerprint"],
+            "dino_weight_fingerprint": module_fingerprint(
+                self.core_model.dino
+            ),
             "baseline_fingerprint": str(
                 base_meta.get("baseline_fingerprint", "unspecified")
             ),

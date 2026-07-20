@@ -7,12 +7,15 @@ from Model.PC_HBM.encoder.child_semantic_detail_verifier import (
     EncoderParentChildDetailVerifier,
     EncoderParentRetriever,
     NormalizedStructuredPrior,
+    _GeometrySupportScorer,
     build_support_targets,
 )
 from Model.PC_HBM.encoder.encoder_memory import (
     EncoderPCMemory,
     build_encoder_memory_compat_meta,
 )
+from configs.pc_hbm_dino_config import EncoderPCHBMConfig
+from Model.PC_HBM.encoder.encoder_pc_adapter import EncoderPCHBMAdapter
 
 
 def _memory(
@@ -79,6 +82,7 @@ def _memory(
     )
     memory.finalize(
         compat_meta=build_encoder_memory_compat_meta(
+            dino_weight_fingerprint="verify-dino-sha256",
             producer_fingerprint="verify-adapter-sha256",
             labeled_split_fingerprint="verify-split-sha256",
         )
@@ -116,6 +120,31 @@ def _query_geometry(rows: int) -> torch.Tensor:
     return geometry
 
 
+def test_zero_geometry_reliability_has_exact_zero_and_finite_gradients() -> None:
+    scorer = _GeometrySupportScorer()
+    query = torch.tensor(
+        [[0.0, 1.0, 0.0, 0.0, 0.0, 0.0]], requires_grad=True
+    )
+    parent = torch.tensor(
+        [[[0.0, 1.0, 0.0, 0.0, 0.0, 0.8]]], requires_grad=True
+    )
+    child = torch.tensor(
+        [[[0.0, 1.0, 0.0, 0.0, 0.0, 0.9]]], requires_grad=True
+    )
+
+    result = scorer(query, parent, child)
+
+    assert torch.equal(result["geometry_reliability"], torch.zeros(1, 1))
+    result["score"].sum().backward()
+    assert query.grad is not None and torch.isfinite(query.grad).all()
+    assert parent.grad is not None and torch.isfinite(parent.grad).all()
+    assert child.grad is not None and torch.isfinite(child.grad).all()
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in scorer.parameters()
+    )
+
+
 def test_parent_retrieval_is_per_sample_top16_and_chunked_at_512() -> None:
     memory = _memory()
     retriever = EncoderParentRetriever()
@@ -143,6 +172,19 @@ def test_parent_retrieval_is_per_sample_top16_and_chunked_at_512() -> None:
     )
 
 
+def test_adapter_wires_smoke_parent_top2_and_preserves_default_top16() -> None:
+    default_adapter = EncoderPCHBMAdapter()
+    smoke_adapter = EncoderPCHBMAdapter(
+        EncoderPCHBMConfig(parent_topk=2, query_chunk_size=32)
+    )
+
+    assert default_adapter.verifier.parent_retriever.topk == 16
+    assert default_adapter.verifier.child_verifier.parent_topk == 16
+    assert smoke_adapter.verifier.parent_retriever.topk == 2
+    assert smoke_adapter.verifier.parent_retriever.query_chunk_size == 32
+    assert smoke_adapter.verifier.child_verifier.parent_topk == 2
+
+
 def test_parent_padding_uses_invalid_mask_without_full_bank_fallback() -> None:
     memory = _memory()
     subbank = _subbank(memory, (0,))
@@ -159,6 +201,24 @@ def test_parent_padding_uses_invalid_mask_without_full_bank_fallback() -> None:
     assert torch.equal(result["top_parent_indices"][0, 3:], torch.full((13,), -1))
     assert torch.equal(result["top_parent_keys"][0, 3:], torch.zeros(13, 128))
     assert (result["top_parent_scores"][0, 3:] == -1.0e4).all()
+
+
+def test_parent_retrieval_aligns_autocast_scores_to_query_dtype() -> None:
+    memory = _memory()
+    query = torch.randn(2, 128, dtype=torch.float32, requires_grad=True)
+    retriever = EncoderParentRetriever()
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        result = retriever.retrieve_q(
+            query,
+            torch.zeros(2, dtype=torch.long),
+            [_subbank(memory, (0,))],
+        )
+
+    assert result["top_parent_scores"].dtype == query.dtype
+    result["top_parent_scores"].mean().backward()
+    assert query.grad is not None
+    assert torch.isfinite(query.grad).all()
 
 
 def test_f2_f1_windows_shapes_geometry_and_vector_contract() -> None:

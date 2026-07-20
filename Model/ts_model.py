@@ -562,7 +562,11 @@ class TSModel(nn.Module):
         artifact_meta = checkpoint.get('artifact_meta')
         if not isinstance(artifact_meta, Mapping):
             raise RuntimeError('Base encoder-PC v3 artifact has no metadata mapping.')
-        for field in ('split_fingerprint', 'producer_fingerprint'):
+        for field in (
+            'split_fingerprint',
+            'producer_fingerprint',
+            'dino_weight_fingerprint',
+        ):
             if not isinstance(artifact_meta.get(field), str) or not artifact_meta[field]:
                 raise RuntimeError(
                     f'Final Base encoder-PC v3 artifact is missing {field}.'
@@ -572,6 +576,12 @@ class TSModel(nn.Module):
             raise RuntimeError(
                 'Base encoder-PC artifact producer fingerprint does not match '
                 'its loaded Adapter.'
+            )
+        live_dino = module_fingerprint(self.dino)
+        if artifact_meta['dino_weight_fingerprint'] != live_dino:
+            raise RuntimeError(
+                'Base encoder-PC artifact DINO fingerprint does not match '
+                'the live frozen DINO.'
             )
         self.teacher_encoder_pc_hbm.load_state_dict(
             self.student_encoder_pc_hbm.state_dict(), strict=True

@@ -116,11 +116,26 @@ class _GeometrySupportScorer(nn.Module):
         offset_difference = torch.abs(
             query[..., 3:5] - child_geometry[..., 3:5]
         ).mean(dim=-1)
-        geometry_reliability = (
+        reliability_product = (
             query[..., 5].clamp(0.0, 1.0)
             * child_geometry[..., 5].clamp(0.0, 1.0)
             * parent_geometry[..., 5].clamp(0.0, 1.0)
-        ).pow(1.0 / 3.0)
+        )
+        # The geometric mean has an infinite derivative at an exact zero.
+        # Zero reliability is a normal boundary case (especially under AMP),
+        # so evaluate the root at a finite placeholder and mask both its value
+        # and gradient back to strict zero for those entries.
+        positive_reliability = reliability_product > 0
+        safe_product = torch.where(
+            positive_reliability,
+            reliability_product,
+            torch.ones_like(reliability_product),
+        )
+        geometry_reliability = torch.where(
+            positive_reliability,
+            safe_product.pow(1.0 / 3.0),
+            torch.zeros_like(reliability_product),
+        )
 
         parent_child_sdf_difference = torch.abs(
             parent_geometry[..., 0] - child_geometry[..., 0]
@@ -251,14 +266,14 @@ class EncoderParentRetriever(nn.Module):
         super().__init__()
         if int(dim) != MEMORY_DIM:
             raise ValueError("Encoder parent vectors are fixed to 128 dimensions")
-        if int(topk) != PARENT_TOPK:
-            raise ValueError("Encoder parent retrieval top-k is fixed to 16")
+        if not 1 <= int(topk) <= PARENT_TOPK:
+            raise ValueError("Encoder parent retrieval top-k must be in [1,16]")
         if int(query_chunk_size) <= 0:
             raise ValueError("query_chunk_size must be positive")
         if float(temperature) <= 0.0:
             raise ValueError("parent temperature must be positive")
         self.dim = MEMORY_DIM
-        self.topk = PARENT_TOPK
+        self.topk = int(topk)
         self.query_chunk_size = int(query_chunk_size)
         self.temperature = float(temperature)
 
@@ -439,7 +454,13 @@ class EncoderParentRetriever(nn.Module):
                 return selected.reshape(rows, real_k)
             return selected.reshape(rows, real_k, width)
 
-        result["top_parent_scores"][query_positions, :real_k] = scores
+        # Autocast may produce FP16/BF16 matmul scores even when q3 (and thus
+        # the preallocated result) is FP32.  Preserve the result/query dtype;
+        # the differentiable cast keeps retrieval gradients intact.
+        score_target = result["top_parent_scores"]
+        result["top_parent_scores"][query_positions, :real_k] = scores.to(
+            dtype=score_target.dtype
+        )
         result["top_parent_valid"][query_positions, :real_k] = True
         result["top_parent_keys"][query_positions, :real_k] = gathered(
             "f3_parent_keys", MEMORY_DIM
@@ -518,10 +539,18 @@ def _masked_max(
 class ChildSemanticDetailVerifier(nn.Module):
     """Verify retrieved F3 parents with F2 semantics, F1 detail, and geometry."""
 
-    def __init__(self, dim: int = MEMORY_DIM) -> None:
+    def __init__(
+        self,
+        dim: int = MEMORY_DIM,
+        *,
+        parent_topk: int = PARENT_TOPK,
+    ) -> None:
         super().__init__()
         if int(dim) != MEMORY_DIM:
             raise ValueError("Encoder verification vectors are fixed to 128 dimensions")
+        if not 1 <= int(parent_topk) <= PARENT_TOPK:
+            raise ValueError("Encoder verification parent_topk must be in [1,16]")
+        self.parent_topk = int(parent_topk)
         self.semantic_local_encoder = _LocalPatchEncoder(window=5)
         self.detail_local_encoder = _LocalPatchEncoder(window=3)
         self.semantic_score_mlp = _PairSupportScorer()
@@ -546,8 +575,10 @@ class ChildSemanticDetailVerifier(nn.Module):
             raise RuntimeError("EncoderPCMemory must be finalized before verification")
         parent_keys = self._parent_tensor(parent_result, "top_parent_keys", 3)
         rows, topk, width = parent_keys.shape
-        if (topk, width) != (PARENT_TOPK, MEMORY_DIM):
-            raise ValueError(f"top_parent_keys must be [M,{PARENT_TOPK},{MEMORY_DIM}]")
+        if (topk, width) != (self.parent_topk, MEMORY_DIM):
+            raise ValueError(
+                f"top_parent_keys must be [M,{self.parent_topk},{MEMORY_DIM}]"
+            )
         if batch_ids.numel() != rows or flat_indices.numel() != rows:
             raise ValueError("boundary token indices must align with retrieved parents")
         if query_geometry.shape != (rows, GEOMETRY_DIM):
@@ -822,10 +853,20 @@ class ChildSemanticDetailVerifier(nn.Module):
 class EncoderParentChildDetailVerifier(nn.Module):
     """End-to-end F3 parent retrieval followed by F2/F1 verification."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        parent_topk: int = PARENT_TOPK,
+        query_chunk_size: int = QUERY_CHUNK_SIZE,
+        temperature: float = 0.07,
+    ) -> None:
         super().__init__()
-        self.parent_retriever = EncoderParentRetriever()
-        self.child_verifier = ChildSemanticDetailVerifier()
+        self.parent_retriever = EncoderParentRetriever(
+            topk=parent_topk,
+            query_chunk_size=query_chunk_size,
+            temperature=temperature,
+        )
+        self.child_verifier = ChildSemanticDetailVerifier(parent_topk=parent_topk)
 
     def forward(
         self,

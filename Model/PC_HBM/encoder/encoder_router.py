@@ -213,7 +213,11 @@ class EncoderPCRouter(nn.Module):
         route_valid = valid_count >= 2
         route_margin = query_route.new_zeros(batch_size)
         if k >= 2:
-            raw_margin = top_scores[:, 0] - top_scores[:, 1]
+            # Confidence is calibrated in cosine-similarity space.  The
+            # temperature-scaled scores remain useful for retrieval attention
+            # and InfoNCE, but applying tau_route a second time here would make
+            # even tiny cosine margins saturate the confidence sigmoid.
+            raw_margin = top_similarities[:, 0] - top_similarities[:, 1]
             route_margin = torch.where(
                 route_valid, raw_margin, torch.zeros_like(raw_margin)
             )
@@ -325,13 +329,19 @@ class EncoderPCRouter(nn.Module):
     ) -> torch.Tensor:
         if probability.ndim != 4 or probability.shape[:2] != (batch_size, 1):
             raise ValueError(f"{name} must be [B,1,H,W], got {tuple(probability.shape)}")
-        if probability.device != device or probability.dtype != dtype:
-            raise ValueError(f"{name} must match projected feature device and dtype")
+        if probability.device != device:
+            raise ValueError(f"{name} must match projected feature device")
+        if not probability.is_floating_point():
+            raise TypeError(f"{name} must use a floating-point dtype")
         if not torch.isfinite(probability).all():
             raise ValueError(f"{name} must be finite")
         detached = probability.detach()
         if detached.numel() and (detached.min() < -1.0e-6 or detached.max() > 1.0 + 1.0e-6):
             raise ValueError(f"{name} must contain probabilities in [0,1]")
+        # CUDA autocast keeps LayerNorm-ended projected tokens in FP32 while
+        # sigmoid heads can emit FP16.  Align without detaching so route
+        # supervision remains differentiable across the AMP boundary.
+        probability = probability.to(dtype=dtype)
         if probability.shape[-2:] != spatial_size:
             probability = F.interpolate(
                 probability,

@@ -436,7 +436,11 @@ def _required_encoder_artifact_meta(checkpoint):
     if not isinstance(metadata, Mapping):
         raise RuntimeError('Encoder-PC model artifact is missing artifact_meta.')
     resolved = dict(metadata)
-    for key in ('producer_fingerprint', 'split_fingerprint'):
+    for key in (
+        'producer_fingerprint',
+        'split_fingerprint',
+        'dino_weight_fingerprint',
+    ):
         value = resolved.get(key)
         if not isinstance(value, str) or not value.strip():
             raise RuntimeError(
@@ -468,6 +472,11 @@ def load_encoder_pc_model_for_inference(source, model, pc_cfg):
             'Encoder-PC model producer fingerprint does not match the loaded '
             'Adapter state.'
         )
+    actual_dino = module_fingerprint(model.dino)
+    if metadata['dino_weight_fingerprint'] != actual_dino:
+        raise RuntimeError(
+            'Encoder-PC model DINO fingerprint does not match the live frozen DINO.'
+        )
     return loaded
 
 
@@ -477,6 +486,7 @@ def load_encoder_pc_memory_for_inference(
     *,
     model_artifact,
     encoder_pc_hbm,
+    dino,
     diagnostic_identity_fallback=False,
 ):
     """Load schema-v3 labeled memory and cross-check it against the model."""
@@ -484,6 +494,15 @@ def load_encoder_pc_memory_for_inference(
     try:
         metadata = _required_encoder_artifact_meta(model_artifact)
         actual_producer = module_fingerprint(encoder_pc_hbm)
+        if not isinstance(dino, torch.nn.Module):
+            raise TypeError('Encoder-PC inference requires the frozen DINO module.')
+        if any(parameter.requires_grad for parameter in dino.parameters()):
+            raise RuntimeError('Encoder-PC inference DINO weights must be frozen.')
+        dino_weight_fingerprint = module_fingerprint(dino)
+        if metadata['dino_weight_fingerprint'] != dino_weight_fingerprint:
+            raise RuntimeError(
+                'Encoder-PC model and live DINO fingerprints differ.'
+            )
         if metadata['producer_fingerprint'] != actual_producer:
             raise RuntimeError(
                 'Encoder-PC model producer fingerprint differs from the live Adapter.'
@@ -499,6 +518,7 @@ def load_encoder_pc_memory_for_inference(
         )
         memory.load_state_dict(state, device='cpu', dtype=torch.float16)
         expected = build_encoder_memory_compat_meta(
+            dino_weight_fingerprint=dino_weight_fingerprint,
             producer_fingerprint=actual_producer,
             labeled_split_fingerprint=metadata['split_fingerprint'],
         )
@@ -597,6 +617,7 @@ if __name__ == '__main__':
             pc_cfg,
             model_artifact=model_artifact,
             encoder_pc_hbm=model.encoder_pc_hbm,
+            dino=model.dino,
             diagnostic_identity_fallback=args.diagnostic_identity_fallback,
         )
     else:

@@ -438,6 +438,9 @@ class EncoderPCHBMTrainer:
     ) -> dict[str, Any]:
         metadata = {
             "split_fingerprint": self.split_state["fingerprint"],
+            "dino_weight_fingerprint": module_fingerprint(
+                self.model_without_ddp.dino
+            ),
             "baseline_fingerprint": str(
                 getattr(self.cfg, "baseline_fingerprint", "unspecified")
             ),

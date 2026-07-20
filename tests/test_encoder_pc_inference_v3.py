@@ -52,6 +52,10 @@ class _TinyRefiner(nn.Module):
 class _ArtifactModel(nn.Module):
     def __init__(self):
         super().__init__()
+        self.dino = nn.Linear(3, 3, bias=False)
+        with torch.no_grad():
+            self.dino.weight.fill_(0.125)
+        self.dino.requires_grad_(False).eval()
         self.encoder_pc_hbm = _TinyAdapter()
         self.decoder = _TinyDecoder()
         self.pseudo_refiner = _TinyRefiner()
@@ -96,6 +100,7 @@ def _memory(producer: str, split: str) -> EncoderPCMemory:
     memory.append(_entry())
     memory.finalize(
         compat_meta=build_encoder_memory_compat_meta(
+            dino_weight_fingerprint=module_fingerprint(_ArtifactModel().dino),
             producer_fingerprint=producer,
             labeled_split_fingerprint=split,
         )
@@ -121,6 +126,7 @@ def _artifact(tmp_path, *, config=None, role="student", design="teacher_student"
         artifact_meta={
             "producer_fingerprint": producer,
             "split_fingerprint": split,
+            "dino_weight_fingerprint": module_fingerprint(source.dino),
         },
     )
     return path, payload, producer, split
@@ -141,6 +147,7 @@ def test_strict_v3_model_and_memory_load_cross_check_fingerprints(tmp_path):
         config,
         model_artifact=artifact,
         encoder_pc_hbm=target.encoder_pc_hbm,
+        dino=target.dino,
     )
 
     assert loaded.is_ready()
@@ -176,6 +183,7 @@ def test_formal_memory_rejects_v1_v2_and_only_diagnostic_mode_falls_back(
             config,
             model_artifact=artifact,
             encoder_pc_hbm=target.encoder_pc_hbm,
+            dino=target.dino,
         )
     with pytest.warns(RuntimeWarning, match="diagnostic identity fallback"):
         assert (
@@ -184,6 +192,7 @@ def test_formal_memory_rejects_v1_v2_and_only_diagnostic_mode_falls_back(
                 config,
                 model_artifact=artifact,
                 encoder_pc_hbm=target.encoder_pc_hbm,
+                dino=target.dino,
                 diagnostic_identity_fallback=True,
             )
             is None
@@ -209,6 +218,7 @@ def test_formal_memory_rejects_producer_and_split_mismatch(tmp_path, mismatch):
             config,
             model_artifact=artifact,
             encoder_pc_hbm=target.encoder_pc_hbm,
+            dino=target.dino,
         )
 
 
@@ -226,6 +236,7 @@ def test_missing_memory_is_formal_error_and_explicit_diagnostic_fallback(tmp_pat
             config,
             model_artifact=artifact,
             encoder_pc_hbm=target.encoder_pc_hbm,
+            dino=target.dino,
         )
     with pytest.warns(RuntimeWarning, match="diagnostic identity fallback"):
         assert (
@@ -234,6 +245,7 @@ def test_missing_memory_is_formal_error_and_explicit_diagnostic_fallback(tmp_pat
                 config,
                 model_artifact=artifact,
                 encoder_pc_hbm=target.encoder_pc_hbm,
+                dino=target.dino,
                 diagnostic_identity_fallback=True,
             )
             is None
@@ -268,6 +280,17 @@ def test_model_loader_recomputes_and_rejects_forged_producer_metadata(tmp_path):
     with pytest.raises(RuntimeError, match="loaded Adapter state"):
         inference_module.load_encoder_pc_model_for_inference(
             forged, _ArtifactModel(), EncoderPCHBMConfig()
+        )
+
+
+def test_model_loader_recomputes_and_rejects_dino_fingerprint(tmp_path):
+    model_path, _, _, _ = _artifact(tmp_path)
+    target = _ArtifactModel()
+    with torch.no_grad():
+        target.dino.weight.add_(0.5)
+    with pytest.raises(RuntimeError, match="DINO fingerprint"):
+        inference_module.load_encoder_pc_model_for_inference(
+            model_path, target, EncoderPCHBMConfig()
         )
 
 

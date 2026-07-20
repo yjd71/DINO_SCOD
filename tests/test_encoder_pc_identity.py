@@ -64,6 +64,7 @@ def _memory(image_count: int = 2, parents_per_image: int = 20) -> EncoderPCMemor
     )
     memory.finalize(
         compat_meta=build_encoder_memory_compat_meta(
+            dino_weight_fingerprint="identity-dino-sha256",
             producer_fingerprint="identity-adapter-sha256",
             labeled_split_fingerprint="identity-split-sha256",
         )

@@ -19,6 +19,7 @@ def _compat(
     split: str = "labeled-split-sha256",
 ) -> dict:
     return build_encoder_memory_compat_meta(
+        dino_weight_fingerprint="memory-test-dino-sha256",
         producer_fingerprint=producer,
         labeled_split_fingerprint=split,
     )

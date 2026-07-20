@@ -64,6 +64,7 @@ def _memory(image_ids: tuple[str, ...], route_keys: torch.Tensor) -> EncoderPCMe
     )
     memory.finalize(
         compat_meta=build_encoder_memory_compat_meta(
+            dino_weight_fingerprint="route-test-dino-sha256",
             producer_fingerprint="route-test-adapter",
             labeled_split_fingerprint="route-test-split",
         )
@@ -97,6 +98,25 @@ def test_route_key_encoder_is_shared_normalized_and_gt_free() -> None:
         torch.testing.assert_close(value.norm(dim=1), torch.ones(2))
     signature = inspect.signature(router.encode_route_key)
     assert all("gt" not in name and "mask" not in name for name in signature.parameters)
+
+
+def test_route_probability_aligns_amp_dtype_without_detaching_gradient() -> None:
+    probability = torch.rand(2, 1, 14, 14, dtype=torch.float32, requires_grad=True)
+
+    aligned = EncoderPCRouter._prepare_probability(
+        probability,
+        batch_size=2,
+        spatial_size=(28, 28),
+        name="coarse_probability",
+        dtype=torch.float16,
+        device=torch.device("cpu"),
+    )
+
+    assert aligned.dtype == torch.float16
+    assert aligned.shape == (2, 1, 28, 28)
+    aligned.float().mean().backward()
+    assert probability.grad is not None
+    assert torch.isfinite(probability.grad).all()
 
 
 def test_unmasked_same_image_infonce_and_masked_retrieval_are_separate() -> None:
@@ -186,6 +206,40 @@ def test_margin_confidence_has_floor_and_does_not_use_route_entropy() -> None:
     torch.testing.assert_close(
         result["route_confidence"], torch.tensor([0.50]), rtol=0.0, atol=1.0e-6
     )
+
+
+def test_margin_confidence_uses_raw_cosine_not_temperature_scaled_score() -> None:
+    query = _unit((0, 1.0))
+    top = _unit((0, 0.80), (1, 0.60))
+    second = _unit((0, 0.76), (1, 0.6499231))
+    memory = _memory(
+        ("self", "top", "second"),
+        torch.stack((query, top, second)),
+    )
+    router = EncoderPCRouter(
+        top_img_k=2,
+        tau_route=0.07,
+        margin_temperature=0.03,
+    )
+    result = router.route(
+        query.unsqueeze(0), memory, query_image_ids=("self",)
+    )
+
+    cosine_margin = result["top_img_similarities"][0, 0] - result[
+        "top_img_similarities"
+    ][0, 1]
+    expected = torch.sigmoid(cosine_margin / 0.03).clamp_min(0.20)
+    scaled_score_confidence = torch.sigmoid(
+        (result["top_img_scores"][0, 0] - result["top_img_scores"][0, 1])
+        / 0.03
+    )
+    torch.testing.assert_close(result["route_margin"][0], cosine_margin)
+    torch.testing.assert_close(result["route_confidence"][0], expected)
+    assert result["route_margin"].item() == pytest.approx(0.04, abs=5.0e-4)
+    assert result["route_confidence"].item() == pytest.approx(
+        torch.sigmoid(torch.tensor(0.04 / 0.03)).item(), abs=2.0e-3
+    )
+    assert not torch.isclose(result["route_confidence"][0], scaled_score_confidence)
 
 
 def test_fewer_than_two_candidates_is_invalid_at_confidence_floor() -> None:

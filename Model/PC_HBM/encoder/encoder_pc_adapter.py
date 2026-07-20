@@ -65,7 +65,11 @@ class EncoderPCHBMAdapter(nn.Module):
             margin_temperature=cfg.route_margin_temperature,
             confidence_floor=cfg.route_confidence_floor,
         )
-        self.verifier = EncoderParentChildDetailVerifier()
+        self.verifier = EncoderParentChildDetailVerifier(
+            parent_topk=cfg.parent_topk,
+            query_chunk_size=cfg.query_chunk_size,
+            temperature=cfg.tau_parent,
+        )
         self.route_context = EncoderRouteContextAdapter(
             cfg.memory_dim,
             num_heads=cfg.attention_heads,
