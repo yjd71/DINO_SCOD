@@ -17,6 +17,7 @@ from .contracts import DinoFeatureBundle, Tensor4
 from .encoder_global_fusion import EncoderBootstrap, EncoderBootstrapOutput
 from .encoder_memory import EncoderPCMemory
 from .encoder_router import EncoderPCRouter
+from .encoder_level_propagation import EncoderLevelPropagation
 from .encoder_feature_injector import (
     EncoderF4F3InjectionOutput,
     EncoderFeatureInjector,
@@ -31,6 +32,8 @@ from .route_context_adapter import (
 class EncoderPCStageFlags:
     enable_f4_f3: bool = True
     f4_f3_progress: float = 1.0
+    enable_f2_f1: bool = True
+    f2_f1_progress: float = 1.0
     require_same_image_positive: bool = False
 
 
@@ -74,6 +77,17 @@ class EncoderPCHBMAdapter(nn.Module):
             max_f4=cfg.max_f4_injection,
             max_f3=cfg.max_f3_injection,
             alpha_init=cfg.injection_alpha_init,
+        )
+        self.propagation = EncoderLevelPropagation(
+            cfg.memory_dim,
+            cfg.encoder_dim,
+            num_heads=cfg.attention_heads,
+            window_size=cfg.propagation_window_size,
+            max_f2=cfg.max_f2_injection,
+            max_f1=cfg.max_f1_injection,
+            alpha_init=cfg.injection_alpha_init,
+            detach_f3_refs=cfg.detach_f3_refs_for_f2,
+            detach_f2_refs=cfg.detach_f2_refs_for_f1,
         )
 
     def forward_memory_features(
@@ -194,6 +208,11 @@ class EncoderPCHBMAdapter(nn.Module):
         uncertainty_tokens = gather_tokens(
             uncertainty_map, batch_ids, flat_indices
         )
+        boundary_confidence_tokens = gather_tokens(
+            bootstrap.boundary_output.boundary_probability,
+            batch_ids,
+            flat_indices,
+        )
         sparse_route_context = route_keys["route_key"].index_select(0, batch_ids)
         sparse_route_confidence = route["route_confidence"].index_select(0, batch_ids)
         context = self.route_context(
@@ -202,6 +221,7 @@ class EncoderPCHBMAdapter(nn.Module):
             route_context=sparse_route_context,
             route_confidence=sparse_route_confidence,
             uncertainty=uncertainty_tokens,
+            boundary_confidence=boundary_confidence_tokens,
             batch_ids=batch_ids,
             flat_indices=flat_indices,
             batch_size=e1.shape[0],
@@ -218,9 +238,25 @@ class EncoderPCHBMAdapter(nn.Module):
             f3_gate_map=context.gate_map,
             progress=progress,
         )
+        propagation = None
+        f1_tokens, f2_tokens = bundle.patch_tokens[:2]
+        if flags.enable_f2_f1:
+            propagation = self.propagation(
+                f1_tokens=f1_tokens,
+                f2_tokens=f2_tokens,
+                e1_map=e1,
+                e2_map=e2,
+                corrected_f3_state=e3 + context.gate_map * context.verified_f3_map,
+                verified_f2_map=context.verified_f2_map,
+                verified_f1_map=context.verified_f1_map,
+                valid2_map=context.valid2_map,
+                valid1_map=context.valid1_map,
+                progress=flags.f2_f1_progress,
+            )
+            f1_tokens, f2_tokens = propagation.f1_tokens, propagation.f2_tokens
         enhanced: Tensor4 = (
-            bundle.patch_tokens[0],
-            bundle.patch_tokens[1],
+            f1_tokens,
+            f2_tokens,
             injection.f3_tokens,
             injection.f4_tokens,
         )
@@ -230,6 +266,7 @@ class EncoderPCHBMAdapter(nn.Module):
                 "verification": verification,
                 "route_context": context,
                 "injection": injection,
+                "propagation": propagation,
                 "C23_map": context.c23_map,
                 "semantic_support_map": context.semantic_support_map,
                 "detail_support_map": context.detail_support_map,

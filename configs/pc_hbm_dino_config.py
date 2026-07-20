@@ -461,6 +461,16 @@ class EncoderPCHBMConfig:
             raise ValueError("route_confidence_floor must be in (0, 1].")
         if self.attention_heads <= 0 or self.memory_dim % self.attention_heads:
             raise ValueError("attention_heads must divide memory_dim.")
+        if self.attention_heads != 8:
+            raise ValueError("Encoder PC-HBM uses exactly 8 attention heads.")
+        if (
+            self.semantic_window_size != 5
+            or self.detail_window_size != 3
+            or self.propagation_window_size != 3
+        ):
+            raise ValueError("Encoder verification/propagation windows are fixed to 5/3/3.")
+        if not self.detach_f3_refs_for_f2 or not self.detach_f2_refs_for_f1:
+            raise ValueError("Encoder hierarchy references must remain detached.")
         if not (
             0 < self.bootstrap_end_epoch < self.parent_end_epoch
             < self.f4_f3_end_epoch < self.hierarchy_end_epoch < self.final_epoch

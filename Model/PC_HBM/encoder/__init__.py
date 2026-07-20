@@ -33,6 +33,7 @@ from .encoder_router import EncoderPCRouter, EncoderRouter
 from .encoder_feature_injector import (
     EncoderF4F3InjectionOutput,
     EncoderFeatureInjector,
+    RouteTokenContextAdapter,
 )
 from .encoder_pc_adapter import (
     EncoderPCAdapter,
@@ -40,10 +41,16 @@ from .encoder_pc_adapter import (
     EncoderPCHBMAdapter,
     EncoderPCStageFlags,
 )
+from .encoder_level_propagation import (
+    EncoderLevelPropagation,
+    EncoderPropagationOutput,
+    SameGridLocalCrossAttention,
+)
 from .feature_projector import DinoFeatureProjector, ProjectedDinoFeatures
 from .route_context_adapter import (
     EncoderRouteContextAdapter,
     EncoderRouteContextOutput,
+    EncoderStructuredGate,
     scatter_query_tokens,
 )
 
@@ -70,12 +77,17 @@ __all__ = [
     "EncoderRouter",
     "EncoderF4F3InjectionOutput",
     "EncoderFeatureInjector",
+    "RouteTokenContextAdapter",
     "EncoderPCAdapter",
     "EncoderPCAdapterOutput",
     "EncoderPCHBMAdapter",
     "EncoderPCStageFlags",
+    "EncoderLevelPropagation",
+    "EncoderPropagationOutput",
+    "SameGridLocalCrossAttention",
     "EncoderRouteContextAdapter",
     "EncoderRouteContextOutput",
+    "EncoderStructuredGate",
     "scatter_query_tokens",
     "ChildSemanticDetailVerifier",
     "EncoderParentChildDetailVerifier",
