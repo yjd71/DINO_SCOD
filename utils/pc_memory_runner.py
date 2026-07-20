@@ -10,6 +10,11 @@ import torch
 from torch import nn
 from torch.utils.data import DistributedSampler, RandomSampler
 
+from Model.PC_HBM.encoder.encoder_memory import (
+    build_encoder_memory_compat_meta as _build_encoder_memory_compat_meta,
+)
+from Model.PC_HBM.encoder.encoder_memory_builder import EncoderMemoryBuilder
+from utils.checkpoint_pc_hbm import compute_labeled_split_fingerprint
 from utils.dataloader import build_labeled_memory_loader
 
 
@@ -177,6 +182,123 @@ def rebuild_memory(
     return memory
 
 
+@torch.inference_mode()
+def rebuild_encoder_memory(
+    model: nn.Module,
+    memory_adapter: nn.Module,
+    memory_loader,
+    memory,
+    device: torch.device | str,
+    *,
+    config: Any | None = None,
+    compat_meta: Mapping[str, Any] | None = None,
+    use_amp: bool = True,
+):
+    """Rebuild schema-v3 memory from raw DINO bundles and an EMA Adapter only.
+
+    This API intentionally has no Decoder argument. GT is passed only to the
+    tensor-only entry builder after the Adapter has produced every route and
+    retrieval key from the unenhanced DINO feature bundle.
+    """
+
+    device = torch.device(device)
+    _validate_memory_loader(memory_loader)
+    feature_model = _unwrap_module(model)
+    extract_bundle = getattr(feature_model, "extract_feature_bundle", None)
+    if not callable(extract_bundle):
+        raise AttributeError(
+            "Encoder memory rebuild model must provide extract_feature_bundle(images)"
+        )
+    adapter = _unwrap_module(memory_adapter)
+    forward_memory_features = getattr(adapter, "forward_memory_features", None)
+    if not callable(forward_memory_features):
+        raise AttributeError(
+            "memory_adapter must provide forward_memory_features(raw_bundle)"
+        )
+    if config is not None:
+        if str(getattr(config, "memory_source", "labeled_only")) != "labeled_only":
+            raise ValueError("Encoder memory rebuild only accepts labeled_only configuration")
+        if bool(getattr(config, "use_unlabeled_memory_update", False)):
+            raise ValueError("Unlabeled pseudo labels cannot update encoder PC-HBM memory")
+        if int(getattr(config, "memory_schema_version", 3)) != 3:
+            raise ValueError("Encoder memory rebuild requires schema v3")
+        if str(getattr(config, "memory_device", "cpu")) != "cpu":
+            raise ValueError("Encoder memory rebuild storage device must be CPU")
+        storage_dtype = str(getattr(config, "memory_storage_dtype", "float16"))
+        if storage_dtype.lower().replace("torch.", "") not in {"float16", "fp16", "half"}:
+            raise ValueError("Encoder memory rebuild storage dtype must be float16")
+    entry_builder = EncoderMemoryBuilder(config)
+
+    memory.clear()
+    adapter.eval()
+    seen_ids: set[str] = set()
+    ordered_ids: list[str] = []
+    for batch in memory_loader:
+        image_ids, images, gts = unpack_memory_batch(batch)
+        duplicate = seen_ids.intersection(image_ids)
+        if duplicate:
+            raise ValueError(
+                f"Memory loader repeated stable image ids: {sorted(duplicate)[:5]}"
+            )
+        seen_ids.update(image_ids)
+        ordered_ids.extend(image_ids)
+        images = images.to(device=device, non_blocking=True)
+        gts = gts.to(device=device, non_blocking=True)
+        amp_enabled = bool(use_amp and device.type == "cuda")
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=amp_enabled,
+        ):
+            raw_bundle = extract_bundle(images)
+            memory_features = forward_memory_features(raw_bundle)
+            if not isinstance(memory_features, Mapping):
+                raise TypeError("forward_memory_features must return a mapping")
+            entries = entry_builder(
+                features=memory_features,
+                gt=gts,
+                image_ids=image_ids,
+            )
+        if not isinstance(entries, Mapping):
+            raise TypeError("Encoder memory entry builder must return a mapping")
+        memory.append(entries)
+
+    if not seen_ids:
+        raise RuntimeError("Cannot finalize an empty encoder PC-HBM labeled memory")
+    producer_fingerprint = module_fingerprint(adapter)
+    split_fingerprint = compute_labeled_split_fingerprint(ordered_ids)
+    generated_meta = _build_encoder_memory_compat_meta(
+        producer_fingerprint=producer_fingerprint,
+        labeled_split_fingerprint=split_fingerprint,
+    )
+    generated_meta.update(
+        {
+            "producer_source": "ema_encoder_adapter",
+            "labeled_image_count": len(seen_ids),
+        }
+    )
+    if compat_meta:
+        for key, value in compat_meta.items():
+            if key in generated_meta and not _compat_values_equal(generated_meta[key], value):
+                raise ValueError(
+                    f"Encoder memory compatibility metadata conflicts with rebuilt {key}"
+                )
+            generated_meta[key] = value
+    memory.finalize(
+        device=torch.device("cpu"),
+        dtype=torch.float16,
+        compat_meta=generated_meta,
+    )
+    if not memory.is_ready():
+        raise RuntimeError("Encoder PC-HBM memory did not become ready after finalize")
+    compatible = memory.validate_compat(generated_meta)
+    if not compatible:
+        raise RuntimeError(
+            f"Rebuilt encoder PC-HBM memory is incompatible: {compatible.reason}"
+        )
+    return memory
+
+
 def _validate_memory_loader(memory_loader) -> None:
     if bool(getattr(memory_loader, "drop_last", False)):
         raise ValueError("Memory loader must use drop_last=False")
@@ -189,6 +311,18 @@ def _validate_memory_loader(memory_loader) -> None:
 
 def _unwrap_module(module: nn.Module) -> nn.Module:
     return module.module if hasattr(module, "module") else module
+
+
+def _compat_values_equal(left: Any, right: Any) -> bool:
+    if isinstance(left, (tuple, list)) and isinstance(right, (tuple, list)):
+        return len(left) == len(right) and all(
+            _compat_values_equal(a, b) for a, b in zip(left, right)
+        )
+    if isinstance(left, Mapping) and isinstance(right, Mapping):
+        return set(left) == set(right) and all(
+            _compat_values_equal(left[key], right[key]) for key in left
+        )
+    return left == right
 
 
 # Public alias used by training entry points.

@@ -20,6 +20,7 @@ from .encoder_memory import (
     build_encoder_memory_compat_meta,
 )
 from .feature_projector import DinoFeatureProjector, ProjectedDinoFeatures
+from .encoder_memory_builder import EncoderMemoryBuilder
 
 __all__ = [
     "DinoFeatureBundle",
@@ -38,6 +39,7 @@ __all__ = [
     "ENCODER_PC_STATIC_COMPAT_KEYS",
     "ENCODER_PC_STATIC_COMPAT_META",
     "EncoderMemoryCompatibilityResult",
+    "EncoderMemoryBuilder",
     "EncoderPCMemory",
     "build_encoder_memory_compat_meta",
 ]
