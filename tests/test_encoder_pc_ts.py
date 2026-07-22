@@ -327,15 +327,23 @@ class _CountingSGD(torch.optim.SGD):
 class _Scheduler:
     def __init__(self):
         self.steps = 0
+        self.T_max = 30
+        self.eta_min = 1.0e-7
 
     def step(self):
         self.steps += 1
 
     def state_dict(self):
-        return {"steps": self.steps}
+        return {
+            "steps": self.steps,
+            "T_max": self.T_max,
+            "eta_min": self.eta_min,
+        }
 
     def load_state_dict(self, state):
         self.steps = state["steps"]
+        self.T_max = state["T_max"]
+        self.eta_min = state["eta_min"]
 
 
 class _TinyTS(nn.Module):
@@ -382,7 +390,13 @@ class _TinyTS(nn.Module):
         raise AssertionError(branch)
 
 
-def _trainer_fixture(monkeypatch, tmp_path, *, base_split=None):
+def _trainer_fixture(
+    monkeypatch,
+    tmp_path,
+    *,
+    base_split=None,
+    use_default_scheduler=False,
+):
     keys = ("image",)
     split = compute_labeled_split_fingerprint(keys)
     core = _TinyTS(split if base_split is None else base_split)
@@ -457,7 +471,7 @@ def _trainer_fixture(monkeypatch, tmp_path, *, base_split=None):
         unlabeled_loader=unlabeled,
         memory_loader=_MemoryLoader(keys),
         optimizer=optimizer,
-        scheduler=_Scheduler(),
+        scheduler=None if use_default_scheduler else _Scheduler(),
         memory_rebuild_fn=rebuild,
     )
     return trainer, core, memory, rebuild_calls
@@ -478,6 +492,19 @@ def test_encoder_ts_trainer_uses_sequential_backwards_one_step_and_teacher_memor
     assert rebuild_calls[0][5]["producer_source"] == "ema_teacher_adapter"
     assert "loss" in metrics
     assert all(parameter.grad is None for parameter in core.dino.parameters())
+
+
+def test_encoder_ts_default_scheduler_keeps_fixed_30_epoch_period(
+    monkeypatch, tmp_path
+):
+    trainer, _core, _memory, _calls = _trainer_fixture(
+        monkeypatch,
+        tmp_path,
+        use_default_scheduler=True,
+    )
+
+    assert trainer.scheduler.T_max == 30
+    assert trainer.scheduler.eta_min == pytest.approx(1.0e-7)
 
 
 def test_encoder_ts_trainer_rejects_base_split_mismatch(monkeypatch, tmp_path):
@@ -529,6 +556,19 @@ def test_encoder_ts_resume_restores_student_and_all_three_teacher_modules(
     assert captured["expected_model_role"] == "student"
     assert captured["expected_training_design"] == "teacher_student"
     assert trainer.current_epoch == 5
+
+
+def test_encoder_ts_resume_rejects_old_t_max_15_scheduler(monkeypatch, tmp_path):
+    trainer, _core, _memory, _calls = _trainer_fixture(monkeypatch, tmp_path)
+
+    def load(_path, **kwargs):
+        kwargs["scheduler"].T_max = 15
+        return {"epoch": 4, "stage_state": {"name": "full", "ts_epoch": 4}}
+
+    monkeypatch.setattr(trainer_module, "load_encoder_pc_training_resume", load)
+
+    with pytest.raises(RuntimeError, match="expected 30, got 15"):
+        trainer.resume("old-t-max-15-resume.pth", restore_rng=False)
 
 
 def test_encoder_ts_final_memory_is_rebuilt_from_online_student_and_fingerprinted(

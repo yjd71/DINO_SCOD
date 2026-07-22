@@ -9,7 +9,6 @@ from typing import Any
 
 import torch
 from torch import nn
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm import tqdm
 
@@ -47,6 +46,10 @@ from utils.distributed import (
 from utils.pc_memory_runner import (
     module_fingerprint,
     rebuild_encoder_memory,
+)
+from utils.ts_lr_scheduler import (
+    build_ts_cosine_scheduler,
+    validate_ts_scheduler_contract,
 )
 
 
@@ -99,11 +102,8 @@ class EncoderPCTSTrainer:
             self.core_model.student_pseudo_refiner,
             decoder_warm_started=True,
         )
-        self.scheduler = scheduler or CosineAnnealingLR(
-            self.optimizer,
-            T_max=max(1, int(getattr(cfg, "epochs", 15))),
-            eta_min=float(getattr(cfg, "min_lr", 1.0e-6)),
-        )
+        self.scheduler = scheduler or build_ts_cosine_scheduler(self.optimizer, cfg)
+        validate_ts_scheduler_contract(self.scheduler, cfg)
         self.amp_enabled = bool(
             getattr(cfg, "use_amp", True) and self.device.type == "cuda"
         )
@@ -563,6 +563,7 @@ class EncoderPCTSTrainer:
             expected_memory_profile=self.memory_profile,
             expected_artifact_meta=self._artifact_meta(),
         )
+        validate_ts_scheduler_contract(self.scheduler, self.cfg)
         stage_state = checkpoint.get("stage_state")
         if not isinstance(stage_state, Mapping):
             raise RuntimeError("encoder_pc TS resume is missing full stage state")

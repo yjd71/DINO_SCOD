@@ -51,6 +51,10 @@ from utils.distributed import (
 )
 from utils.logging_utils import current_time
 from utils.pc_memory_runner import build_memory_compat_meta, module_fingerprint, rebuild_memory
+from utils.ts_lr_scheduler import (
+    build_ts_cosine_scheduler,
+    validate_ts_scheduler_contract,
+)
 
 
 def _current_local_timestamp() -> str:
@@ -116,11 +120,8 @@ class PCHBMPseudoTrainer:
             lr=float(cfg.learning_rate),
             weight_decay=float(cfg.weight_decay),
         )
-        self.scheduler = scheduler or optim.lr_scheduler.CosineAnnealingLR(
-            self.optimizer,
-            T_max=max(1, int(cfg.epochs)),
-            eta_min=float(cfg.min_lr),
-        )
+        self.scheduler = scheduler or build_ts_cosine_scheduler(self.optimizer, cfg)
+        validate_ts_scheduler_contract(self.scheduler, cfg)
         self.amp_enabled = bool(
             getattr(pc_cfg, "use_amp", True) and self.device.type == "cuda"
         )
@@ -244,6 +245,7 @@ class PCHBMPseudoTrainer:
                 restore_rng=True,
                 expected_artifact_meta=self._artifact_metadata("resume"),
             )
+            validate_ts_scheduler_contract(self.scheduler, cfg)
             self._validate_resume_config(checkpoint.get("pc_cfg"))
             self.current_epoch = int(checkpoint["epoch"]) + 1
         self._freeze_teacher()

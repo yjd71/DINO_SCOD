@@ -61,6 +61,9 @@ class Config():
         ''' LR Scheduler '''
         self.learning_rate = 1e-4
         self.min_lr = 1e-7
+        # Keep the first 15 TS epochs on the original 30-epoch cosine curve.
+        # This period is intentionally independent of ``self.epochs``.
+        self.scheduler_t_max = 30
 
         ''' logging '''
         self.log_interval = 50

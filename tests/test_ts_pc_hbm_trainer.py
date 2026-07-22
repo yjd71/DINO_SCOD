@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
+from configs.ts_model_config import Config
 import utils.distributed as distributed
 import utils.trainer_ts_model_pseudo_pc_hbm as ts_trainer
 from utils.trainer_ts_model_pseudo_pc_hbm import (
@@ -15,6 +16,10 @@ from utils.trainer_ts_model_pseudo_pc_hbm import (
 import Model.ts_model as ts_model_module
 import train_ts_model_pseudo_pc_hbm as ts_entrypoint
 from train_ts_model_pseudo_pc_hbm import parse_args, validate_training_args
+from utils.ts_lr_scheduler import (
+    build_ts_cosine_scheduler,
+    validate_ts_scheduler_contract,
+)
 
 
 class _TinyTeacherStudent(nn.Module):
@@ -551,3 +556,141 @@ def test_ts_cli_enables_unused_parameter_discovery_for_every_design(
 
     assert wrap_calls == [(model, context, True)]
     assert train_calls == [training_design]
+
+
+def test_ts_config_keeps_15_epochs_on_fixed_30_epoch_cosine_period():
+    cfg = Config()
+
+    assert cfg.epochs == 15
+    assert cfg.learning_rate == pytest.approx(1.0e-4)
+    assert cfg.min_lr == pytest.approx(1.0e-7)
+    assert cfg.scheduler_t_max == 30
+
+
+def test_decoder_ts_default_scheduler_keeps_fixed_30_epoch_period(monkeypatch):
+    class TinyDecoder(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = nn.Parameter(torch.tensor(0.0))
+            self.pc_hbm = nn.Identity()
+
+    class StopAfterScheduler(RuntimeError):
+        pass
+
+    model = SimpleNamespace(
+        pc_cfg=object(),
+        teacher=TinyDecoder(),
+        student=TinyDecoder(),
+    )
+    cfg = SimpleNamespace(
+        pc_training_design="joint",
+        distributed=False,
+        device="cpu",
+        l_batch_size=32,
+        u_batch_size=32,
+        learning_rate=1.0e-4,
+        weight_decay=0.0,
+        epochs=15,
+        min_lr=1.0e-7,
+        scheduler_t_max=30,
+    )
+    captured = {}
+    real_validate = validate_ts_scheduler_contract
+
+    monkeypatch.setattr(
+        ts_trainer,
+        "trainable_parameter_groups",
+        lambda decoder, **_kwargs: decoder.parameters(),
+    )
+
+    def capture_scheduler(scheduler, config):
+        real_validate(scheduler, config)
+        captured["scheduler"] = scheduler
+
+    monkeypatch.setattr(
+        ts_trainer,
+        "validate_ts_scheduler_contract",
+        capture_scheduler,
+    )
+    monkeypatch.setattr(
+        ts_trainer.torch.amp,
+        "GradScaler",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(StopAfterScheduler()),
+    )
+
+    with pytest.raises(StopAfterScheduler):
+        PCHBMPseudoTrainer(model, cfg, SimpleNamespace(use_amp=False))
+
+    assert captured["scheduler"].T_max == 30
+    assert captured["scheduler"].eta_min == pytest.approx(1.0e-7)
+
+
+def test_ts_cosine_schedule_matches_original_epoch_13_trajectory():
+    cfg = Config()
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    optimizer = torch.optim.Adam([parameter], lr=cfg.learning_rate)
+    scheduler = build_ts_cosine_scheduler(optimizer, cfg)
+    used_lrs = []
+    logged_lrs = []
+
+    for _epoch in range(1, cfg.epochs + 1):
+        used_lrs.append(optimizer.param_groups[0]["lr"])
+        optimizer.step()
+        scheduler.step()
+        logged_lrs.append(optimizer.param_groups[0]["lr"])
+
+    assert scheduler.T_max == 30
+    assert logged_lrs[11] == pytest.approx(6.5485398869e-5)
+    assert used_lrs[12] == pytest.approx(6.5485398869e-5)
+    assert logged_lrs[12] == pytest.approx(6.04351889563e-5)
+    assert logged_lrs[14] == pytest.approx(5.005e-5)
+
+
+def test_ts_scheduler_contract_accepts_t_max_30():
+    cfg = Config()
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    optimizer = torch.optim.Adam([parameter], lr=cfg.learning_rate)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=30,
+        eta_min=cfg.min_lr,
+    )
+
+    validate_ts_scheduler_contract(scheduler, cfg)
+
+
+def test_ts_scheduler_contract_rejects_old_t_max_15_resume():
+    cfg = Config()
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    optimizer = torch.optim.Adam([parameter], lr=cfg.learning_rate)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=15,
+        eta_min=cfg.min_lr,
+    )
+
+    with pytest.raises(RuntimeError, match="expected 30, got 15"):
+        validate_ts_scheduler_contract(scheduler, cfg)
+
+
+def test_ts_scheduler_contract_rejects_changed_min_lr_resume():
+    cfg = Config()
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    optimizer = torch.optim.Adam([parameter], lr=cfg.learning_rate)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=30,
+        eta_min=1.0e-6,
+    )
+
+    with pytest.raises(RuntimeError, match="eta_min mismatch"):
+        validate_ts_scheduler_contract(scheduler, cfg)
+
+
+def test_ts_scheduler_t_max_cannot_be_rebound_to_epochs():
+    cfg = SimpleNamespace(epochs=15, scheduler_t_max=15, min_lr=1.0e-7)
+    parameter = torch.nn.Parameter(torch.tensor(0.0))
+    optimizer = torch.optim.Adam([parameter], lr=1.0e-4)
+
+    with pytest.raises(ValueError, match="scheduler_t_max=30"):
+        build_ts_cosine_scheduler(optimizer, cfg)
