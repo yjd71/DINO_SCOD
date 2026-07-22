@@ -41,21 +41,7 @@ SCHEMA_V2_COMPAT_KEYS = (
     "geometry_dim",
     "storage_dtype",
     "source",
-    "gbe_version",
-    "gbe_normalization",
-    "gbe_padding_mode",
-    "gpm_dilations",
-    "gpm_contract",
-    "f4_adapter_contract",
-    "ode_contract",
-    "rcab_reduction",
-    "bgfbr_stage_count",
-    "fg_bg_contract",
     "boundary_feature_channels",
-    "use_gbe",
-    "use_ode",
-    "use_rcab",
-    "use_pc_boundary_context",
     "sync_bn",
 )
 SCHEMA_V2_REQUIRED_MEMORY_KEYS = (*SCHEMA_V2_COMPAT_KEYS, "producer_fingerprint")
@@ -70,6 +56,7 @@ class PCMemory:
 
     FORMAT_VERSION = 1
     DEFAULT_SCHEMA_VERSION = 2
+    DEFAULT_ARCHITECTURE = "DINO_SCOD_PC_HBM"
 
     def __init__(
         self,
@@ -554,6 +541,30 @@ class PCMemory:
             raise RuntimeError(
                 f"Unsupported PC-HBM memory schema v{declared_schema}; "
                 "schema v1 cannot be migrated and the labeled memory must be rebuilt"
+            )
+        architecture_values = {
+            str(value)
+            for value in (
+                outer.get("architecture"),
+                state.get("architecture"),
+                outer_meta.get("architecture"),
+                inner_meta.get("architecture"),
+            )
+            if value is not None
+        }
+        if len(architecture_values) > 1:
+            raise RuntimeError(
+                "Conflicting PC-HBM memory architecture declarations: "
+                f"{sorted(architecture_values)}"
+            )
+        declared_architecture = next(iter(architecture_values), None)
+        if (
+            declared_architecture is not None
+            and declared_architecture != self.DEFAULT_ARCHITECTURE
+        ):
+            raise RuntimeError(
+                f"Unsupported PC-HBM memory architecture {declared_architecture!r}; "
+                "the labeled memory must be rebuilt for the original Decoder"
             )
         self.compat_meta.update(outer_meta)
         self.compat_meta.update(inner_meta)

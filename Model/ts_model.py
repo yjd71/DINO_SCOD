@@ -2,8 +2,7 @@ import torch
 import torch.nn as nn
 import warnings
 from collections.abc import Mapping
-from Model.BGFBR import ImageNetRGBAdapter
-from Model.decoder import build_decoder, resolve_decoder_arch
+from Model.decoder import Decoder
 from configs.pc_hbm_dino_config import EncoderPCHBMConfig
 from Model.PC_HBM.encoder import (
     DinoFeatureBundle,
@@ -53,7 +52,16 @@ class TSModel(nn.Module):
         self.dino.eval()
         
         self.pc_cfg = pc_cfg
-        self.decoder_arch = resolve_decoder_arch(decoder_arch, pc_cfg)
+        self.pc_enabled = bool(getattr(pc_cfg, 'enabled', True))
+        configured_decoder_arch = decoder_arch
+        if configured_decoder_arch is None and pc_cfg is not None:
+            configured_decoder_arch = getattr(pc_cfg, 'decoder_arch', None)
+        self.decoder_arch = str(configured_decoder_arch or Decoder.decoder_arch)
+        if self.decoder_arch != Decoder.decoder_arch:
+            raise ValueError(
+                f'Unsupported decoder_arch={self.decoder_arch!r}; only the '
+                f'original {Decoder.decoder_arch!r} Decoder is available.'
+            )
         self.pc_placement = str(getattr(pc_cfg, 'pc_placement', 'decoder'))
         if self.pc_placement not in {'decoder', 'encoder'}:
             raise ValueError(
@@ -62,23 +70,24 @@ class TSModel(nn.Module):
             )
         self.allow_legacy_pc_init = allow_legacy_pc_init
         self.training_design = training_design
-        self.rgb_adapter = ImageNetRGBAdapter()
-        self.teacher = build_decoder(
-            self.decoder_arch,
-            pc_cfg=pc_cfg,
-            attach_pc=self.pc_placement == 'decoder',
+        teacher_pc_cfg = (
+            pc_cfg
+            if self.pc_enabled and self.pc_placement == 'decoder'
+            else None
         )
-        self.student = build_decoder(
-            self.decoder_arch,
-            pc_cfg=pc_cfg,
-            attach_pc=(
-                self.pc_placement == 'decoder'
-                and training_design != 'teacher_only'
-            ),
+        student_pc_cfg = (
+            pc_cfg
+            if self.pc_enabled
+            and self.pc_placement == 'decoder'
+            and training_design != 'teacher_only'
+            else None
         )
+        self.teacher = Decoder(pc_cfg=teacher_pc_cfg)
+        self.student = Decoder(pc_cfg=student_pc_cfg)
 
         self.encoder_pc_profile_v3 = (
-            self.pc_placement == 'encoder'
+            self.pc_enabled
+            and self.pc_placement == 'encoder'
             and isinstance(pc_cfg, EncoderPCHBMConfig)
         )
         self.teacher_encoder_pc_hbm = None
@@ -191,20 +200,14 @@ class TSModel(nn.Module):
     def _extract_features(self, x):
         return self.extract_features(x)
 
-    def prepare_rgb(self, x):
-        """Invert ImageNet normalization once for all TS decoder branches."""
-
-        return self.rgb_adapter(x)
-
     @torch.inference_mode()
-    def teacher_pseudo(self, features, memory, epoch, image_rgb=None):
+    def teacher_pseudo(self, features, memory, epoch):
         if getattr(self, 'encoder_pc_profile_v3', False):
             if not isinstance(features, DinoFeatureBundle):
                 raise TypeError('encoder_pc teacher_pseudo requires DinoFeatureBundle.')
             payload = self.teacher_encoder_pc_head(
                 role='teacher_pseudo',
                 bundle=features,
-                image_rgb=image_rgb,
                 memory=memory,
                 stage=self._encoder_full_stage(require_same_image_positive=False),
                 epoch=epoch,
@@ -220,7 +223,6 @@ class TSModel(nn.Module):
         if getattr(self, 'pc_placement', 'decoder') == 'encoder':
             _, aux = self.teacher(
                 features,
-                image_rgb=image_rgb,
                 memory=None,
                 pc_mode='off',
                 return_aux=True,
@@ -228,7 +230,6 @@ class TSModel(nn.Module):
             return aux
         _, aux = self.teacher(
             features,
-            image_rgb=image_rgb,
             memory=memory,
             pc_mode='teacher_pseudo',
             epoch=epoch,
@@ -266,7 +267,7 @@ class TSModel(nn.Module):
         return aux
 
     def student_labeled(
-        self, features, memory, epoch, query_image_ids=None, image_rgb=None
+        self, features, memory, epoch, query_image_ids=None
     ):
         if self.encoder_pc_profile_v3:
             if not isinstance(features, DinoFeatureBundle):
@@ -274,7 +275,6 @@ class TSModel(nn.Module):
             core = self.student_encoder_pc_head(
                 role='labeled_core',
                 bundle=features,
-                image_rgb=image_rgb,
                 memory=memory,
                 mode='full',
                 stage=self._encoder_full_stage(require_same_image_positive=True),
@@ -296,18 +296,16 @@ class TSModel(nn.Module):
         if getattr(self, 'pc_placement', 'decoder') == 'encoder':
             return self.student(
                 features,
-                image_rgb=image_rgb,
                 memory=None,
                 pc_mode='off',
                 return_aux=True,
             )
         if self.training_design == 'teacher_only':
             return self.student(
-                features, image_rgb=image_rgb, pc_mode='off', return_aux=True
+                features, pc_mode='off', return_aux=True
             )
         return self.student(
             features,
-            image_rgb=image_rgb,
             memory=memory,
             pc_mode='full',
             epoch=epoch,
@@ -315,14 +313,13 @@ class TSModel(nn.Module):
             query_image_ids=query_image_ids,
         )
 
-    def student_unlabeled(self, features, memory, epoch, image_rgb=None):
+    def student_unlabeled(self, features, memory, epoch):
         if self.encoder_pc_profile_v3:
             if not isinstance(features, DinoFeatureBundle):
                 raise TypeError('encoder_pc student_unlabeled requires DinoFeatureBundle.')
             core = self.student_encoder_pc_head(
                 role='student_core',
                 bundle=features,
-                image_rgb=image_rgb,
                 memory=memory,
                 stage=self._encoder_full_stage(require_same_image_positive=False),
                 epoch=epoch,
@@ -338,18 +335,16 @@ class TSModel(nn.Module):
         if getattr(self, 'pc_placement', 'decoder') == 'encoder':
             return self.student(
                 features,
-                image_rgb=image_rgb,
                 memory=None,
                 pc_mode='off',
                 return_aux=True,
             )
         if self.training_design == 'teacher_only':
             return self.student(
-                features, image_rgb=image_rgb, pc_mode='off', return_aux=True
+                features, pc_mode='off', return_aux=True
             )
         return self.student(
             features,
-            image_rgb=image_rgb,
             memory=memory,
             pc_mode='student_core',
             epoch=epoch,
@@ -366,7 +361,6 @@ class TSModel(nn.Module):
         memory=None,
         epoch=None,
         query_image_ids=None,
-        image_rgb=None,
     ):
         if branch is not None:
             if features is None:
@@ -377,12 +371,9 @@ class TSModel(nn.Module):
                     memory,
                     epoch,
                     query_image_ids=query_image_ids,
-                    image_rgb=image_rgb,
                 )
             if branch == 'student_unlabeled':
-                return self.student_unlabeled(
-                    features, memory, epoch, image_rgb=image_rgb
-                )
+                return self.student_unlabeled(features, memory, epoch)
             raise ValueError(f'Unsupported TS forward branch: {branch!r}.')
 
         if getattr(self, 'encoder_pc_profile_v3', False):
@@ -396,44 +387,38 @@ class TSModel(nn.Module):
             raise ValueError('Legacy TS forward requires both l_x and u_x.')
         l_x_features = self.extract_features(l_x)
         u_x_features = self.extract_features(u_x)
-        l_rgb = self.prepare_rgb(l_x)
-        u_rgb = self.prepare_rgb(u_x)
         with torch.no_grad():
             teacher_label = torch.sigmoid(
-                self.teacher(u_x_features, image_rgb=u_rgb, pc_mode='off')[3].detach()
+                self.teacher(u_x_features, pc_mode='off')[3].detach()
             )
-        l_segs = list(self.student(l_x_features, image_rgb=l_rgb, pc_mode='off'))
-        u_segs = list(self.student(u_x_features, image_rgb=u_rgb, pc_mode='off'))
+        l_segs = list(self.student(l_x_features, pc_mode='off'))
+        u_segs = list(self.student(u_x_features, pc_mode='off'))
         return l_segs, u_segs, teacher_label
 
     
     def inference(self, x, memory=None, epoch=None):
         if self.encoder_pc_profile_v3:
             bundle = self.extract_feature_bundle(x)
-            image_rgb = self.prepare_rgb(x)
             return self.student_encoder_pc_head(
                 role='inference',
                 bundle=bundle,
-                image_rgb=image_rgb,
                 memory=memory,
                 stage=self._encoder_full_stage(require_same_image_positive=False),
                 epoch=epoch,
                 return_aux=False,
             )
         x_features = self.extract_features(x)
-        image_rgb = self.prepare_rgb(x)
         if self.training_design == 'teacher_only' or self.student.pc_hbm is None:
-            return self.student(x_features, image_rgb=image_rgb, pc_mode='off')[3]
+            return self.student(x_features, pc_mode='off')[3]
         if memory is None:
             warnings.warn(
                 'PC-HBM memory is missing; using z_main logits.',
                 RuntimeWarning,
                 stacklevel=2,
             )
-            return self.student(x_features, image_rgb=image_rgb, pc_mode='off')[3]
+            return self.student(x_features, pc_mode='off')[3]
         _, aux = self.student(
             x_features,
-            image_rgb=image_rgb,
             memory=memory,
             pc_mode='full',
             epoch=epoch,

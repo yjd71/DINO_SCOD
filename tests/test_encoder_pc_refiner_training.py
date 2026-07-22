@@ -16,7 +16,7 @@ class _ReadyMemory:
 
 
 class _TinyDecoder(nn.Module):
-    decoder_arch = "bgfbr_pc_v1"
+    decoder_arch = "legacy_transformer"
     pc_hbm = None
 
     def __init__(self) -> None:

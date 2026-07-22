@@ -375,11 +375,9 @@ class EncoderPCTSTrainer:
             # Labeled: full core supervision plus a detached refiner graph.
             with self._autocast():
                 l_bundle = self.core_model.extract_feature_bundle(l_imgs)
-                l_rgb = self.core_model.prepare_rgb(l_imgs)
                 l_outputs, l_aux = self.model(
                     branch="student_labeled",
                     features=l_bundle,
-                    image_rgb=l_rgb,
                     memory=self.memory,
                     epoch=self.pc_cfg.final_epoch + epoch,
                     query_image_ids=list(l_image_ids),
@@ -400,21 +398,19 @@ class EncoderPCTSTrainer:
             for name, value in {**l_terms, **refiner_terms}.items():
                 if torch.is_tensor(value) and value.numel() == 1:
                     totals[name] += float(value.detach())
-            del l_bundle, l_rgb, l_outputs, l_aux, l_gt, l_imgs, l_loss
+            del l_bundle, l_outputs, l_aux, l_gt, l_imgs, l_loss
             del l_core_loss, l_refiner_loss, l_terms, refiner_terms, l_image_ids
 
             # Unlabeled: EMA Teacher refines; Student stays on z_core and never
             # executes its refiner.
             with self._autocast():
                 u_bundle = self.core_model.extract_feature_bundle(u_imgs)
-                u_rgb = self.core_model.prepare_rgb(u_imgs)
             with torch.inference_mode():
                 with self._autocast():
                     teacher_payload = self.core_model.teacher_pseudo(
                         u_bundle,
                         self.memory,
                         self.pc_cfg.final_epoch + epoch,
-                        image_rgb=u_rgb,
                     )
             pseudo = prepare_encoder_pc_pseudo_targets(teacher_payload, self.pc_cfg)
             del teacher_payload
@@ -422,7 +418,6 @@ class EncoderPCTSTrainer:
                 u_outputs, u_aux = self.model(
                     branch="student_unlabeled",
                     features=u_bundle,
-                    image_rgb=u_rgb,
                     memory=self.memory,
                     epoch=self.pc_cfg.final_epoch + epoch,
                 )
@@ -466,7 +461,7 @@ class EncoderPCTSTrainer:
                 loss=f"{l_loss_value + u_loss_value:.4f}",
                 conf=f"{float(u_terms['pseudo_conf_mean']):.3e}",
             )
-            del u_bundle, u_rgb, u_outputs, u_aux, pseudo, u_loss, u_terms, u_imgs
+            del u_bundle, u_outputs, u_aux, pseudo, u_loss, u_terms, u_imgs
 
         if steps == 0:
             raise RuntimeError("encoder_pc TS epoch completed without optimizer steps")

@@ -271,6 +271,8 @@ def test_ts_model_teacher_only_uses_raw_student_off_paths(monkeypatch):
             return None
 
     class FakeDecoder(nn.Module):
+        decoder_arch = "legacy_transformer"
+
         def __init__(self, pc_cfg=None):
             super().__init__()
             self.base = nn.Linear(2, 2)
@@ -284,13 +286,7 @@ def test_ts_model_teacher_only_uses_raw_student_off_paths(monkeypatch):
 
     monkeypatch.setattr(ts_model_module.torch.hub, "load", lambda *args, **kwargs: FakeDino())
     monkeypatch.setattr(ts_model_module.torch, "load", lambda *args, **kwargs: {})
-    monkeypatch.setattr(
-        ts_model_module,
-        "build_decoder",
-        lambda decoder_arch, pc_cfg=None, attach_pc=True: FakeDecoder(
-            pc_cfg=pc_cfg if attach_pc else None
-        ),
-    )
+    monkeypatch.setattr(ts_model_module, "Decoder", FakeDecoder)
     monkeypatch.setattr(
         ts_model_module,
         "load_decoder_compatible",
@@ -478,6 +474,7 @@ def test_joint_cli_retains_legacy_optional_split():
     validate_training_args(
         SimpleNamespace(
             training_design="joint",
+            experiment_profile="legacy_pc",
             labeled_indices_pt=None,
             allow_legacy_pc_init=True,
         )
@@ -491,7 +488,7 @@ def test_ts_cli_enables_unused_parameter_discovery_for_every_design(
 ):
     args = SimpleNamespace(
         training_design=training_design,
-        experiment_profile="bgfbr_pc",
+        experiment_profile="legacy_pc",
         teacher_pc_checkpoint="teacher_enhancer.pth",
         student_checkpoint=None,
         output_dir="results/ts",
@@ -525,7 +522,7 @@ def test_ts_cli_enables_unused_parameter_discovery_for_every_design(
     monkeypatch.setattr(
         ts_entrypoint,
         "apply_experiment_profile",
-        lambda *_args, **_kwargs: SimpleNamespace(name="bgfbr_pc"),
+        lambda *_args, **_kwargs: SimpleNamespace(name="legacy_pc"),
     )
     monkeypatch.setattr(ts_entrypoint, "TSModel", lambda **_kwargs: model)
 

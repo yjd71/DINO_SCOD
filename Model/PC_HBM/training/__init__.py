@@ -27,7 +27,7 @@ from .losses import (
     pc_mode_for_epoch,
     structure_loss,
 )
-from .optimizer import migration_aware_parameter_groups
+from .optimizer import trainable_parameter_groups
 from .pseudo_label import (
     build_pc_confidence,
     confidence_weighted_feature_cosine_loss,
@@ -56,7 +56,7 @@ __all__ = [
     "encoder_pc_labeled_loss",
     "make_ema_copy",
     "make_ema_encoder_adapter",
-    "migration_aware_parameter_groups",
+    "trainable_parameter_groups",
     "pc_hbm_labeled_loss",
     "pc_hbm_pc_only_labeled_loss",
     "pc_injection_strength",

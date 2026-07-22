@@ -411,46 +411,6 @@ def _p1_distillation_losses(
     return total, terms
 
 
-def _bgfbr_unlabeled_background_loss(
-    aux: Mapping[str, Any],
-    pseudo: torch.Tensor,
-    confidence: torch.Tensor,
-    hard_valid: torch.Tensor,
-    reference: torch.Tensor,
-) -> torch.Tensor:
-    """Supervise the four BGFBR background logits with foreground complements."""
-
-    architecture = aux.get("decoder_architecture")
-    bgfbr = aux.get("bgfbr")
-    if architecture is None and isinstance(bgfbr, Mapping):
-        architecture = "bgfbr_pc_v1"
-    if architecture is None or str(architecture) == "legacy_transformer":
-        return zero_like_loss(reference)
-    if str(architecture) != "bgfbr_pc_v1":
-        raise ValueError(
-            f"Unsupported decoder architecture {architecture!r} for pseudo loss"
-        )
-    if not isinstance(bgfbr, Mapping):
-        raise KeyError("BGFBR pseudo loss requires aux['bgfbr'] mapping")
-    background = bgfbr.get("bg_output")
-    if not isinstance(background, (tuple, list)) or len(background) != 4:
-        raise ValueError(
-            "aux['bgfbr']['bg_output'] must contain stage4-to-stage1 logits"
-        )
-    if not all(torch.is_tensor(logit) for logit in background):
-        raise TypeError("aux['bgfbr']['bg_output'] entries must be tensors")
-
-    target = 1.0 - pseudo
-    valid_confidence = confidence * hard_valid.to(dtype=confidence.dtype)
-    stage_weights = (1.0 / 16.0, 1.0 / 8.0, 1.0 / 4.0, 1.0 / 2.0)
-    loss = zero_like_loss(reference)
-    for weight, logit in zip(stage_weights, background):
-        loss = loss + weight * weighted_structure_loss(
-            logit, target, valid_confidence
-        )
-    return loss
-
-
 def pc_unlabeled_loss(
     outputs: Sequence[torch.Tensor],
     aux: Mapping[str, Any],
@@ -514,14 +474,6 @@ def pc_unlabeled_loss(
         + 0.10 * weighted_structure_loss(m4, p_soft, confidence)
         + 0.10 * weighted_structure_loss(global_logit, p_soft, confidence)
     )
-    l_bg = _bgfbr_unlabeled_background_loss(
-        aux,
-        p_soft,
-        confidence,
-        hard_targets["hard_valid"],
-        z_student,
-    )
-
     l_feat_p3 = zero
     l_feat_p2 = zero
     l_feat_p1 = zero
@@ -596,12 +548,8 @@ def pc_unlabeled_loss(
     hard_loss_weight = float(getattr(config, "hard_loss_weight", 2.0))
     if hard_loss_weight < 0.0:
         raise ValueError("hard_loss_weight must be non-negative")
-    background_loss_weight = float(getattr(config, "lambda_u_bg", 1.0))
-    if background_loss_weight < 0.0:
-        raise ValueError("lambda_u_bg must be non-negative")
     l_hard_weighted = hard_loss_weight * hard_ramp * l_hard
-    l_bg_weighted = background_loss_weight * l_bg
-    unscaled = l_soft + l_hard_weighted + l_side + l_bg_weighted + l_feature
+    unscaled = l_soft + l_hard_weighted + l_side + l_feature
     total = float(getattr(config, "lambda_u", 1.0)) * unscaled
     positive_confidence = confidence > 0
     log = {
@@ -609,8 +557,6 @@ def pc_unlabeled_loss(
         "L_u_hard": l_hard.detach(),
         "L_u_hard_weighted": l_hard_weighted.detach(),
         "L_u_side": l_side.detach(),
-        "L_u_bg": l_bg.detach(),
-        "L_u_bg_weighted": l_bg_weighted.detach(),
         "L_u_feat_p3": l_feat_p3.detach(),
         "L_u_feat_p2": l_feat_p2.detach(),
         "L_u_feat_p1_B1": p1_terms["B1"].detach(),

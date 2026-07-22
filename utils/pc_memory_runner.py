@@ -124,7 +124,7 @@ def rebuild_memory(
     decoder = _unwrap_module(memory_decoder)
     if not hasattr(decoder, "forward_memory_features"):
         raise AttributeError(
-            "memory_decoder must provide forward_memory_features(features, image_rgb)"
+            "memory_decoder must provide forward_memory_features(features)"
         )
     if entry_builder is None:
         engine = getattr(decoder, "pc_hbm", None)
@@ -151,14 +151,7 @@ def rebuild_memory(
         amp_enabled = bool(use_amp and device.type == "cuda")
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
             features = feature_model.extract_features(images)
-            image_rgb = (
-                feature_model.prepare_rgb(images)
-                if hasattr(feature_model, "prepare_rgb")
-                else None
-            )
-            memory_features = decoder.forward_memory_features(
-                features, image_rgb=image_rgb
-            )
+            memory_features = decoder.forward_memory_features(features)
             entries = entry_builder(
                 features=memory_features,
                 gt=gts,

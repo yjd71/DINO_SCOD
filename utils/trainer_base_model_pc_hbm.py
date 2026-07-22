@@ -27,7 +27,7 @@ from Model.PC_HBM.training import (
     DiagnosticWarningTracker,
     collect_pc_diagnostics,
     make_ema_copy,
-    migration_aware_parameter_groups,
+    trainable_parameter_groups,
     pc_hbm_labeled_loss,
     pc_mode_for_epoch,
     update_ema_module,
@@ -155,15 +155,9 @@ class BasePCHBMTrainer:
             dino.eval()
 
         if optimizer is None:
-            reused_names = getattr(
-                cfg,
-                "legacy_reused_parameter_names",
-                getattr(self.pc_cfg, "legacy_reused_parameter_names", ()),
-            )
-            parameter_groups = migration_aware_parameter_groups(
+            parameter_groups = trainable_parameter_groups(
                 self.decoder,
                 base_lr=float(cfg.learning_rate),
-                reused_parameter_names=reused_names,
             )
             self.optimizer = Adam(
                 parameter_groups,

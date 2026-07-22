@@ -1,8 +1,7 @@
 import torch
 import torch.nn as nn
 import warnings
-from Model.BGFBR import ImageNetRGBAdapter
-from Model.decoder import build_decoder, resolve_decoder_arch
+from Model.decoder import Decoder
 from configs.pc_hbm_dino_config import EncoderPCHBMConfig
 from Model.PC_HBM.encoder import (
     DinoFeatureBundle,
@@ -34,23 +33,29 @@ class BaseModel(nn.Module):
         # Missing ``enabled`` preserves the historical behavior; only an
         # explicit False selects the structural no-prototype Base control.
         self.pc_enabled = bool(getattr(pc_cfg, 'enabled', True))
-        self.decoder_arch = resolve_decoder_arch(decoder_arch, pc_cfg)
+        configured_decoder_arch = decoder_arch
+        if configured_decoder_arch is None and pc_cfg is not None:
+            configured_decoder_arch = getattr(pc_cfg, 'decoder_arch', None)
+        self.decoder_arch = str(configured_decoder_arch or Decoder.decoder_arch)
+        if self.decoder_arch != Decoder.decoder_arch:
+            raise ValueError(
+                f'Unsupported decoder_arch={self.decoder_arch!r}; only the '
+                f'original {Decoder.decoder_arch!r} Decoder is available.'
+            )
         self.pc_placement = str(getattr(pc_cfg, 'pc_placement', 'decoder'))
         if self.pc_placement not in {'decoder', 'encoder'}:
             raise ValueError(
                 f'Unsupported pc_placement={self.pc_placement!r}; expected '
                 "'decoder' or 'encoder'."
             )
-        self.rgb_adapter = ImageNetRGBAdapter()
-        self.decoder = build_decoder(
-            self.decoder_arch,
-            pc_cfg=pc_cfg,
-            attach_pc=(
-                bool(attach_pc)
-                and self.pc_enabled
-                and self.pc_placement == 'decoder'
-            ),
+        decoder_pc_cfg = (
+            pc_cfg
+            if bool(attach_pc)
+            and self.pc_enabled
+            and self.pc_placement == 'decoder'
+            else None
         )
+        self.decoder = Decoder(pc_cfg=decoder_pc_cfg)
         self.encoder_pc_hbm = None
         self.pseudo_refiner = None
         self.encoder_pc_head = None
@@ -135,11 +140,6 @@ class BaseModel(nn.Module):
         """Backward-compatible alias used by the original training scripts."""
         return self.extract_features(x)
 
-    def prepare_rgb(self, x):
-        """Return the sole RGB representation consumed by BGFBR and memory."""
-
-        return self.rgb_adapter(x)
-        
     def forward(
         self,
         x,
@@ -155,11 +155,9 @@ class BaseModel(nn.Module):
     ):
         bundle = self.extract_feature_bundle(x)
         x_features = bundle.patch_tokens
-        image_rgb = self.prepare_rgb(x)
         if not self.pc_enabled:
             decoder_result = self.decoder(
                 features=x_features,
-                image_rgb=image_rgb,
                 memory=None,
                 pc_mode='off',
                 epoch=epoch,
@@ -195,7 +193,6 @@ class BaseModel(nn.Module):
                 head_result = self.encoder_pc_head(
                     role=encoder_role,
                     bundle=bundle,
-                    image_rgb=image_rgb,
                     memory=memory,
                     mode=pc_mode,
                     stage=encoder_stage,
@@ -222,7 +219,6 @@ class BaseModel(nn.Module):
                 return head_result.outputs
             decoder_result = self.decoder(
                 features=x_features,
-                image_rgb=image_rgb,
                 memory=None,
                 pc_mode='off',
                 epoch=epoch,
@@ -232,7 +228,7 @@ class BaseModel(nn.Module):
             if not return_aux:
                 return decoder_result
             if not isinstance(decoder_result, (tuple, list)) or len(decoder_result) != 2:
-                raise RuntimeError('BGFBR Decoder must return (outputs, aux).')
+                raise RuntimeError('Decoder must return (outputs, aux).')
             outputs, decoder_aux = decoder_result
             combined_aux = dict(decoder_aux or {})
             combined_aux['encoder_pc_hbm'] = encoder_aux
@@ -241,7 +237,6 @@ class BaseModel(nn.Module):
             return outputs, combined_aux
         return self.decoder(
             features=x_features,
-            image_rgb=image_rgb,
             memory=memory,
             pc_mode=pc_mode,
             epoch=epoch,
@@ -259,12 +254,10 @@ class BaseModel(nn.Module):
     ):
         bundle = self.extract_feature_bundle(x)
         x_features = bundle.patch_tokens
-        image_rgb = self.prepare_rgb(x)
         if self.pc_placement == 'encoder' and self.encoder_pc_profile_v3:
             return self.encoder_pc_head(
                 role='inference',
                 bundle=bundle,
-                image_rgb=image_rgb,
                 memory=memory,
                 stage=None,
                 epoch=epoch,
@@ -272,17 +265,16 @@ class BaseModel(nn.Module):
                 return_aux=False,
             )
         if self.decoder.pc_hbm is None:
-            return self.decoder(features=x_features, image_rgb=image_rgb, pc_mode='off')[3]
+            return self.decoder(features=x_features, pc_mode='off')[3]
         if memory is None:
             warnings.warn(
                 'PC-HBM memory is missing; using z_main logits.',
                 RuntimeWarning,
                 stacklevel=2,
             )
-            return self.decoder(features=x_features, image_rgb=image_rgb, pc_mode='off')[3]
+            return self.decoder(features=x_features, pc_mode='off')[3]
         _, aux = self.decoder(
             features=x_features,
-            image_rgb=image_rgb,
             memory=memory,
             pc_mode='full',
             epoch=epoch,
@@ -310,7 +302,7 @@ class BaseModel(nn.Module):
     def load_decoder_checkpoint(self, path, require_pc_complete=False):
         if self.pc_placement == 'encoder':
             raise RuntimeError(
-                'encoder_pc accepts only strict non-PC BGFBR warm-start or v3 artifacts.'
+                'encoder_pc accepts only strict original-Decoder warm-start or v3 artifacts.'
             )
         assert path.endswith('.pth'), f'Path should end with .pth, but got: {path}'
         load_decoder_compatible(

@@ -5,9 +5,9 @@ Run with::
     python -m torch.distributed.run --standalone --nproc_per_node=2 \
         tests/ddp_smoke.py --cpu
 
-The smoke deliberately uses precomputed DINO features and reconstructs a
-deterministic RGB tensor from them. It keeps the real BGFBR decoder and every
-PC-HBM module so the distributed contract exercises the production graph.
+The smoke deliberately uses precomputed DINO features. It keeps the real
+original Decoder and every PC-HBM module so the distributed contract exercises
+the production graph.
 """
 
 from __future__ import annotations
@@ -31,7 +31,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
-from Model.decoder import build_decoder
+from Model.decoder import Decoder
 from Model.PC_HBM.memory import PCMemory
 from Model.PC_HBM.training import pc_unlabeled_loss, update_ema_module
 from utils.pc_memory_runner import module_fingerprint
@@ -43,21 +43,7 @@ class _PCHBMDDPSmokeModule(nn.Module):
     def __init__(self, config: DinoPCHBMConfig, *, teacher_only: bool = False) -> None:
         super().__init__()
         self.teacher_only = bool(teacher_only)
-        self.student = build_decoder(
-            decoder_arch="bgfbr_pc_v1",
-            pc_cfg=config,
-            attach_pc=not self.teacher_only,
-        )
-
-    @staticmethod
-    def _image_rgb(features: Sequence[torch.Tensor]) -> torch.Tensor:
-        first = features[0]
-        batch, tokens, _ = first.shape
-        side = int(tokens**0.5)
-        if side * side != tokens:
-            raise ValueError("DDP smoke features must form a square token grid")
-        rgb_28 = torch.sigmoid(first[:, :, :3].transpose(1, 2).reshape(batch, 3, side, side))
-        return F.interpolate(rgb_28, size=(392, 392), mode="bilinear", align_corners=False)
+        self.student = Decoder(pc_cfg=None if self.teacher_only else config)
 
     def forward(
         self,
@@ -83,7 +69,6 @@ class _PCHBMDDPSmokeModule(nn.Module):
 
         outputs, aux = self.student(
             features,
-            image_rgb=self._image_rgb(features),
             memory=memory,
             pc_mode=mode,
             epoch=epoch,
@@ -461,7 +446,7 @@ def main() -> None:
         # Base uses find_unused_parameters=True because the unused set changes
         # by stage: off leaves every PC parameter unused; parent_only activates
         # only the parent/B3 subset; full activates the complete correction
-        # path. BGFBR supervision remains live in all three stages.
+        # path. Original-Decoder supervision remains live in all three stages.
         # The changing reducer graph must not become stale or hang either rank.
         for step, mode in enumerate(("off", "parent_only", "full")):
             optimizer.zero_grad(set_to_none=True)
@@ -479,7 +464,7 @@ def main() -> None:
                 ddp.module,
                 pc_parameters=False,
                 expected=True,
-                name=f"Base/{mode} BGFBR Decoder",
+                name=f"Base/{mode} original Decoder",
             )
             _assert_finite_gradient_group(
                 ddp.module,
@@ -493,9 +478,9 @@ def main() -> None:
             )
 
         # Teacher-only TS uses a raw Student with no PC-HBM parameters.  Its
-        # unlabeled objective intentionally leaves a small BGFBR subset (for
-        # example the Stage-1 foreground-logit head) outside that backward
-        # graph, so DDP must discover unused parameters on every invocation.
+        # unlabeled objective intentionally leaves a small Decoder subset
+        # outside that backward graph, so DDP must discover unused parameters
+        # on every invocation.
         # Both backwards still synchronize and accumulate normally.
         torch.manual_seed(271828)
         raw_model = _PCHBMDDPSmokeModule(config, teacher_only=True)
@@ -624,7 +609,6 @@ def main() -> None:
         with torch.inference_mode():
             teacher_outputs, teacher_aux = joint_teacher(
                 joint_features,
-                image_rgb=_PCHBMDDPSmokeModule._image_rgb(joint_features),
                 memory=memory,
                 pc_mode="teacher_pseudo",
                 epoch=13,

@@ -21,7 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from Model.base_model import BaseModel
-from Model.decoder import Decoder, build_decoder
+from Model.decoder import Decoder
 from Model.PC_HBM.memory import PCMemory
 from Model.PC_HBM.training import (
     decoder_base_loss,
@@ -166,9 +166,8 @@ def extract_features(model: BaseModel, batch_size: int, config: DinoPCHBMConfig)
     )
     with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.float16):
         features = model.extract_features(images)
-        image_rgb = model.prepare_rgb(images)
     del images
-    return tuple(feature.detach() for feature in features), image_rgb.detach()
+    return tuple(feature.detach() for feature in features)
 
 
 def real_training_loss(
@@ -299,12 +298,11 @@ def run_training_scenario(
     decoder.train()
     decoder.zero_grad(set_to_none=True)
     torch.cuda.reset_peak_memory_stats()
-    features, image_rgb = extract_features(model, batch_size, config)
+    features = extract_features(model, batch_size, config)
     query_ids = [f"{label}-{index}" for index in range(batch_size)]
     with torch.autocast(device_type="cuda", dtype=torch.float16):
         outputs, aux = decoder(
             features,
-            image_rgb=image_rgb,
             memory=memory,
             pc_mode=pc_mode,
             epoch=epoch,
@@ -346,7 +344,7 @@ def run_training_scenario(
         assert_module_received_gradients(decoder.pc_hbm.gate_mlp, "PC gate MLP")
     peak = peak_gib()
     decoder.zero_grad(set_to_none=True)
-    del loss, metrics, outputs, aux, features, image_rgb
+    del loss, metrics, outputs, aux, features
     release()
     print(f"[PASS] {label}: batch={batch_size}, mode={pc_mode}, peak={peak:.2f} GiB")
     return peak
@@ -357,15 +355,14 @@ def run_teacher_scenario(
     memory: PCMemory,
     config: DinoPCHBMConfig,
 ) -> float:
-    teacher = build_decoder(pc_cfg=config)
+    teacher = Decoder(pc_cfg=config)
     teacher.load_state_dict(model.decoder.state_dict(), strict=True)
     teacher.requires_grad_(False).eval().cuda()
     torch.cuda.reset_peak_memory_stats()
-    features, image_rgb = extract_features(model, BATCH_TEACHER, config)
+    features = extract_features(model, BATCH_TEACHER, config)
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16):
         _, aux = teacher(
             features,
-            image_rgb=image_rgb,
             memory=memory,
             pc_mode="teacher_pseudo",
             epoch=30,
@@ -381,7 +378,7 @@ def run_teacher_scenario(
         if probability.min() < 0 or probability.max() > 1:
             raise AssertionError("Teacher p_final is not a probability tensor")
     peak = peak_gib()
-    del probability, aux, features, image_rgb, teacher
+    del probability, aux, features, teacher
     release()
     print(
         f"[PASS] teacher inference: batch={BATCH_TEACHER}, "
@@ -391,7 +388,7 @@ def run_teacher_scenario(
 
 
 def _raw_student_from_enhancer(model: BaseModel) -> Decoder:
-    student = build_decoder(pc_cfg=model.pc_cfg, attach_pc=False)
+    student = Decoder(pc_cfg=None)
     student.load_state_dict(
         {
             name: value
@@ -407,7 +404,7 @@ def _joint_student_from_enhancer(
     model: BaseModel,
     config: DinoPCHBMConfig,
 ) -> Decoder:
-    student = build_decoder(pc_cfg=config)
+    student = Decoder(pc_cfg=config)
     student.load_state_dict(model.decoder.state_dict(), strict=True)
     return student.cuda()
 
@@ -506,11 +503,9 @@ def run_raw_student_labeled_scenario(
 ) -> float:
     student = _raw_student_from_enhancer(model).train()
     torch.cuda.reset_peak_memory_stats()
-    features, image_rgb = extract_features(model, BATCH_STUDENT_LABELED, config)
+    features = extract_features(model, BATCH_STUDENT_LABELED, config)
     with torch.autocast(device_type="cuda", dtype=torch.float16):
-        outputs, aux = student(
-            features, image_rgb=image_rgb, pc_mode="off", return_aux=True
-        )
+        outputs, aux = student(features, pc_mode="off", return_aux=True)
         if aux.get("pc_active", True):
             raise AssertionError("Raw labeled Student unexpectedly activated PC-HBM")
         gt = (torch.rand_like(aux["z_main"], dtype=torch.float32) > 0.5).float()
@@ -518,7 +513,7 @@ def run_raw_student_labeled_scenario(
     loss.backward()
     assert_finite_gradients(student)
     peak = peak_gib()
-    del loss, gt, outputs, aux, features, image_rgb, student
+    del loss, gt, outputs, aux, features, student
     release()
     print(
         f"[PASS] student labeled raw: batch={BATCH_STUDENT_LABELED}, "
@@ -532,16 +527,15 @@ def run_raw_student_unlabeled_scenario(
     memory: PCMemory,
     config: DinoPCHBMConfig,
 ) -> float:
-    teacher = build_decoder(pc_cfg=config)
+    teacher = Decoder(pc_cfg=config)
     teacher.load_state_dict(model.decoder.state_dict(), strict=True)
     teacher.requires_grad_(False).eval().cuda()
     student = _raw_student_from_enhancer(model).train()
     torch.cuda.reset_peak_memory_stats()
-    features, image_rgb = extract_features(model, BATCH_STUDENT_UNLABELED, config)
+    features = extract_features(model, BATCH_STUDENT_UNLABELED, config)
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16):
         _, teacher_aux = teacher(
             features,
-            image_rgb=image_rgb,
             memory=memory,
             pc_mode="teacher_pseudo",
             epoch=30,
@@ -552,9 +546,7 @@ def run_raw_student_unlabeled_scenario(
         if name not in pseudo:
             raise AssertionError(f"Teacher-only pseudo targets are missing {name}")
     with torch.autocast(device_type="cuda", dtype=torch.float16):
-        outputs, student_aux = student(
-            features, image_rgb=image_rgb, pc_mode="off", return_aux=True
-        )
+        outputs, student_aux = student(features, pc_mode="off", return_aux=True)
         loss, metrics = pc_unlabeled_loss(
             outputs,
             student_aux,
@@ -579,7 +571,7 @@ def run_raw_student_unlabeled_scenario(
             raise AssertionError(f"Missing or non-finite teacher-only metric: {name}")
     peak = peak_gib()
     del loss, metrics, outputs, student_aux, pseudo, teacher_aux, features
-    del image_rgb, teacher, student
+    del teacher, student
     release()
     print(
         f"[PASS] student unlabeled raw: batch={BATCH_STUDENT_UNLABELED}, "
@@ -617,15 +609,14 @@ def run_joint_student_unlabeled_scenario(
 ) -> float:
     """Run corrected-to-corrected P3/P2/P1 distillation at physical batch 32."""
 
-    teacher = build_decoder(pc_cfg=config)
+    teacher = Decoder(pc_cfg=config)
     teacher.load_state_dict(model.decoder.state_dict(), strict=True)
     teacher.requires_grad_(False).eval().cuda()
     torch.cuda.reset_peak_memory_stats()
-    features, image_rgb = extract_features(model, BATCH_STUDENT_UNLABELED, config)
+    features = extract_features(model, BATCH_STUDENT_UNLABELED, config)
     with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.float16):
         _, teacher_aux = teacher(
             features,
-            image_rgb=image_rgb,
             memory=memory,
             pc_mode="teacher_pseudo",
             epoch=30,
@@ -659,7 +650,6 @@ def run_joint_student_unlabeled_scenario(
     with torch.autocast(device_type="cuda", dtype=torch.float16):
         outputs, student_aux = student(
             features,
-            image_rgb=image_rgb,
             memory=memory,
             pc_mode="student_core",
             epoch=30,
@@ -709,7 +699,7 @@ def run_joint_student_unlabeled_scenario(
 
     peak = peak_gib()
     del loss, metrics, outputs, student_aux, teacher_features, confidence, pseudo
-    del features, image_rgb, student
+    del features, student
     release()
     print(
         f"[PASS] student unlabeled joint: batch={BATCH_STUDENT_UNLABELED}, "

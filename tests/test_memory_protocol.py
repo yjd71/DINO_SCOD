@@ -140,13 +140,13 @@ def test_region_sampling_is_deterministic_bounded_and_never_duplicates() -> None
     assert empty.numel() == 0
 
 
-def test_memory_schema_v2_requires_the_complete_bgfbr_contract() -> None:
+def test_memory_schema_v2_requires_the_complete_original_decoder_contract() -> None:
     memory, config = _ready_memory()
     expected = config.expected_memory_meta()
-    assert expected["architecture"] == "DINO_SCOD_BGFBR_PC_HBM"
+    assert expected["architecture"] == "DINO_SCOD_PC_HBM"
     assert expected["schema_version"] == 2
-    assert expected["decoder_architecture"] == "bgfbr_pc_v1"
-    assert expected["boundary_feature_channels"] == (7, 10, 10, 16)
+    assert expected["decoder_architecture"] == "legacy_transformer"
+    assert expected["boundary_feature_channels"] == (5, 8, 8, 14)
 
     partial = {"architecture": expected["architecture"], "schema_version": 2}
     result = memory.validate_compat(partial)
@@ -154,10 +154,10 @@ def test_memory_schema_v2_requires_the_complete_bgfbr_contract() -> None:
     assert result.reason.startswith("missing_expected_compat_key:")
 
     mismatch = dict(expected)
-    mismatch["gbe_normalization"] = "different"
+    mismatch["decoder_architecture"] = "removed_decoder"
     result = memory.validate_compat(mismatch)
     assert not result
-    assert result.reason == "compat_mismatch:gbe_normalization"
+    assert result.reason == "compat_mismatch:decoder_architecture"
 
 
 def test_memory_schema_v1_is_rejected_instead_of_silently_migrated() -> None:
@@ -167,4 +167,14 @@ def test_memory_schema_v1_is_rejected_instead_of_silently_migrated() -> None:
     state["compat_meta"]["schema_version"] = 1
     restored = PCMemory()
     with pytest.raises(RuntimeError, match="schema v1 cannot be migrated"):
+        restored.load_state_dict(state)
+
+
+def test_removed_decoder_memory_architecture_is_rejected_before_tensor_load() -> None:
+    memory, _ = _ready_memory()
+    state = copy.deepcopy(memory.state_dict())
+    state["compat_meta"]["architecture"] = "DINO_SCOD_BGFBR_PC_HBM"
+
+    restored = PCMemory()
+    with pytest.raises(RuntimeError, match="Unsupported PC-HBM memory architecture"):
         restored.load_state_dict(state)

@@ -20,7 +20,7 @@ from tqdm import tqdm
 
 from Model.PC_HBM.memory import PCMemory
 from Model.PC_HBM.training import (
-    migration_aware_parameter_groups,
+    trainable_parameter_groups,
     pc_hbm_labeled_loss,
     pc_unlabeled_loss,
     prepare_pseudo_targets,
@@ -107,15 +107,9 @@ class PCHBMPseudoTrainer:
         if int(cfg.l_batch_size) != 32 or int(cfg.u_batch_size) != 32:
             raise ValueError("PC-HBM TS requires physical labeled/unlabeled batches of 32")
 
-        reused_names = getattr(
-            cfg,
-            "legacy_reused_parameter_names",
-            getattr(pc_cfg, "legacy_reused_parameter_names", ()),
-        )
-        student_parameters = migration_aware_parameter_groups(
+        student_parameters = trainable_parameter_groups(
             self.core_model.student,
             base_lr=float(cfg.learning_rate),
-            reused_parameter_names=reused_names,
         )
         self.optimizer = optim.Adam(
             student_parameters,
@@ -457,8 +451,6 @@ class PCHBMPseudoTrainer:
             "unlabeled": 0.0,
             "L_u_hard": 0.0,
             "L_u_hard_weighted": 0.0,
-            "L_u_bg": 0.0,
-            "L_u_bg_weighted": 0.0,
             "hard_valid_ratio": 0.0,
             "hard_ramp": 0.0,
             "confidence": 0.0,
@@ -489,11 +481,9 @@ class PCHBMPseudoTrainer:
             # 1) Labeled Student uses the untouched raw/off path in teacher-only mode.
             with self._autocast():
                 l_features = self.core_model.extract_features(l_imgs)
-                l_image_rgb = self.core_model.prepare_rgb(l_imgs)
                 l_outputs, l_aux = self.model(
                     branch="student_labeled",
                     features=l_features,
-                    image_rgb=l_image_rgb,
                     memory=self.memory,
                     epoch=decoder_epoch,
                     query_image_ids=list(l_image_ids),
@@ -515,7 +505,6 @@ class PCHBMPseudoTrainer:
             l_loss_value = float(l_loss.detach())
             del (
                 l_features,
-                l_image_rgb,
                 l_outputs,
                 l_aux,
                 l_gt,
@@ -529,14 +518,12 @@ class PCHBMPseudoTrainer:
             # cloning to ordinary tensors only after leaving inference_mode.
             with self._autocast():
                 u_features = self.core_model.extract_features(u_imgs)
-                u_image_rgb = self.core_model.prepare_rgb(u_imgs)
             with torch.inference_mode():
                 with self._autocast():
                     teacher_aux = self.core_model.teacher_pseudo(
                         u_features,
                         self.memory,
                         decoder_epoch,
-                        image_rgb=u_image_rgb,
                     )
             teacher_target_aux = self._clone_teacher_target_aux(
                 teacher_aux,
@@ -557,7 +544,6 @@ class PCHBMPseudoTrainer:
                 u_outputs, u_aux = self.model(
                     branch="student_unlabeled",
                     features=u_features,
-                    image_rgb=u_image_rgb,
                     memory=self.memory,
                     epoch=decoder_epoch,
                 )
@@ -599,8 +585,6 @@ class PCHBMPseudoTrainer:
             totals["unlabeled"] += u_loss_value
             totals["L_u_hard"] += float(u_log["L_u_hard"])
             totals["L_u_hard_weighted"] += float(u_log["L_u_hard_weighted"])
-            totals["L_u_bg"] += float(u_log.get("L_u_bg", 0.0))
-            totals["L_u_bg_weighted"] += float(u_log.get("L_u_bg_weighted", 0.0))
             totals["hard_valid_ratio"] += float(u_log["hard_valid_ratio"])
             totals["hard_ramp"] += float(u_log["hard_ramp"])
             totals["confidence"] += confidence_value
@@ -627,7 +611,7 @@ class PCHBMPseudoTrainer:
                 hard=f"{float(u_log['L_u_hard']):.3e}",
                 p1=f"{float(u_log.get('L_u_feat_p1', 0.0)):.3e}",
             )
-            del u_features, u_image_rgb, u_outputs, u_aux
+            del u_features, u_outputs, u_aux
             del pseudo, u_imgs, u_loss, u_log
 
         if steps == 0:

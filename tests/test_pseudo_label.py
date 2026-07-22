@@ -499,48 +499,29 @@ def test_unlabeled_loss_rejects_incompatible_main_logit_contract(output_z_main, 
         pc_unlabeled_loss(outputs, aux, pseudo, confidence, 1, cfg)
 
 
-def test_bgfbr_unlabeled_background_uses_complement_and_reliable_mask():
+def test_unlabeled_loss_ignores_removed_background_side_outputs():
     cfg = DinoPCHBMConfig(use_hard_pseudo=False)
-    cfg.lambda_u_bg = 1.5
     outputs = [torch.zeros(1, 1, 8, 8, requires_grad=True) for _ in range(5)]
     pseudo = torch.full((1, 1, 8, 8), 0.5)
     pseudo[:, :, :, :4] = 0.9
     confidence = torch.ones_like(pseudo)
-    background = tuple(
+    unused_background = tuple(
         torch.zeros(1, 1, 8, 8, requires_grad=True) for _ in range(4)
     )
     aux = {
-        "decoder_architecture": "bgfbr_pc_v1",
+        "decoder_architecture": "legacy_transformer",
         "z_main": outputs[3],
         "mixture_skipped": True,
-        "bgfbr": {"bg_output": background},
+        "unused_background_outputs": unused_background,
     }
 
     loss, log = pc_unlabeled_loss(outputs, aux, pseudo, confidence, 1, cfg)
-    hard_valid = (pseudo >= cfg.pseudo_fg_threshold) | (
-        pseudo <= cfg.pseudo_bg_threshold
-    )
-    reliable_confidence = confidence * hard_valid.to(dtype=confidence.dtype)
-    weights = (1.0 / 16.0, 1.0 / 8.0, 1.0 / 4.0, 1.0 / 2.0)
-    expected_bg = sum(
-        weight
-        * weighted_structure_loss(
-            logit,
-            1.0 - pseudo,
-            reliable_confidence,
-        )
-        for weight, logit in zip(weights, background)
-    )
-
-    torch.testing.assert_close(log["L_u_bg"], expected_bg.detach())
-    torch.testing.assert_close(log["L_u_bg_weighted"], 1.5 * expected_bg.detach())
+    assert "L_u_bg" not in log
+    assert "L_u_bg_weighted" not in log
     torch.testing.assert_close(
         loss.detach(),
-        log["L_u_soft"] + log["L_u_side"] + log["L_u_bg_weighted"],
+        log["L_u_soft"] + log["L_u_side"] + log["L_u_feature"],
     )
 
     loss.backward()
-    for logit in background:
-        assert logit.grad is not None
-        assert torch.count_nonzero(logit.grad[:, :, :, :4]) > 0
-        assert torch.count_nonzero(logit.grad[:, :, :, 4:]) == 0
+    assert all(logit.grad is None for logit in unused_background)

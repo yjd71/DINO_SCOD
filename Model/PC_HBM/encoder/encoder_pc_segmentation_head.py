@@ -1,7 +1,7 @@
 """Role-gated execution head for encoder-side PC-HBM v3.
 
 The head is the single policy boundary around the trainable Encoder Adapter,
-the permanently non-PC BGFBR Decoder, and the training-only pseudo refiner.
+the permanently non-PC original Decoder, and the training-only pseudo refiner.
 It deliberately makes the five supported execution roles explicit so that a
 Student core or formal inference call cannot accidentally execute mixture
 refinement.
@@ -41,7 +41,7 @@ class EncoderPCCoreResult:
     @property
     def z_core(self) -> torch.Tensor:
         if len(self.outputs) != 5:
-            raise RuntimeError("BGFBR core must return exactly five outputs.")
+            raise RuntimeError("Decoder core must return exactly five outputs.")
         return self.outputs[3]
 
 
@@ -87,7 +87,6 @@ class EncoderPCSegmentationHead(nn.Module):
     def _run_core(
         self,
         bundle: DinoFeatureBundle,
-        image_rgb: torch.Tensor,
         *,
         memory: Any,
         mode: str,
@@ -107,7 +106,6 @@ class EncoderPCSegmentationHead(nn.Module):
         )
         decoder_result = self.decoder(
             features=adapter_output.features,
-            image_rgb=image_rgb,
             memory=None,
             pc_mode="off",
             epoch=epoch,
@@ -116,7 +114,7 @@ class EncoderPCSegmentationHead(nn.Module):
         )
         if return_aux:
             if not isinstance(decoder_result, (tuple, list)) or len(decoder_result) != 2:
-                raise RuntimeError("BGFBR Decoder must return (outputs, aux).")
+                raise RuntimeError("Decoder must return (outputs, aux).")
             outputs, decoder_aux = decoder_result
             combined_aux = dict(decoder_aux or {})
             combined_aux["encoder_pc_hbm"] = adapter_output.aux
@@ -128,7 +126,7 @@ class EncoderPCSegmentationHead(nn.Module):
             outputs = decoder_result
             combined_aux = {}
         if not isinstance(outputs, (tuple, list)) or len(outputs) != 5:
-            raise RuntimeError("BGFBR Decoder must return five core outputs.")
+            raise RuntimeError("Decoder must return five core outputs.")
         return EncoderPCCoreResult(tuple(outputs), combined_aux)
 
     def _run_refiner(
@@ -159,7 +157,6 @@ class EncoderPCSegmentationHead(nn.Module):
         *,
         role: str,
         bundle: DinoFeatureBundle | None = None,
-        image_rgb: torch.Tensor | None = None,
         core_result: EncoderPCCoreResult | None = None,
         memory: Any = None,
         mode: str = "full",
@@ -184,8 +181,8 @@ class EncoderPCSegmentationHead(nn.Module):
                 core_result, epoch=epoch, ts_continuation=False
             )
 
-        if bundle is None or image_rgb is None:
-            raise ValueError(f"role={role!r} requires bundle and image_rgb")
+        if bundle is None:
+            raise ValueError(f"role={role!r} requires bundle")
         if role in {"teacher_pseudo", "student_core", "inference"}:
             mode = "full"
             stage = (
@@ -200,7 +197,6 @@ class EncoderPCSegmentationHead(nn.Module):
         needs_aux = return_aux or role == "teacher_pseudo"
         core = self._run_core(
             bundle,
-            image_rgb,
             memory=memory,
             mode=mode,
             stage=stage,

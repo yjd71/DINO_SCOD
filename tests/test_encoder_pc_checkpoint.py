@@ -13,7 +13,7 @@ from utils.checkpoint_pc_hbm import (
     ENCODER_PC_FORMAT_VERSION,
     ENCODER_PC_MODEL_ARCHITECTURE,
     ENCODER_PC_RESUME_KIND,
-    load_bgfbr_decoder_warm_start,
+    load_original_decoder_warm_start,
     load_encoder_pc_checkpoint,
     load_encoder_pc_training_resume,
     save_encoder_pc_checkpoint,
@@ -27,8 +27,8 @@ class TinyAdapter(nn.Module):
         self.project = nn.Linear(4, 3)
 
 
-class TinyDetachedBGFBR(nn.Module):
-    decoder_architecture = "bgfbr_pc_v1"
+class TinyOriginalDecoder(nn.Module):
+    decoder_architecture = "legacy_transformer"
     decoder_contract_version = 1
 
     def __init__(self, *, attached: bool = False):
@@ -84,7 +84,7 @@ def _parameters(*modules: nn.Module):
 
 def test_encoder_pc_loader_rejects_live_config_drift(tmp_path: Path):
     adapter = TinyAdapter()
-    decoder = TinyDetachedBGFBR()
+    decoder = TinyOriginalDecoder()
     refiner = TinyRefiner()
     path = tmp_path / "strict_config_v3.pt"
     save_encoder_pc_checkpoint(
@@ -103,7 +103,7 @@ def test_encoder_pc_loader_rejects_live_config_drift(tmp_path: Path):
         load_encoder_pc_checkpoint(
             path,
             encoder_pc_hbm=TinyAdapter(),
-            decoder=TinyDetachedBGFBR(),
+            decoder=TinyOriginalDecoder(),
             pseudo_refiner=TinyRefiner(),
             expected_model_role="base",
             expected_training_design="encoder_pc_base",
@@ -114,7 +114,7 @@ def test_encoder_pc_loader_rejects_live_config_drift(tmp_path: Path):
 def test_encoder_pc_v3_artifact_round_trip_and_metadata(tmp_path: Path):
     torch.manual_seed(11)
     source_adapter = TinyAdapter()
-    source_decoder = TinyDetachedBGFBR()
+    source_decoder = TinyOriginalDecoder()
     source_refiner = TinyRefiner()
     checkpoint_path = tmp_path / "encoder_pc_v3.pt"
 
@@ -139,7 +139,7 @@ def test_encoder_pc_v3_artifact_round_trip_and_metadata(tmp_path: Path):
     assert not any(key.startswith("pc_hbm.") for key in payload["decoder"])
 
     target_adapter = TinyAdapter()
-    target_decoder = TinyDetachedBGFBR()
+    target_decoder = TinyOriginalDecoder()
     target_refiner = TinyRefiner()
     for module in (target_adapter, target_decoder, target_refiner):
         _zero(module)
@@ -164,7 +164,7 @@ def test_encoder_pc_v3_artifact_round_trip_and_metadata(tmp_path: Path):
 
 def test_encoder_pc_loader_rejects_legacy_format_role_and_design(tmp_path: Path):
     adapter = TinyAdapter()
-    decoder = TinyDetachedBGFBR()
+    decoder = TinyOriginalDecoder()
     refiner = TinyRefiner()
     path = tmp_path / "artifact.pt"
     payload = save_encoder_pc_checkpoint(
@@ -180,7 +180,7 @@ def test_encoder_pc_loader_rejects_legacy_format_role_and_design(tmp_path: Path)
 
     common = dict(
         encoder_pc_hbm=TinyAdapter(),
-        decoder=TinyDetachedBGFBR(),
+        decoder=TinyOriginalDecoder(),
         pseudo_refiner=TinyRefiner(),
         expected_model_role="student",
         expected_training_design="encoder_pc_teacher_student",
@@ -198,6 +198,11 @@ def test_encoder_pc_loader_rejects_legacy_format_role_and_design(tmp_path: Path)
             **{**common, "expected_training_design": "encoder_pc_base"},
         )
 
+    old_bgfbr_artifact = dict(payload)
+    old_bgfbr_artifact["model_architecture"] = "dino_encoder_pc_bgfbr_v1"
+    with pytest.raises(RuntimeError, match="model architecture mismatch"):
+        load_encoder_pc_checkpoint(old_bgfbr_artifact, **common)
+
 
 def test_encoder_pc_artifact_rejects_decoder_side_pc_state(tmp_path: Path):
     with pytest.raises(RuntimeError, match="attach_pc=False"):
@@ -205,7 +210,7 @@ def test_encoder_pc_artifact_rejects_decoder_side_pc_state(tmp_path: Path):
             tmp_path / "invalid.pt",
             epoch=1,
             encoder_pc_hbm=TinyAdapter(),
-            decoder=TinyDetachedBGFBR(attached=True),
+            decoder=TinyOriginalDecoder(attached=True),
             pseudo_refiner=TinyRefiner(),
             config=_config(),
             model_role="base",
@@ -216,7 +221,7 @@ def test_encoder_pc_artifact_rejects_decoder_side_pc_state(tmp_path: Path):
 def test_encoder_pc_training_resume_restores_full_state_and_rng(tmp_path: Path):
     torch.manual_seed(21)
     source_adapter = TinyAdapter()
-    source_decoder = TinyDetachedBGFBR()
+    source_decoder = TinyOriginalDecoder()
     source_refiner = TinyRefiner()
     source_modules = (source_adapter, source_decoder, source_refiner)
     optimizer = torch.optim.Adam(_parameters(*source_modules), lr=1e-4)
@@ -227,7 +232,7 @@ def test_encoder_pc_training_resume_restores_full_state_and_rng(tmp_path: Path):
     scheduler.step()
     scaler = TinyScaler(1024.0)
     ema_adapter = TinyAdapter()
-    ema_decoder = TinyDetachedBGFBR()
+    ema_decoder = TinyOriginalDecoder()
     ema_refiner = TinyRefiner()
     stage_state = {"name": "hierarchical_refiner", "epoch": 23, "progress": 0.6}
     split_state = {"labeled_split_fingerprint": "split-23", "round": 2}
@@ -262,7 +267,7 @@ def test_encoder_pc_training_resume_restores_full_state_and_rng(tmp_path: Path):
     assert payload["memory_profile"] == memory_profile
 
     target_adapter = TinyAdapter()
-    target_decoder = TinyDetachedBGFBR()
+    target_decoder = TinyOriginalDecoder()
     target_refiner = TinyRefiner()
     target_modules = (target_adapter, target_decoder, target_refiner)
     target_optimizer = torch.optim.Adam(_parameters(*target_modules), lr=9e-3)
@@ -271,7 +276,7 @@ def test_encoder_pc_training_resume_restores_full_state_and_rng(tmp_path: Path):
     )
     target_scaler = TinyScaler(1.0)
     target_ema_adapter = TinyAdapter()
-    target_ema_decoder = TinyDetachedBGFBR()
+    target_ema_decoder = TinyOriginalDecoder()
     target_ema_refiner = TinyRefiner()
     for module in (
         *target_modules,
@@ -315,7 +320,7 @@ def test_encoder_pc_training_resume_restores_full_state_and_rng(tmp_path: Path):
 
 def test_encoder_pc_resume_is_strict_about_kind_and_ema(tmp_path: Path):
     adapter = TinyAdapter()
-    decoder = TinyDetachedBGFBR()
+    decoder = TinyOriginalDecoder()
     refiner = TinyRefiner()
     optimizer = torch.optim.SGD(_parameters(adapter, decoder, refiner), lr=0.1)
     path = tmp_path / "resume.pt"
@@ -335,7 +340,7 @@ def test_encoder_pc_resume_is_strict_about_kind_and_ema(tmp_path: Path):
     )
     common = dict(
         encoder_pc_hbm=TinyAdapter(),
-        decoder=TinyDetachedBGFBR(),
+        decoder=TinyOriginalDecoder(),
         pseudo_refiner=TinyRefiner(),
         expected_model_role="base",
         expected_training_design="encoder_pc_base",
@@ -349,21 +354,21 @@ def test_encoder_pc_resume_is_strict_about_kind_and_ema(tmp_path: Path):
         load_encoder_pc_training_resume(payload, ema_adapter=TinyAdapter(), **common)
 
 
-def test_bgfbr_warm_start_loads_all_non_pc_and_only_ignores_pc():
+def test_original_decoder_warm_start_loads_all_non_pc_and_only_ignores_pc():
     torch.manual_seed(33)
-    legacy = TinyDetachedBGFBR(attached=True)
-    target = TinyDetachedBGFBR(attached=False)
+    legacy = TinyOriginalDecoder(attached=True)
+    target = TinyOriginalDecoder(attached=False)
     _zero(target)
     checkpoint = {
         "format_version": 2,
-        "decoder_architecture": "bgfbr_pc_v1",
+        "decoder_architecture": "legacy_transformer",
         "decoder_contract_version": 1,
         "decoder": legacy.state_dict(),
         "optimizer": {"must_not_migrate": True},
         "memory": {"must_not_migrate": True},
     }
 
-    result = load_bgfbr_decoder_warm_start(
+    result = load_original_decoder_warm_start(
         target,
         checkpoint,
         drop_prefixes=("pc_hbm.",),
@@ -375,25 +380,52 @@ def test_bgfbr_warm_start_loads_all_non_pc_and_only_ignores_pc():
     assert set(result["ignored_pc_keys"]) == {"pc_hbm.weight", "pc_hbm.bias"}
     assert set(result["loaded_keys"]) == set(target.state_dict())
 
+    raw_target = TinyOriginalDecoder(attached=False)
+    _zero(raw_target)
+    raw_result = load_original_decoder_warm_start(raw_target, legacy.state_dict())
+    for key, value in raw_target.state_dict().items():
+        assert torch.equal(value, legacy.state_dict()[key]), key
+    assert set(raw_result["ignored_pc_keys"]) == {"pc_hbm.weight", "pc_hbm.bias"}
+
 
 @pytest.mark.parametrize("mutation", ["missing", "unexpected"])
-def test_bgfbr_warm_start_rejects_non_pc_key_drift(mutation: str):
-    source = TinyDetachedBGFBR(attached=True).state_dict()
+def test_original_decoder_warm_start_rejects_non_pc_key_drift(mutation: str):
+    source = TinyOriginalDecoder(attached=True).state_dict()
     source = dict(source)
     if mutation == "missing":
         source.pop("project.bias")
     else:
         source["unrelated.weight"] = torch.ones(1)
     with pytest.raises(RuntimeError, match="non-PC keys"):
-        load_bgfbr_decoder_warm_start(
-            TinyDetachedBGFBR(),
-            {"decoder_architecture": "bgfbr_pc_v1", "decoder": source},
+        load_original_decoder_warm_start(
+            TinyOriginalDecoder(),
+            {"decoder_architecture": "legacy_transformer", "decoder": source},
         )
 
 
-def test_bgfbr_warm_start_rejects_attached_target():
-    with pytest.raises(RuntimeError, match="detached BGFBR Decoder"):
-        load_bgfbr_decoder_warm_start(
-            TinyDetachedBGFBR(attached=True),
-            {"decoder": TinyDetachedBGFBR(attached=True).state_dict()},
+def test_original_decoder_warm_start_rejects_attached_target():
+    with pytest.raises(RuntimeError, match="detached original Decoder"):
+        load_original_decoder_warm_start(
+            TinyOriginalDecoder(attached=True),
+            {"decoder": TinyOriginalDecoder(attached=True).state_dict()},
         )
+
+
+def test_original_decoder_warm_start_rejects_untagged_target():
+    source = nn.Linear(3, 2)
+    with pytest.raises(RuntimeError, match="target is not the original Decoder"):
+        load_original_decoder_warm_start(
+            nn.Linear(3, 2),
+            {"decoder": source.state_dict()},
+        )
+
+
+def test_original_decoder_warm_start_rejects_old_bgfbr_artifact():
+    checkpoint = {
+        "format_version": 2,
+        "decoder_architecture": "bgfbr_pc_v1",
+        "decoder_contract_version": 1,
+        "decoder": TinyOriginalDecoder().state_dict(),
+    }
+    with pytest.raises(RuntimeError, match="unsupported decoder architecture"):
+        load_original_decoder_warm_start(TinyOriginalDecoder(), checkpoint)

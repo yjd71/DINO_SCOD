@@ -1,4 +1,4 @@
-"""Train the staged labeled Base DINO PC-HBM model without changing legacy entry points."""
+"""Train the staged labeled Base DINO PC-HBM model with the original Decoder."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import random
 import numpy as np
 import torch
 
-from configs.bgfbr_experiments import (
+from configs.pc_hbm_experiments import (
     build_experiment_profile,
     experiment_profile_names,
 )
@@ -46,8 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--experiment-profile",
         choices=experiment_profile_names(),
-        default="bgfbr_pc",
-        help="Reproducible decoder/ablation profile (default is the full BGFBR x PC-HBM run).",
+        default="encoder_pc",
+        help="PC placement/ablation profile (default: encoder_pc).",
     )
     parser.add_argument(
         "--output-dir",
@@ -55,7 +55,7 @@ def parse_args() -> argparse.Namespace:
         dest="output_dir",
         default=None,
         help=(
-            "Output directory. Defaults to ./results/base_pc_hbm for legacy profiles "
+            "Output directory. Defaults to ./results/base_pc_hbm for decoder-side profiles "
             "and ./results/base_encoder_pc for encoder_pc."
         ),
     )
@@ -74,16 +74,8 @@ def parse_args() -> argparse.Namespace:
         "--baseline-checkpoint",
         default=None,
         help=(
-            "Same-architecture Decoder initialization: required for teacher_only and "
-            "optional as a two_stage warm start."
-        ),
-    )
-    initialization.add_argument(
-        "--legacy-warm-start",
-        default=None,
-        help=(
-            "Explicit two_stage-only migration from a legacy Transformer Decoder into "
-            "a BGFBR target; reuses projectors but never legacy PC weights."
+            "Strict original-Decoder non-PC initialization: required for teacher_only "
+            "and optional as a two_stage warm start."
         ),
     )
     parser.add_argument("--seed", type=int, default=2027)
@@ -136,17 +128,14 @@ def validate_training_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--baseline-checkpoint is only valid for --training-design teacher_only or two_stage"
         )
-    if args.legacy_warm_start and args.training_design != "two_stage":
-        raise ValueError("--legacy-warm-start is only valid for --training-design two_stage")
     initialization = (
-        args.legacy_warm_start,
         args.baseline_checkpoint,
         args.decoder_checkpoint,
         args.resume,
     )
     if sum(value is not None for value in initialization) > 1:
         raise ValueError(
-            "--legacy-warm-start conflicts with baseline/decoder/resume initialization"
+            "baseline/decoder/resume initialization options are mutually exclusive"
         )
     if build_experiment_profile(args.experiment_profile).pc_placement == "encoder":
         from configs.pc_hbm_dino_config import EncoderPCHBMConfig
@@ -159,9 +148,10 @@ def validate_training_args(args: argparse.Namespace) -> None:
                 else "enabled=False is a Decoder-only Base control and requires two_stage."
             )
             raise ValueError(message)
-        if args.decoder_checkpoint or args.legacy_warm_start:
+        if args.decoder_checkpoint:
             raise ValueError(
-                "encoder_pc accepts only --baseline-checkpoint for optional BGFBR warm-start."
+                "encoder_pc accepts only --baseline-checkpoint for optional "
+                "original-Decoder warm-start."
             )
         if encoder_pc_enabled and args.allow_self_match:
             raise ValueError("encoder_pc always excludes retrieval self-matches.")
@@ -177,7 +167,7 @@ if __name__ == "__main__":
     args = parse_args()
     validate_training_args(args)
     from configs.base_model_config import Config
-    from configs.bgfbr_experiments import (
+    from configs.pc_hbm_experiments import (
         apply_experiment_profile,
         build_experiment_profile,
     )
@@ -186,8 +176,7 @@ if __name__ == "__main__":
     from utils.checkpoint_pc_hbm import (
         extract_non_pc_decoder_state,
         load_decoder_compatible,
-        load_bgfbr_decoder_warm_start,
-        load_legacy_into_bgfbr,
+        load_original_decoder_warm_start,
         state_dict_fingerprint,
     )
     from utils.distributed import (
@@ -260,8 +249,8 @@ if __name__ == "__main__":
             cfg.baseline_fingerprint = state_dict_fingerprint(
                 extract_non_pc_decoder_state(args.baseline_checkpoint)
             )
-            cfg.initialization_source = "bgfbr_non_pc_warm_start"
-            load_bgfbr_decoder_warm_start(model.decoder, args.baseline_checkpoint)
+            cfg.initialization_source = "original_decoder_non_pc_warm_start"
+            load_original_decoder_warm_start(model.decoder, args.baseline_checkpoint)
             decoder_warm_started = True
         elif args.training_design in {"teacher_only", "two_stage"} and args.baseline_checkpoint:
             cfg.baseline_fingerprint = state_dict_fingerprint(
@@ -280,26 +269,9 @@ if __name__ == "__main__":
                     "--baseline-checkpoint must be a complete same-architecture Decoder; "
                     "only an entirely absent pc_hbm.* subtree is permitted"
                 )
-        elif args.legacy_warm_start:
-            if pc_cfg.decoder_arch != "bgfbr_pc_v1":
-                raise ValueError(
-                    "--legacy-warm-start requires a BGFBR target profile; use "
-                    "--baseline-checkpoint for a same-architecture legacy_off run"
-                )
-            cfg.baseline_fingerprint = state_dict_fingerprint(
-                extract_non_pc_decoder_state(args.legacy_warm_start)
-            )
-            migration = load_legacy_into_bgfbr(
-                model.decoder,
-                args.legacy_warm_start,
-                reuse_projectors=True,
-                reuse_pc_core=False,
-            )
-            cfg.legacy_migration_report = migration["report"]
-            cfg.legacy_reused_parameter_names = migration["reused_parameter_names"]
         if encoder_profile and not decoder_warm_started:
             cfg.baseline_fingerprint = state_dict_fingerprint(model.decoder.state_dict())
-            cfg.initialization_source = "scratch_bgfbr"
+            cfg.initialization_source = "scratch_original_decoder"
         if not pc_enabled:
             configure_no_pc_base_trainability(model)
         elif encoder_profile:

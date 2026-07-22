@@ -25,9 +25,7 @@ tests/*
 !tests/test_bpus_v2_trainer.py
 !tests/test_bpus_v2_cli.py
 !tests/test_bpus_v2_integration.py
-!tests/test_bgfbr_primitives.py
-!tests/test_bgfbr_decoder.py
-!tests/test_bgfbr_experiments.py
+!tests/test_pc_hbm_experiments.py
 __pycache__/
 *.py[cod]
 ./cache

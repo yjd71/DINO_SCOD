@@ -54,40 +54,32 @@ def _restore_pc_config(checkpoint: Mapping[str, Any]) -> DinoPCHBMConfig:
             "cannot be reconstructed safely."
         )
     restored = dict(snapshot)
-    decoder_state = checkpoint.get("decoder")
-    legacy_decoder = isinstance(decoder_state, Mapping) and any(
-        str(key).startswith("TransBlock_seg") for key in decoder_state
+    memory_architecture = str(
+        restored.get("memory_architecture", "DINO_SCOD_PC_HBM")
     )
-    legacy_schema = int(restored.get("memory_schema_version", 1)) == 1
-    migrated_legacy = legacy_decoder and legacy_schema
-    if migrated_legacy:
-        # Pre-BGFBR checkpoints used the legacy Transformer decoder and the
-        # original four boundary descriptors.  Recreate that exact module
-        # shape, while exporting its newly rebuilt memory in schema v2 so the
-        # current strict producer-fingerprint checks can validate it.
-        restored.update(
-            memory_schema_version=2,
-            memory_architecture="DINO_SCOD_BGFBR_PC_HBM",
-            decoder_arch="legacy_transformer",
-            experiment_profile="legacy_pc_migrated",
+    if memory_architecture != "DINO_SCOD_PC_HBM":
+        raise ValueError(
+            f"Unsupported decoder-side memory architecture {memory_architecture!r}; "
+            "retrain with the original Decoder"
         )
+    decoder_arch = str(restored.get("decoder_arch", "legacy_transformer"))
+    if decoder_arch != "legacy_transformer":
+        raise ValueError(
+            f"Unsupported decoder architecture {decoder_arch!r}; only the original "
+            "Decoder can produce decoder-side PC memory"
+        )
+    if int(restored.get("memory_schema_version", 1)) == 1:
+        # A schema-v1 original-Decoder model checkpoint can still be used as a
+        # producer, but its stale memory is never loaded or migrated.
+        restored["memory_schema_version"] = 2
+    restored["memory_architecture"] = "DINO_SCOD_PC_HBM"
+    restored["decoder_arch"] = "legacy_transformer"
     try:
         config = DinoPCHBMConfig(**restored)
     except TypeError as error:
         raise RuntimeError(
             "Checkpoint pc_cfg is incompatible with the current DinoPCHBMConfig schema"
         ) from error
-    if migrated_legacy:
-        config.boundary_feature_channels = (5, 8, 8, 14)
-        config.use_pc_boundary_context = False
-        config.use_gbe = False
-        config.use_ode = False
-        config.use_rcab = False
-        print(
-            "Migrated legacy schema-v1 Decoder config: "
-            "decoder_arch=legacy_transformer, "
-            "boundary_feature_channels=(5, 8, 8, 14), export_schema=2"
-        )
     if str(getattr(config, "pc_placement", "decoder")) != "decoder":
         raise ValueError("This utility only supports decoder-side PC-HBM checkpoints")
     return config

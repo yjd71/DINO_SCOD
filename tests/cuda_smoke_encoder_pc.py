@@ -3,8 +3,8 @@
 This script intentionally exposes no batch-size override and has no OOM
 fallback.  The only reduced capacities are route top-2, parent top-2, and
 query chunk 32, supplied by :func:`ddp_smoke_encoder_pc.smoke_config`.  It loads
-the real local frozen DINOv2-B/14 checkpoint and the real unchanged BGFBR
-implementation with decoder-side PC permanently detached.
+the real local frozen DINOv2-B/14 checkpoint and the real unchanged original
+Decoder with decoder-side PC permanently detached.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ if str(REPO_ROOT) not in sys.path:
 
 import torch
 
-from Model.decoder import build_decoder
+from Model.decoder import Decoder
 from Model.PC_HBM.encoder import DinoFeatureBundle
 from ddp_smoke_encoder_pc import (
     EncoderPCSmokePipeline,
@@ -29,7 +29,6 @@ from ddp_smoke_encoder_pc import (
     smoke_config,
     synthetic_gt,
     synthetic_memory,
-    synthetic_rgb,
 )
 from Model.PC_HBM.encoder.teacher_pseudo_refiner import (
     teacher_pseudo_refiner_labeled_loss,
@@ -190,13 +189,11 @@ def _run_base_batch16(
     bundle = _extract_real_bundle(dino, BASE_BATCH, torch.device("cuda"))
     if bundle.patch_tokens[0].shape[0] != BASE_BATCH:
         raise AssertionError("Base physical batch is not fixed at 16")
-    rgb = synthetic_rgb(BASE_BATCH, torch.device("cuda"), torch.float16)
     gt = synthetic_gt(BASE_BATCH, torch.device("cuda"))
     with _autocast():
         outputs, aux, refined = model(
             bundle.patch_tokens,
             bundle.cls_tokens,
-            rgb,
             memory,
             branch="base",
             stage=stage,
@@ -216,7 +213,7 @@ def _run_base_batch16(
     if model.student_refiner.call_count != 1:
         raise AssertionError("Base epoch21 must execute labeled Refiner once")
     peak = _peak_gib()
-    del bundle, rgb, gt, outputs, aux, refined, core_loss, refiner_loss, loss, memory
+    del bundle, gt, outputs, aux, refined, core_loss, refiner_loss, loss, memory
     optimizer.zero_grad(set_to_none=True)
     _release()
     return peak
@@ -252,13 +249,11 @@ def _run_ts_batch32(
     labeled_bundle = _extract_real_bundle(dino, TS_BATCH, torch.device("cuda"))
     if labeled_bundle.patch_tokens[0].shape[0] != TS_BATCH:
         raise AssertionError("Student labeled physical batch is not fixed at 32")
-    labeled_rgb = synthetic_rgb(TS_BATCH, torch.device("cuda"), torch.float16)
     labeled_gt = synthetic_gt(TS_BATCH, torch.device("cuda"))
     with _autocast():
         labeled_outputs, labeled_aux, labeled_refined = model(
             labeled_bundle.patch_tokens,
             labeled_bundle.cls_tokens,
-            labeled_rgb,
             memory,
             branch="student_labeled",
             stage=stage,
@@ -275,7 +270,7 @@ def _run_ts_batch32(
     _assert_finite_gradients(model, "TS labeled batch32")
     if labeled_outputs[3].shape[0] != TS_BATCH:
         raise AssertionError("Student labeled z_core did not retain batch32")
-    del labeled_bundle, labeled_rgb, labeled_gt, labeled_outputs, labeled_aux
+    del labeled_bundle, labeled_gt, labeled_outputs, labeled_aux
     del labeled_refined, labeled_core_loss, labeled_refiner_loss, labeled_loss
     _release()
 
@@ -283,27 +278,22 @@ def _run_ts_batch32(
     teacher_bundle = _extract_real_bundle(dino, TS_BATCH, torch.device("cuda"))
     if teacher_bundle.patch_tokens[0].shape[0] != TS_BATCH:
         raise AssertionError("Teacher physical batch is not fixed at 32")
-    teacher_rgb = synthetic_rgb(TS_BATCH, torch.device("cuda"), torch.float16)
     with torch.inference_mode(), _autocast():
-        teacher_payload = model.teacher_pseudo(
-            teacher_bundle, teacher_rgb, memory, stage
-        )
+        teacher_payload = model.teacher_pseudo(teacher_bundle, memory, stage)
     if teacher_payload["z_core"].shape[0] != TS_BATCH:
         raise AssertionError("Teacher z_core did not retain batch32")
     pseudo = prepare_encoder_pc_pseudo_targets(teacher_payload, config)
-    del teacher_bundle, teacher_rgb, teacher_payload
+    del teacher_bundle, teacher_payload
     _release()
 
     # Student unlabeled B=32: full Adapter + Decoder z_core, never Refiner.
     unlabeled_bundle = _extract_real_bundle(dino, TS_BATCH, torch.device("cuda"))
     if unlabeled_bundle.patch_tokens[0].shape[0] != TS_BATCH:
         raise AssertionError("Student unlabeled physical batch is not fixed at 32")
-    unlabeled_rgb = synthetic_rgb(TS_BATCH, torch.device("cuda"), torch.float16)
     with _autocast():
         unlabeled_outputs, unlabeled_core_aux, unlabeled_refined = model(
             unlabeled_bundle.patch_tokens,
             unlabeled_bundle.cls_tokens,
-            unlabeled_rgb,
             memory,
             branch="student_unlabeled",
             stage=stage,
@@ -322,7 +312,7 @@ def _run_ts_batch32(
     if student_aux["z_core"] is not unlabeled_outputs[3]:
         raise AssertionError("Student unlabeled supervision is not outputs[3] z_core")
     scaler.scale(unlabeled_loss).backward()
-    del unlabeled_bundle, unlabeled_rgb, unlabeled_outputs, unlabeled_core_aux
+    del unlabeled_bundle, unlabeled_outputs, unlabeled_core_aux
     del unlabeled_refined, student_aux, pseudo, unlabeled_loss
     _release()
 
@@ -363,11 +353,7 @@ def main() -> None:
         raise AssertionError("CUDA smoke capacity contract changed")
     dino, dino_weight_fingerprint = _load_frozen_dino(device)
     model = EncoderPCSmokePipeline(config).to(device)
-    real_decoder = build_decoder(
-        config.decoder_arch,
-        pc_cfg=config,
-        attach_pc=False,
-    ).to(device)
+    real_decoder = Decoder(pc_cfg=None).to(device)
     if real_decoder.pc_hbm is not None or any(
         name.startswith("pc_hbm.") for name in real_decoder.state_dict()
     ):
@@ -381,7 +367,9 @@ def main() -> None:
     def require_decoder_off(label: str):
         def hook(_module, _args, kwargs):
             if kwargs.get("pc_mode") != "off" or kwargs.get("memory") is not None:
-                raise AssertionError(f"{label} BGFBR did not run with PC permanently off")
+                raise AssertionError(
+                    f"{label} original Decoder did not run with PC permanently off"
+                )
             decoder_calls[label] += 1
 
         return hook
@@ -423,12 +411,12 @@ def main() -> None:
     if any(parameter.grad is not None for parameter in dino.parameters()):
         raise AssertionError("CUDA smoke produced gradients for frozen DINO")
     if decoder_calls != {"student": 3, "teacher": 1}:
-        raise AssertionError(f"Unexpected real BGFBR call counts: {decoder_calls}")
+        raise AssertionError(f"Unexpected original Decoder call counts: {decoder_calls}")
     print(
         "[PASS] encoder_pc CUDA AMP: "
         f"Base={BASE_BATCH}, Teacher={TS_BATCH}, StudentL={TS_BATCH}, "
         f"StudentU={TS_BATCH}, route_top=2, parent_top=2, chunk=32, "
-        "dino=real_frozen_vitb14, decoder=real_bgfbr_off, "
+        "dino=real_frozen_vitb14, decoder=real_original_off, "
         f"base_peak={base_peak:.2f} GiB, ts_peak={ts_peak:.2f} GiB"
     )
 

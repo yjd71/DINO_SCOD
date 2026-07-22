@@ -9,9 +9,8 @@ from Model.PC_HBM.training.losses import (
     pc_hbm_pc_only_labeled_loss,
     pc_injection_strength,
     pc_mode_for_epoch,
-    structure_loss,
 )
-from Model.PC_HBM.training.optimizer import migration_aware_parameter_groups
+from Model.PC_HBM.training.optimizer import trainable_parameter_groups
 
 
 def _outputs(size=16):
@@ -84,25 +83,19 @@ def test_schedule_and_ramp_are_one_based():
     assert [pc_injection_strength(e, cfg) for e in (10, 11, 12, 13)] == [0.0, 1 / 3, 2 / 3, 1.0]
 
 
-def test_explicitly_reused_pc_parameters_use_half_learning_rate():
+def test_all_original_decoder_parameters_use_the_configured_learning_rate():
     module = torch.nn.Module()
     module.base = torch.nn.Linear(2, 2)
     module.pc_hbm = torch.nn.Linear(2, 2)
-    groups = migration_aware_parameter_groups(
+    groups = trainable_parameter_groups(
         module,
         base_lr=2.0e-4,
-        reused_parameter_names=("base.weight", "pc_hbm.weight"),
     )
-    by_name = {group["group_name"]: group for group in groups}
-    assert by_name["base"]["lr"] == 2.0e-4
-    assert by_name["migrated_pc"]["lr"] == 1.0e-4
-    assert any(
-        parameter is module.pc_hbm.weight
-        for parameter in by_name["migrated_pc"]["params"]
-    )
-    assert any(
-        parameter is module.base.weight for parameter in by_name["base"]["params"]
-    )
+    assert len(groups) == 1
+    assert groups[0]["group_name"] == "decoder"
+    assert groups[0]["lr"] == 2.0e-4
+    grouped = {id(parameter) for parameter in groups[0]["params"]}
+    assert grouped == {id(parameter) for parameter in module.parameters()}
 
 
 def test_off_and_parent_only_loss_matrix():
@@ -179,7 +172,7 @@ def test_training_fails_fast_on_memory_fallback():
         raise AssertionError("full PC-HBM training must reject baseline fallback")
 
 
-def test_decoder_base_loss_keeps_legacy_five_output_contract():
+def test_decoder_base_loss_keeps_original_five_output_contract():
     cfg = DinoPCHBMConfig()
     outputs = _outputs()
     gt = torch.rand(1, 1, 16, 16)
@@ -194,74 +187,11 @@ def test_decoder_base_loss_keeps_legacy_five_output_contract():
     torch.testing.assert_close(actual, base_structure_loss(outputs, gt))
 
 
-def test_decoder_base_loss_supervises_all_bgfbr_foreground_and_background_logits():
-    cfg = DinoPCHBMConfig()
-    cfg.lambda_bgfbr_fg = 1.5
-    cfg.lambda_bgfbr_bg = 1.25
-    cfg.lambda_bgfbr_final = 0.75
-    cfg.lambda_bgfbr_global = 0.5
-    outputs = _outputs()
-    gt = (torch.rand(1, 1, 32, 32) > 0.5).float()
-    target_output_scale = torch.nn.functional.interpolate(
-        gt, size=(16, 16), mode="nearest"
-    )
-    foreground = tuple(
-        torch.randn(1, 1, 16, 16, requires_grad=True) for _ in range(4)
-    )
-    background = tuple(
-        torch.randn(1, 1, 16, 16, requires_grad=True) for _ in range(4)
-    )
-    aux = {
-        "decoder_architecture": "bgfbr_pc_v1",
-        "bgfbr": {"fg_output": foreground, "bg_output": background},
-    }
-
-    actual = decoder_base_loss(outputs, aux, gt, cfg)
-    weights = (1.0 / 16.0, 1.0 / 8.0, 1.0 / 4.0, 1.0 / 2.0)
-    expected_fg = sum(
-        weight * structure_loss(logit, target_output_scale)
-        for weight, logit in zip(weights, foreground)
-    )
-    expected_bg = sum(
-        weight * structure_loss(logit, 1.0 - target_output_scale)
-        for weight, logit in zip(weights, background)
-    )
-    expected = (
-        1.5 * expected_fg
-        + 1.25 * expected_bg
-        + 0.75 * structure_loss(outputs[3], target_output_scale)
-        + 0.5 * structure_loss(outputs[4], target_output_scale)
-    )
-    torch.testing.assert_close(actual, expected)
-
-    actual.backward()
-    assert all(
-        logit.grad is not None and torch.isfinite(logit.grad).all()
-        for logit in foreground
-    )
-    assert all(
-        logit.grad is not None and torch.isfinite(logit.grad).all()
-        for logit in background
-    )
-
-
-def test_teacher_only_pc_loss_excludes_bgfbr_base_supervision():
+def test_teacher_only_pc_loss_excludes_original_decoder_base_supervision():
     cfg = DinoPCHBMConfig()
     outputs = _outputs()
     gt = torch.rand(1, 1, 16, 16)
     aux = _full_aux(outputs)
-    foreground = tuple(
-        torch.randn(1, 1, 16, 16, requires_grad=True) for _ in range(4)
-    )
-    background = tuple(
-        torch.randn(1, 1, 16, 16, requires_grad=True) for _ in range(4)
-    )
-    aux.update(
-        {
-            "decoder_architecture": "bgfbr_pc_v1",
-            "bgfbr": {"fg_output": foreground, "bg_output": background},
-        }
-    )
 
     loss, log = pc_hbm_pc_only_labeled_loss(
         outputs,
@@ -274,7 +204,6 @@ def test_teacher_only_pc_loss_excludes_bgfbr_base_supervision():
     loss.backward()
 
     assert "L_base" not in log
-    assert all(logit.grad is None for logit in foreground + background)
     assert all(
         output.grad is None or torch.count_nonzero(output.grad) == 0
         for output in outputs

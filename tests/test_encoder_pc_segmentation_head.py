@@ -35,7 +35,7 @@ def _evidence() -> dict[str, torch.Tensor]:
 
 
 class _Decoder(nn.Module):
-    decoder_arch = "bgfbr_pc_v1"
+    decoder_arch = "legacy_transformer"
 
     def __init__(self) -> None:
         super().__init__()
@@ -43,7 +43,7 @@ class _Decoder(nn.Module):
         self.scale = nn.Parameter(torch.ones(()))
         self.calls: list[dict] = []
 
-    def forward(self, features, image_rgb, **kwargs):
+    def forward(self, features, **kwargs):
         self.calls.append(kwargs)
         z_core = self.scale * torch.ones(
             features[0].size(0), 1, 98, 98, device=features[0].device
@@ -88,12 +88,10 @@ def _head() -> tuple[EncoderPCSegmentationHead, _Decoder, Mock]:
 def test_role_contract_runs_refiner_only_for_labeled_and_teacher_roles() -> None:
     head, decoder, refiner_forward = _head()
     bundle = _bundle()
-    rgb = torch.randn(1, 3, 392, 392)
 
     labeled = head(
         role="labeled_core",
         bundle=bundle,
-        image_rgb=rgb,
         mode="off",
         return_aux=True,
     )
@@ -109,7 +107,6 @@ def test_role_contract_runs_refiner_only_for_labeled_and_teacher_roles() -> None
     student = head(
         role="student_core",
         bundle=bundle,
-        image_rgb=rgb,
         return_aux=True,
     )
     assert isinstance(student, EncoderPCCoreResult)
@@ -118,7 +115,6 @@ def test_role_contract_runs_refiner_only_for_labeled_and_teacher_roles() -> None
     z_core = head(
         role="inference",
         bundle=bundle,
-        image_rgb=rgb,
         return_aux=False,
     )
     assert torch.equal(z_core, decoder.scale * torch.ones_like(z_core))
@@ -127,7 +123,6 @@ def test_role_contract_runs_refiner_only_for_labeled_and_teacher_roles() -> None
     teacher = head(
         role="teacher_pseudo",
         bundle=bundle,
-        image_rgb=rgb,
         epoch=1,
     )
     assert teacher["z_core"] is teacher["outputs"][3]

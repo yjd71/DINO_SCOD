@@ -60,25 +60,15 @@ class DinoPCHBMEngine(nn.Module):
             geometry_dim=cfg.geometry_dim,
         )
         dim = cfg.memory_dim
-        decoder_arch = str(getattr(cfg, 'decoder_arch', 'legacy_transformer'))
-        is_bgfbr = decoder_arch == 'bgfbr_pc_v1'
         boundary_contract = tuple(
-            getattr(cfg, 'boundary_feature_channels', (7, 10, 10, 16) if is_bgfbr else (5, 8, 8, 14))
+            getattr(cfg, 'boundary_feature_channels', (5, 8, 8, 14))
         )
-        if len(boundary_contract) != 4:
-            raise ValueError('boundary_feature_channels must contain P3/P2/P1/mixture channels')
-        self.p3_boundary_in_ch = int(
-            getattr(cfg, 'p3_boundary_in_ch', boundary_contract[0])
-        )
-        p2_boundary_in_ch = int(
-            getattr(cfg, 'p2_boundary_in_ch', boundary_contract[1])
-        )
-        p1_boundary_in_ch = int(
-            getattr(cfg, 'p1_boundary_in_ch', boundary_contract[2])
-        )
-        mixture_context_ch = int(
-            getattr(cfg, 'mixture_context_ch', boundary_contract[3])
-        )
+        if boundary_contract != (5, 8, 8, 14):
+            raise ValueError(
+                'boundary_feature_channels is fixed to (5, 8, 8, 14) '
+                'for the original Decoder'
+            )
+        self.p3_boundary_in_ch = 5
 
         self.boundary3 = BoundaryQueryHead3(
             top_ratio=cfg.p3_top_ratio,
@@ -132,7 +122,7 @@ class DinoPCHBMEngine(nn.Module):
             detach_refs=cfg.detach_p3_refs_for_p2,
             num_heads=cfg.attn_num_heads,
             head_dim=cfg.attn_head_dim,
-            boundary_in_ch=p2_boundary_in_ch,
+            boundary_in_ch=8,
         )
         self.p1_pra = P1PixelRefinementAttention(
             p1_ch=spec.p1,
@@ -145,7 +135,7 @@ class DinoPCHBMEngine(nn.Module):
             detach_refs=cfg.detach_p2_refs_for_p1,
             num_heads=cfg.attn_num_heads,
             head_dim=cfg.attn_head_dim,
-            boundary_in_ch=p1_boundary_in_ch,
+            boundary_in_ch=8,
         )
         self.mixture = AdaptiveMixtureHead(
             r_max=cfg.r_max,
@@ -154,14 +144,8 @@ class DinoPCHBMEngine(nn.Module):
             init_bias=cfg.mixture_init_bias,
             use_branch_quality=True,
             use_branch_dropout=True,
-            context_ch=mixture_context_ch,
+            context_ch=14,
         )
-        if is_bgfbr:
-            from Model.BGFBR import P3P2CorrectionBridge
-
-            self.p3_p2_bridge = P3P2CorrectionBridge(channels=spec.p2)
-        else:
-            self.p3_p2_bridge = None
         self.memory_builder = DinoMemoryBuilder(
             cfg, self.router, self.parent_retriever, self.child_query
         )
@@ -243,19 +227,9 @@ class DinoPCHBMEngine(nn.Module):
         m3: torch.Tensor,
         memory,
         query_image_ids: Optional[Sequence[str]] = None,
-        edge_context: torch.Tensor | None = None,
-        dual_uncertainty: torch.Tensor | None = None,
     ) -> Dict[str, object]:
         prob3 = torch.sigmoid(m3)
         boundary_input = _boundary_features(prob3)
-        if self.p3_boundary_in_ch == 7:
-            zeros = torch.zeros_like(prob3)
-            edge = zeros if edge_context is None else edge_context
-            dual = zeros if dual_uncertainty is None else dual_uncertainty
-            target = prob3.shape[-2:]
-            edge = F.interpolate(edge, size=target, mode='bilinear', align_corners=False)
-            dual = F.interpolate(dual, size=target, mode='bilinear', align_corners=False)
-            boundary_input = torch.cat([boundary_input, edge, dual], dim=1)
         if boundary_input.size(1) != self.p3_boundary_in_ch:
             raise RuntimeError(
                 f'P3 boundary contract expected {self.p3_boundary_in_ch} channels, '
@@ -305,8 +279,6 @@ class DinoPCHBMEngine(nn.Module):
         memory,
         epoch: Optional[int],
         query_image_ids: Optional[Sequence[str]] = None,
-        edge_context: torch.Tensor | None = None,
-        dual_uncertainty: torch.Tensor | None = None,
     ) -> Dict[str, object]:
         aux = self.forward_parent_only(
             x3,
@@ -314,8 +286,6 @@ class DinoPCHBMEngine(nn.Module):
             m3,
             memory,
             query_image_ids,
-            edge_context=edge_context,
-            dual_uncertainty=dual_uncertainty,
         )
         parent_ret = aux['parent_ret']
         batch_ids = aux['batch_ids3']
@@ -430,15 +400,11 @@ class DinoPCHBMEngine(nn.Module):
         p2: torch.Tensor,
         prob2: torch.Tensor,
         pc_maps: Dict[str, torch.Tensor],
-        edge_context: torch.Tensor | None = None,
-        dual_uncertainty: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         return self.p2_bra(
             p2=p2,
             prob2=prob2,
             pc_maps=pc_maps,
-            edge_context=edge_context,
-            dual_uncertainty=dual_uncertainty,
         )
 
     def forward_p1(
@@ -446,15 +412,11 @@ class DinoPCHBMEngine(nn.Module):
         p1: torch.Tensor,
         z_main: torch.Tensor,
         p2_aux: Dict[str, torch.Tensor],
-        edge_context: torch.Tensor | None = None,
-        dual_uncertainty: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         return self.p1_pra(
             p1=p1,
             z_main=z_main,
             p2_aux=p2_aux,
-            edge_context=edge_context,
-            dual_uncertainty=dual_uncertainty,
         )
 
     def forward_mixture(
@@ -465,7 +427,6 @@ class DinoPCHBMEngine(nn.Module):
         epoch: Optional[int],
         *,
         ts_continuation: bool = False,
-        extra_context: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         temperature, epsilon = self.cfg.mixture_schedule(
             epoch, ts_continuation=ts_continuation
@@ -477,7 +438,6 @@ class DinoPCHBMEngine(nn.Module):
             epoch=epoch,
             temperature=temperature,
             eps_floor=epsilon,
-            extra_context=extra_context,
         )
 
     @torch.no_grad()

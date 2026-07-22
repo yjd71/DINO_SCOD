@@ -16,7 +16,7 @@ class DinoFeatureBundle:
     """Four frozen DINOv2 patch-token levels and their CLS tokens.
 
     The bundle retains the DINO sequence representation.  Spatial reshaping is
-    owned by the encoder adapter, while the unchanged BGFBR decoder continues to
+    owned by the encoder adapter, while the unchanged original Decoder continues to
     receive the original ``[B, N, C]`` token layout.
     """
 

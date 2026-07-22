@@ -74,8 +74,8 @@ class P1PixelRefinementAttention(nn.Module):
         self.head_dim = int(head_dim)
         self.inner = self.num_heads * self.head_dim
         self.boundary_in_ch = int(boundary_in_ch)
-        if self.boundary_in_ch not in {8, 10}:
-            raise ValueError("P1 boundary_in_ch must be 8 (legacy) or 10 (BGFBR)")
+        if self.boundary_in_ch != 8:
+            raise ValueError("P1 boundary_in_ch is fixed to 8 for the original Decoder")
         if self.inner != self.dim:
             raise ValueError("num_heads * head_dim must equal dim")
         self.boundary_head = BoundaryQueryHead1(
@@ -110,8 +110,6 @@ class P1PixelRefinementAttention(nn.Module):
         z_main: torch.Tensor,
         p1_hw: tuple[int, int],
         p2_aux: Mapping[str, torch.Tensor],
-        edge_context: torch.Tensor | None = None,
-        dual_uncertainty: torch.Tensor | None = None,
     ) -> torch.Tensor:
         z_p1 = F.interpolate(
             z_main, size=p1_hw, mode="bilinear", align_corners=False
@@ -124,13 +122,6 @@ class P1PixelRefinementAttention(nn.Module):
             for name in ("B2_refined_map", "G2_refined_map", "valid2_map")
         ]
         boundary_input = torch.cat([base, *extras], dim=1)
-        if self.boundary_in_ch == 10:
-            zeros = torch.zeros_like(z_p1)
-            edge = zeros if edge_context is None else edge_context
-            dual = zeros if dual_uncertainty is None else dual_uncertainty
-            edge = F.interpolate(edge, size=p1_hw, mode="bilinear", align_corners=False)
-            dual = F.interpolate(dual, size=p1_hw, mode="bilinear", align_corners=False)
-            boundary_input = torch.cat([boundary_input, edge, dual], dim=1)
         if boundary_input.size(1) != self.boundary_in_ch:
             raise RuntimeError(
                 f"P1 boundary contract expected {self.boundary_in_ch} channels, "
@@ -143,8 +134,6 @@ class P1PixelRefinementAttention(nn.Module):
         p1: torch.Tensor,
         z_main: torch.Tensor,
         p2_aux: Mapping[str, torch.Tensor],
-        edge_context: torch.Tensor | None = None,
-        dual_uncertainty: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         batch_size, _, height, width = p1.shape
         if (height, width) != (98, 98):
@@ -157,8 +146,6 @@ class P1PixelRefinementAttention(nn.Module):
             z_main,
             (height, width),
             p2_aux,
-            edge_context=edge_context,
-            dual_uncertainty=dual_uncertainty,
         )
         boundary, indices = self.boundary_head(boundary_input)
         batch_ids = indices["batch_ids"]

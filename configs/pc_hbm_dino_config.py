@@ -27,28 +27,15 @@ class DinoPCHBMConfig:
     output_size: int = 98
     dino_layer_indices: Tuple[int, int, int, int] = (2, 5, 8, 11)
 
-    # Decoder identity.  This contract is independent of checkpoint format v2.
-    experiment_profile: str = "bgfbr_pc"
+    # Original Decoder identity.  This contract is independent of checkpoint format v2.
+    experiment_profile: str = "legacy_pc"
     experiment_base_mode: str = "scheduled"
-    decoder_arch: str = "bgfbr_pc_v1"
+    pc_placement: str = "decoder"
+    decoder_arch: str = "legacy_transformer"
     decoder_contract_version: int = 1
 
-    # BGFBR semantics that affect memory feature interpretation.
-    gbe_version: str = "sobel_rgb_v1"
-    gbe_normalization: str = "per_sample_max"
-    gbe_padding_mode: str = "replicate"
-    gpm_dilations: Tuple[int, int, int] = (1, 3, 5)
-    gpm_contract: str = "five_branch_pam_v1"
-    f4_adapter_contract: str = "128_32_128_zero_init_gamma_v1"
-    ode_contract: str = "dual_path_scalar_alpha_v1"
-    rcab_reduction: int = 16
-    bgfbr_stage_count: int = 4
-    fg_bg_contract: str = "independent_fg_bg_logits_v1"
-    boundary_feature_channels: Tuple[int, int, int, int] = (7, 10, 10, 16)
-    use_gbe: bool = True
-    use_ode: bool = True
-    use_rcab: bool = True
-    use_pc_boundary_context: bool = True
+    # Decoder-side PC descriptors follow the original Decoder feature contract.
+    boundary_feature_channels: Tuple[int, int, int, int] = (5, 8, 8, 14)
     sync_bn: bool = False
 
     # PC-HBM dimensions.
@@ -67,7 +54,7 @@ class DinoPCHBMConfig:
     memory_gpu_cache: bool = False
     memory_format_version: int = 1
     memory_schema_version: int = 2
-    memory_architecture: str = "DINO_SCOD_BGFBR_PC_HBM"
+    memory_architecture: str = "DINO_SCOD_PC_HBM"
     exclude_self_match: bool = True
 
     route_top_img_k: int = 8
@@ -143,10 +130,6 @@ class DinoPCHBMConfig:
 
     # Labeled loss.
     lambda_final: float = 1.0
-    lambda_bgfbr_fg: float = 1.0
-    lambda_bgfbr_bg: float = 1.0
-    lambda_bgfbr_final: float = 1.0
-    lambda_bgfbr_global: float = 1.0
     lambda_mem: float = 0.20
     lambda_boundary: float = 0.10
     lambda_mix_oracle: float = 0.10
@@ -157,7 +140,6 @@ class DinoPCHBMConfig:
 
     # Unlabeled branch.
     lambda_u: float = 1.0
-    lambda_u_bg: float = 1.0
     use_hard_pseudo: bool = True
     hard_loss_weight: float = 2.0
     pseudo_fg_threshold: float = 0.70
@@ -184,20 +166,23 @@ class DinoPCHBMConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.enabled, bool):
             raise TypeError("enabled must be a bool.")
-        if self.decoder_arch not in {"bgfbr_pc_v1", "legacy_transformer"}:
-            raise ValueError(f"Unsupported decoder architecture: {self.decoder_arch!r}")
+        if not isinstance(self.sync_bn, bool):
+            raise TypeError("sync_bn must be a bool.")
+        if self.pc_placement != "decoder":
+            raise ValueError("DinoPCHBMConfig pc_placement must be 'decoder'")
+        if self.decoder_arch != "legacy_transformer":
+            raise ValueError("decoder_arch must be 'legacy_transformer'")
         if self.decoder_contract_version != 1:
             raise ValueError("decoder_contract_version must be 1")
         if self.memory_schema_version != 2:
             raise ValueError("PC-HBM memory schema v1 is obsolete; rebuild memory with schema v2")
-        if self.memory_architecture != "DINO_SCOD_BGFBR_PC_HBM":
-            raise ValueError("memory_architecture must be DINO_SCOD_BGFBR_PC_HBM")
-        if tuple(self.gpm_dilations) != (1, 3, 5):
-            raise ValueError("BGFBR GPM dilations are fixed to (1, 3, 5)")
-        if tuple(self.boundary_feature_channels) != (7, 10, 10, 16):
-            raise ValueError("PC boundary channels are fixed to P3/P2/P1/mixture = 7/10/10/16")
-        if self.rcab_reduction != 16 or self.bgfbr_stage_count != 4:
-            raise ValueError("BGFBR requires four stages and RCAB reduction 16")
+        if self.memory_architecture != "DINO_SCOD_PC_HBM":
+            raise ValueError("memory_architecture must be DINO_SCOD_PC_HBM")
+        if tuple(self.boundary_feature_channels) != (5, 8, 8, 14):
+            raise ValueError(
+                "Original Decoder PC boundary channels are fixed to "
+                "P3/P2/P1/mixture = 5/8/8/14"
+            )
         if self.memory_source != "labeled_only":
             raise ValueError("DINO PC-HBM memory must be labeled_only.")
         if self.use_unlabeled_memory_update:
@@ -227,14 +212,6 @@ class DinoPCHBMConfig:
             raise ValueError("Feature distillation weights must be non-negative.")
         if self.hard_loss_weight < 0:
             raise ValueError("hard_loss_weight must be non-negative.")
-        if min(
-            self.lambda_bgfbr_fg,
-            self.lambda_bgfbr_bg,
-            self.lambda_bgfbr_final,
-            self.lambda_bgfbr_global,
-            self.lambda_u_bg,
-        ) < 0:
-            raise ValueError("BGFBR labeled/unlabeled loss weights must be non-negative.")
         if self.pseudo_hard_ramp_epochs < 1:
             raise ValueError("pseudo_hard_ramp_epochs must be at least one.")
         if not 0.0 <= self.pseudo_bg_threshold < 0.5 < self.pseudo_fg_threshold <= 1.0:
@@ -334,21 +311,7 @@ class DinoPCHBMConfig:
             "geometry_dim": self.geometry_dim,
             "storage_dtype": self.memory_storage_dtype,
             "source": self.memory_source,
-            "gbe_version": self.gbe_version,
-            "gbe_normalization": self.gbe_normalization,
-            "gbe_padding_mode": self.gbe_padding_mode,
-            "gpm_dilations": tuple(self.gpm_dilations),
-            "gpm_contract": self.gpm_contract,
-            "f4_adapter_contract": self.f4_adapter_contract,
-            "ode_contract": self.ode_contract,
-            "rcab_reduction": self.rcab_reduction,
-            "bgfbr_stage_count": self.bgfbr_stage_count,
-            "fg_bg_contract": self.fg_bg_contract,
             "boundary_feature_channels": tuple(self.boundary_feature_channels),
-            "use_gbe": self.use_gbe,
-            "use_ode": self.use_ode,
-            "use_rcab": self.use_rcab,
-            "use_pc_boundary_context": self.use_pc_boundary_context,
             "sync_bn": self.sync_bn,
         }
         if producer_fingerprint is not None:
@@ -367,7 +330,7 @@ class EncoderPCHBMConfig:
     enabled: bool = True
     experiment_profile: str = "encoder_pc"
     pc_placement: str = "encoder"
-    decoder_arch: str = "bgfbr_pc_v1"
+    decoder_arch: str = "legacy_transformer"
     architecture: str = "DINO_SCOD_ENCODER_PC_HBM"
     adapter_architecture: str = "encoder_pc_hbm_v1"
     feature_space: str = "frozen_dinov2_projected_encoder_v1"
@@ -467,7 +430,7 @@ class EncoderPCHBMConfig:
             raise TypeError("enabled must be a bool.")
         fixed = {
             "pc_placement": (self.pc_placement, "encoder"),
-            "decoder_arch": (self.decoder_arch, "bgfbr_pc_v1"),
+            "decoder_arch": (self.decoder_arch, "legacy_transformer"),
             "architecture": (self.architecture, "DINO_SCOD_ENCODER_PC_HBM"),
             "input_size": (self.input_size, 392),
             "token_size": (self.token_size, 28),

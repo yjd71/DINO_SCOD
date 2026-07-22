@@ -8,7 +8,7 @@ import random
 import numpy as np
 import torch
 
-from configs.bgfbr_experiments import (
+from configs.pc_hbm_experiments import (
     apply_experiment_profile,
     build_experiment_profile,
     experiment_profile_names,
@@ -43,13 +43,13 @@ def parse_args():
         "--training-design",
         choices=("teacher_only", "joint"),
         default="teacher_only",
-        help="Teacher-only distillation is the default; joint preserves the legacy PC-HBM flow.",
+        help="Teacher-only distillation is the default; joint preserves decoder-side PC-HBM.",
     )
     parser.add_argument(
         "--experiment-profile",
         choices=experiment_profile_names(),
-        default="bgfbr_pc",
-        help="Architecture/component profile; Base-only mode overrides do not alter TS pseudo modes.",
+        default="encoder_pc",
+        help="PC placement/ablation profile (default: encoder_pc).",
     )
     parser.add_argument(
         "--teacher-pc-checkpoint",
@@ -96,7 +96,7 @@ def validate_training_args(args) -> None:
     if args.training_design == "teacher_only":
         if args.allow_legacy_pc_init:
             raise ValueError("--allow-legacy-pc-init is only valid with --training-design joint")
-    profile_name = getattr(args, "experiment_profile", "bgfbr_pc")
+    profile_name = getattr(args, "experiment_profile", "encoder_pc")
     if build_experiment_profile(profile_name).pc_placement == "encoder":
         if args.training_design != "teacher_only":
             raise ValueError("encoder_pc uses its fixed EMA Teacher/Student design")
@@ -136,14 +136,7 @@ def main():
 
     if encoder_profile:
         pc_cfg = EncoderPCHBMConfig()
-        # Commit 1's canonical encoder profile has no overrides and predates
-        # the encoder-aware registry application added with the ablations.
-        # Future encoder profiles must still apply their explicit overrides.
-        experiment_profile = (
-            requested_profile
-            if args.experiment_profile == "encoder_pc"
-            else apply_experiment_profile(pc_cfg, args.experiment_profile)
-        )
+        experiment_profile = apply_experiment_profile(pc_cfg, args.experiment_profile)
         cfg.use_amp = True
     else:
         pc_cfg = DinoPCHBMConfig()
@@ -166,7 +159,7 @@ def main():
         model,
         context,
         # Both TS designs alternate labeled and unlabeled graphs.  In the
-        # teacher-only BGFBR path, the unlabeled graph intentionally omits the
+        # teacher-only decoder-side path, the unlabeled graph intentionally omits the
         # Stage-1 foreground head while the labeled graph supervises it.
         # DDP must therefore discover the per-forward unused set for raw and
         # joint Students alike.

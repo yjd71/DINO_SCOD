@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 import inference as inference_module
-from configs.bgfbr_experiments import (
+from configs.pc_hbm_experiments import (
     apply_experiment_profile,
     experiment_profile_names,
 )
@@ -34,7 +34,7 @@ class _TinyAdapter(nn.Module):
 
 
 class _TinyDecoder(nn.Module):
-    decoder_architecture = "bgfbr_pc_v1"
+    decoder_architecture = "legacy_transformer"
     decoder_contract_version = 1
 
     def __init__(self):
@@ -327,7 +327,15 @@ def test_encoder_cli_is_canonical_and_legacy_aliases_conflict(monkeypatch):
 def test_legacy_cli_rejects_model_checkpoint_and_keeps_decoder_alias(monkeypatch):
     monkeypatch.setattr(
         "sys.argv",
-        ["inference.py", "--checkpoint", "legacy.pth", "--datasets", "CAMO"],
+        [
+            "inference.py",
+            "--experiment-profile",
+            "legacy_off",
+            "--checkpoint",
+            "legacy.pth",
+            "--datasets",
+            "CAMO",
+        ],
     )
     args = inference_module.parse_args()
     inference_module.validate_inference_args(args)
@@ -392,14 +400,12 @@ def test_formal_head_returns_exact_z_core_and_never_calls_refiner():
         output = head(
             role="inference",
             bundle=bundle,
-            image_rgb=torch.zeros(1, 3, 392, 392),
             memory=memory,
             return_aux=False,
         )
         diagnostic_output = head(
             role="inference",
             bundle=bundle,
-            image_rgb=torch.zeros(1, 3, 392, 392),
             memory=None,
             allow_memory_fallback=True,
             return_aux=False,

@@ -3,7 +3,7 @@
 The standalone DDP/CUDA programs import the helpers in this module.  The
 expensive research components under test (Adapter, memory retrieval, refiner,
 pseudo confidence/loss and EMA) are production implementations.  Only frozen
-DINO feature extraction and the unchanged BGFBR core are represented by
+DINO feature extraction and the unchanged original Decoder are represented by
 strict shape-compatible doubles so fixed physical batches remain runnable on
 the reference 12 GiB GPU and on two CPU/Gloo ranks.
 """
@@ -107,10 +107,10 @@ class SyntheticFrozenDinoContract(nn.Module):
         return DinoFeatureBundle(patches, cls).validate()
 
 
-class SmokeBGFBRContractDecoder(nn.Module):
+class SmokeOriginalDecoderContract(nn.Module):
     """Small five-output Decoder double that enforces the encoder-PC boundary."""
 
-    decoder_arch = "bgfbr_pc_v1"
+    decoder_arch = "legacy_transformer"
 
     def __init__(self) -> None:
         super().__init__()
@@ -130,7 +130,6 @@ class SmokeBGFBRContractDecoder(nn.Module):
     def forward(
         self,
         features: Sequence[torch.Tensor],
-        image_rgb: torch.Tensor,
         *,
         memory=None,
         pc_mode: str = "off",
@@ -150,9 +149,6 @@ class SmokeBGFBRContractDecoder(nn.Module):
         for feature in features:
             if feature.shape != (batch, 784, 768):
                 raise ValueError("Decoder features must remain [B,784,768]")
-        if image_rgb.shape != (batch, 3, 392, 392):
-            raise ValueError("Decoder RGB evidence must be [B,3,392,392]")
-
         token_map = torch.stack(
             [feature.mean(dim=-1) for feature in features], dim=0
         ).mean(dim=0).reshape(batch, 1, 28, 28)
@@ -190,7 +186,7 @@ class EncoderPCSmokeSystem(nn.Module):
     def __init__(self, config: EncoderPCHBMConfig) -> None:
         super().__init__()
         adapter = EncoderPCHBMAdapter(config)
-        decoder = SmokeBGFBRContractDecoder()
+        decoder = SmokeOriginalDecoderContract()
         refiner = CountingTeacherPseudoLabelRefiner(config)
         self.config = config
         self.head = EncoderPCSegmentationHead(adapter, decoder, refiner)
@@ -201,7 +197,7 @@ class EncoderPCSmokeSystem(nn.Module):
         return self.head.adapter
 
     @property
-    def decoder(self) -> SmokeBGFBRContractDecoder:
+    def decoder(self) -> SmokeOriginalDecoderContract:
         return self.head.decoder
 
     @property
@@ -219,7 +215,6 @@ class EncoderPCSmokeSystem(nn.Module):
         *,
         role: str,
         bundle: DinoFeatureBundle,
-        image_rgb: torch.Tensor,
         memory: EncoderPCMemory | None,
         stage: EncoderPCStage | None = None,
         gt: torch.Tensor | None = None,
@@ -233,7 +228,6 @@ class EncoderPCSmokeSystem(nn.Module):
             core = self.head(
                 role="labeled_core",
                 bundle=bundle,
-                image_rgb=image_rgb,
                 memory=memory,
                 mode=stage.mode,
                 stage=stage.adapter_flags(require_same_image_positive=True),
@@ -263,7 +257,6 @@ class EncoderPCSmokeSystem(nn.Module):
             payload = self.head(
                 role="teacher_pseudo",
                 bundle=bundle,
-                image_rgb=image_rgb,
                 memory=memory,
                 stage=(stage.adapter_flags(False) if stage is not None else None),
                 epoch=self.config.final_epoch + int(ts_epoch),
@@ -280,7 +273,6 @@ class EncoderPCSmokeSystem(nn.Module):
             core = self.head(
                 role="student_core",
                 bundle=bundle,
-                image_rgb=image_rgb,
                 memory=memory,
                 stage=(stage.adapter_flags(False) if stage is not None else None),
                 epoch=self.config.final_epoch + int(ts_epoch),
@@ -413,10 +405,9 @@ def test_synthetic_dino_and_decoder_keep_full_shape_contracts() -> None:
     assert all(value.shape == (2, 768) for value in bundle.cls_tokens)
     assert all(not value.requires_grad for value in (*bundle.patch_tokens, *bundle.cls_tokens))
 
-    decoder = SmokeBGFBRContractDecoder()
+    decoder = SmokeOriginalDecoderContract()
     outputs, aux = decoder(
         bundle.patch_tokens,
-        images,
         memory=None,
         pc_mode="off",
         return_aux=True,
@@ -484,7 +475,6 @@ def test_system_uses_real_adapter_refiner_and_skips_unlabeled_refiner() -> None:
     labeled_loss = system(
         role="student_labeled",
         bundle=bundle,
-        image_rgb=images,
         memory=memory,
         stage=stage,
         gt=gt,
@@ -497,7 +487,6 @@ def test_system_uses_real_adapter_refiner_and_skips_unlabeled_refiner() -> None:
         payload = teacher(
             role="teacher_pseudo",
             bundle=bundle,
-            image_rgb=images,
             memory=memory,
             stage=stage,
         )
@@ -508,7 +497,6 @@ def test_system_uses_real_adapter_refiner_and_skips_unlabeled_refiner() -> None:
     unlabeled_loss = system(
         role="student_unlabeled",
         bundle=bundle,
-        image_rgb=images,
         memory=memory,
         stage=stage,
         pseudo=pseudo,
@@ -521,8 +509,8 @@ def test_system_uses_real_adapter_refiner_and_skips_unlabeled_refiner() -> None:
 
 
 def test_decoder_contract_rejects_any_pc_argument() -> None:
-    decoder = SmokeBGFBRContractDecoder()
+    decoder = SmokeOriginalDecoderContract()
     images = smoke_images(1, "cpu")
     bundle = SyntheticFrozenDinoContract()(images)
     with pytest.raises(AssertionError, match="memory=None"):
-        decoder(bundle.patch_tokens, images, memory=object(), pc_mode="off")
+        decoder(bundle.patch_tokens, memory=object(), pc_mode="off")

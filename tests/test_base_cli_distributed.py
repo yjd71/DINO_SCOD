@@ -44,6 +44,8 @@ def test_teacher_only_allows_sampled_images_fallback_with_baseline(monkeypatch):
         monkeypatch,
         "--training-design",
         "teacher_only",
+        "--experiment-profile",
+        "legacy_pc",
         "--baseline-checkpoint",
         "baseline_decoder.pth",
     )

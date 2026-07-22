@@ -13,7 +13,7 @@ import warnings
 from collections.abc import Mapping
 from contextlib import nullcontext
 
-from configs.bgfbr_experiments import (
+from configs.pc_hbm_experiments import (
     apply_experiment_profile,
     build_experiment_profile,
     experiment_profile_names,
@@ -308,7 +308,7 @@ def parse_args():
     parser.add_argument(
         '--experiment-profile',
         choices=experiment_profile_names(),
-        default='bgfbr_pc',
+        default='encoder_pc',
         help='Must match the profile used to produce the Decoder and optional memory.',
     )
     parser.add_argument(

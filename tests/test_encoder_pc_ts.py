@@ -23,10 +23,10 @@ class _TinyModule(nn.Module):
 
 
 class _TinyDecoder(_TinyModule):
-    decoder_arch = "bgfbr_pc_v1"
-    decoder_architecture = "bgfbr_pc_v1"
+    decoder_arch = "legacy_transformer"
+    decoder_architecture = "legacy_transformer"
 
-    def __init__(self, value=0.0):
+    def __init__(self, value=0.0, pc_cfg=None):
         super().__init__(value)
         self.pc_hbm = None
 
@@ -50,11 +50,7 @@ def _patch_encoder_model_construction(monkeypatch, *, loader=None):
         lambda *args, **kwargs: _TinyDino(),
     )
     monkeypatch.setattr(ts_model_module.torch, "load", lambda *args, **kwargs: {})
-    monkeypatch.setattr(
-        ts_model_module,
-        "build_decoder",
-        lambda *args, **kwargs: _TinyDecoder(),
-    )
+    monkeypatch.setattr(ts_model_module, "Decoder", _TinyDecoder)
     monkeypatch.setattr(
         ts_model_module, "EncoderPCHBMAdapter", lambda _config: _TinyModule()
     )
@@ -231,19 +227,15 @@ def test_encoder_ts_roles_execute_refiner_only_for_teacher_and_labeled_student(m
     model = _role_model()
     monkeypatch.setattr(ts_model_module, "DinoFeatureBundle", object)
     bundle = object()
-    rgb = torch.rand(1, 3, 2, 2)
 
-    teacher = model.teacher_pseudo(bundle, object(), 31, image_rgb=rgb)
+    teacher = model.teacher_pseudo(bundle, object(), 31)
     labeled_outputs, labeled_aux = model.student_labeled(
         bundle,
         object(),
         31,
         query_image_ids=["image"],
-        image_rgb=rgb,
     )
-    unlabeled_outputs, unlabeled_aux = model.student_unlabeled(
-        bundle, object(), 31, image_rgb=rgb
-    )
+    unlabeled_outputs, unlabeled_aux = model.student_unlabeled(bundle, object(), 31)
 
     assert "encoder_pc_hbm" in teacher
     assert model.teacher_encoder_pc_head.refiner_calls == 1
@@ -263,7 +255,6 @@ def test_encoder_ts_inference_returns_student_z_core_without_refiner(monkeypatch
     model = _role_model()
     bundle = object()
     model.extract_feature_bundle = lambda _x: bundle
-    model.prepare_rgb = lambda x: x
     result = model.inference(torch.rand(1, 3, 2, 2), memory=object(), epoch=40)
     assert result is model.student_encoder_pc_head.outputs[3]
     assert model.student_encoder_pc_head.refiner_calls == 0
@@ -368,9 +359,6 @@ class _TinyTS(nn.Module):
         self.teacher_refiner_calls = 0
 
     def extract_feature_bundle(self, images):
-        return images.detach()
-
-    def prepare_rgb(self, images):
         return images.detach()
 
     def teacher_pseudo(self, *_args, **_kwargs):

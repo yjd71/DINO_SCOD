@@ -219,13 +219,6 @@ def _labeled_case() -> tuple[
     outputs = [
         torch.zeros(1, 1, 16, 16, requires_grad=True) for _ in range(5)
     ]
-    foreground = [
-        torch.zeros(1, 1, 16, 16, requires_grad=True) for _ in range(4)
-    ]
-    background = [
-        torch.zeros(1, 1, 16, 16, requires_grad=True) for _ in range(4)
-    ]
-
     coarse_logits = torch.zeros(1, 1, 4, 4, requires_grad=True)
     boundary_logits = torch.zeros(1, 1, 4, 4, requires_grad=True)
     route_info_nce = torch.tensor(2.0, requires_grad=True)
@@ -293,10 +286,7 @@ def _labeled_case() -> tuple[
         "injection": {"f4_delta": f4_delta, "f3_delta": f3_delta},
         "propagation": {"f2_delta": f2_delta, "f1_delta": f1_delta},
     }
-    decoder_aux = {
-        "decoder_architecture": "bgfbr_pc_v1",
-        "bgfbr": {"fg_output": foreground, "bg_output": background},
-    }
+    decoder_aux = {"decoder_architecture": "legacy_transformer"}
     leaves = {
         "coarse": coarse_logits,
         "boundary": boundary_logits,
@@ -311,7 +301,6 @@ def _labeled_case() -> tuple[
         "f2": f2_delta,
         "f1": f1_delta,
         "decoder": outputs[3],
-        "decoder_side": foreground[0],
     }
     return outputs, {"decoder": decoder_aux, "encoder": encoder_aux}, gt, leaves
 
@@ -406,7 +395,6 @@ def test_stage_loss_gradients_belong_only_to_active_modules() -> None:
     bootstrap_total.backward()
 
     assert leaves["decoder"].grad is not None
-    assert leaves["decoder_side"].grad is not None
     assert leaves["coarse"].grad is not None
     assert leaves["boundary"].grad is not None
     for name in ("route", "parent", "semantic", "detail", "geometry", "gate", "f4", "f3", "f2", "f1"):
@@ -420,7 +408,6 @@ def test_stage_loss_gradients_belong_only_to_active_modules() -> None:
 
     for name in (
         "decoder",
-        "decoder_side",
         "coarse",
         "boundary",
         "route",

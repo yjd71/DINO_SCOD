@@ -33,16 +33,17 @@ class _FakeDino(nn.Module):
 
 
 class _RecordingDecoder(nn.Module):
-    decoder_arch = "bgfbr_pc_v1"
+    decoder_arch = "legacy_transformer"
 
-    def __init__(self) -> None:
+    def __init__(self, pc_cfg=None) -> None:
         super().__init__()
+        self.received_pc_cfg = pc_cfg
         self.pc_hbm = None
         self.scale = nn.Parameter(torch.ones(()))
         self.calls: list[dict] = []
 
-    def forward(self, features, image_rgb, **kwargs):
-        self.calls.append({"features": features, "image_rgb": image_rgb, **kwargs})
+    def forward(self, features, **kwargs):
+        self.calls.append({"features": features, **kwargs})
         low = features[0].mean(dim=-1).view(features[0].size(0), 1, 28, 28)
         logits = self.scale * F.interpolate(
             low, size=(98, 98), mode="bilinear", align_corners=False
@@ -50,7 +51,7 @@ class _RecordingDecoder(nn.Module):
         outputs = (logits, logits, logits, logits, logits)
         if kwargs.get("return_aux", False):
             return outputs, {
-                "decoder_architecture": "bgfbr_pc_v1",
+                "decoder_architecture": "legacy_transformer",
                 "z_main": logits,
                 "z_final": None,
                 "pc_active": False,
@@ -65,13 +66,9 @@ def _model(monkeypatch) -> tuple[nn.Module, _RecordingDecoder]:
         lambda *args, **kwargs: _FakeDino(),
     )
     monkeypatch.setattr(base_model_module.torch, "load", lambda *args, **kwargs: {})
-    decoder = _RecordingDecoder()
-    monkeypatch.setattr(
-        base_model_module,
-        "build_decoder",
-        lambda *args, **kwargs: decoder,
-    )
-    return base_model_module.BaseModel(pc_cfg=EncoderPCHBMConfig()), decoder
+    monkeypatch.setattr(base_model_module, "Decoder", _RecordingDecoder)
+    model = base_model_module.BaseModel(pc_cfg=EncoderPCHBMConfig())
+    return model, model.decoder
 
 
 def test_v3_base_bootstrap_runs_adapter_then_decoder_permanently_off(monkeypatch) -> None:
@@ -110,7 +107,6 @@ def test_v3_off_path_is_elementwise_equal_to_bare_decoder(monkeypatch) -> None:
     raw = model.extract_features(images)
     expected = decoder(
         features=raw,
-        image_rgb=model.prepare_rgb(images),
         memory=None,
         pc_mode="off",
         epoch=None,
@@ -151,19 +147,13 @@ def test_enabled_false_is_structural_no_prototype_base(monkeypatch) -> None:
         lambda *args, **kwargs: _FakeDino(),
     )
     monkeypatch.setattr(base_model_module.torch, "load", lambda *args, **kwargs: {})
-    decoder = _RecordingDecoder()
-    build_kwargs = {}
-
-    def _build_decoder(*args, **kwargs):
-        build_kwargs.update(kwargs)
-        return decoder
-
-    monkeypatch.setattr(base_model_module, "build_decoder", _build_decoder)
+    monkeypatch.setattr(base_model_module, "Decoder", _RecordingDecoder)
     cfg = EncoderPCHBMConfig(enabled=False)
     model = base_model_module.BaseModel(pc_cfg=cfg)
+    decoder = model.decoder
 
     assert model.pc_enabled is False
-    assert build_kwargs["attach_pc"] is False
+    assert decoder.received_pc_cfg is None
     assert model.encoder_pc_hbm is None
     assert model.pseudo_refiner is None
     assert model.encoder_pc_head is None
@@ -198,7 +188,7 @@ def test_legacy_config_enabled_false_locks_schedule_off() -> None:
 
 
 class _NoPCDecoder(nn.Module):
-    decoder_arch = "bgfbr_pc_v1"
+    decoder_arch = "legacy_transformer"
 
     def __init__(self) -> None:
         super().__init__()

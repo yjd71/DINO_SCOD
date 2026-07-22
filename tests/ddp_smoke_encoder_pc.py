@@ -1,7 +1,7 @@
 """Two-rank CPU/Gloo acceptance smoke for encoder-side PC-HBM v3.
 
 The smoke deliberately replaces only frozen-DINO extraction and the unchanged
-BGFBR core with inexpensive tensor doubles.  The Encoder Adapter, pseudo-label
+original Decoder with inexpensive tensor doubles.  The Encoder Adapter, pseudo-label
 Refiner, v3 retrieval bank, curriculum/losses, pseudo-confidence path, EMA, and
 DDP reducer are production implementations.
 
@@ -189,11 +189,11 @@ def synthetic_memory(
     return memory
 
 
-class SmokeBGFBRDecoder(nn.Module):
-    """Cheap BGFBR-contract double; PC-HBM is permanently absent/off."""
+class SmokeOriginalDecoder(nn.Module):
+    """Cheap original-Decoder contract double; internal PC is absent/off."""
 
-    decoder_arch = "bgfbr_pc_v1"
-    decoder_architecture = "bgfbr_pc_v1"
+    decoder_arch = "legacy_transformer"
+    decoder_architecture = "legacy_transformer"
 
     def __init__(self) -> None:
         super().__init__()
@@ -206,10 +206,8 @@ class SmokeBGFBRDecoder(nn.Module):
     def forward(
         self,
         features: Sequence[torch.Tensor],
-        image_rgb: torch.Tensor,
         **kwargs: Any,
     ) -> Any:
-        del image_rgb
         self.forward_calls += 1
         if kwargs.get("pc_mode") != "off" or kwargs.get("memory") is not None:
             raise AssertionError("Encoder-side Decoder double was not called in off mode")
@@ -251,7 +249,7 @@ class EncoderPCSmokePipeline(nn.Module):
     def __init__(self, config: EncoderPCHBMConfig) -> None:
         super().__init__()
         student_adapter = EncoderPCHBMAdapter(config)
-        student_decoder = SmokeBGFBRDecoder()
+        student_decoder = SmokeOriginalDecoder()
         student_refiner = CountingTeacherPseudoLabelRefiner(config)
         self.student_head = EncoderPCSegmentationHead(
             student_adapter, student_decoder, student_refiner
@@ -267,7 +265,7 @@ class EncoderPCSmokePipeline(nn.Module):
         return self.student_head.adapter
 
     @property
-    def student_decoder(self) -> SmokeBGFBRDecoder:
+    def student_decoder(self) -> SmokeOriginalDecoder:
         return self.student_head.decoder
 
     @property
@@ -279,7 +277,7 @@ class EncoderPCSmokePipeline(nn.Module):
         return self.teacher_head.adapter
 
     @property
-    def teacher_decoder(self) -> SmokeBGFBRDecoder:
+    def teacher_decoder(self) -> SmokeOriginalDecoder:
         return self.teacher_head.decoder
 
     @property
@@ -290,7 +288,6 @@ class EncoderPCSmokePipeline(nn.Module):
         self,
         patches: Sequence[torch.Tensor],
         cls_tokens: Sequence[torch.Tensor],
-        image_rgb: torch.Tensor,
         memory: EncoderPCMemory | None,
         *,
         branch: str,
@@ -302,7 +299,6 @@ class EncoderPCSmokePipeline(nn.Module):
             core = self.student_head(
                 role="labeled_core",
                 bundle=bundle,
-                image_rgb=image_rgb,
                 memory=memory,
                 mode=stage.mode,
                 stage=stage.adapter_flags(require_same_image_positive=True),
@@ -322,7 +318,6 @@ class EncoderPCSmokePipeline(nn.Module):
             core = self.student_head(
                 role="student_core",
                 bundle=bundle,
-                image_rgb=image_rgb,
                 memory=memory,
                 stage=stage.adapter_flags(require_same_image_positive=False),
                 epoch=stage.epoch,
@@ -335,14 +330,12 @@ class EncoderPCSmokePipeline(nn.Module):
     def teacher_pseudo(
         self,
         bundle: DinoFeatureBundle,
-        image_rgb: torch.Tensor,
         memory: EncoderPCMemory,
         stage: EncoderPCStage,
     ) -> Mapping[str, Any]:
         payload = self.teacher_head(
             role="teacher_pseudo",
             bundle=bundle,
-            image_rgb=image_rgb,
             memory=memory,
             stage=stage.adapter_flags(require_same_image_positive=False),
             epoch=stage.epoch,
@@ -484,13 +477,11 @@ def _run_base_curriculum(
         bundle = synthetic_bundle(
             1, torch.device("cpu"), dtype=torch.float32, seed=1000 + step + rank
         )
-        rgb = synthetic_rgb(1, torch.device("cpu"), torch.float32)
         gt = synthetic_gt(1, torch.device("cpu"))
         optimizer.zero_grad(set_to_none=True)
         outputs, aux, refined = ddp(
             bundle.patch_tokens,
             bundle.cls_tokens,
-            rgb,
             memory,
             branch="base",
             stage=stage,
@@ -510,7 +501,7 @@ def _run_base_curriculum(
             model.student_adapter,
             decay=config.memory_adapter_ema_decay,
         )
-        del bundle, rgb, gt, outputs, aux, refined, loss, memory
+        del bundle, gt, outputs, aux, refined, loss, memory
     _assert_rank_consistent(_tensor_checksum(model.student_head), "Base student")
 
 
@@ -549,12 +540,10 @@ def _run_ts_single_step(
     device = torch.device("cpu")
 
     labeled_bundle = synthetic_bundle(1, device, dtype=torch.float32, seed=3000 + rank)
-    labeled_rgb = synthetic_rgb(1, device, torch.float32)
     labeled_gt = synthetic_gt(1, device)
     labeled_outputs, labeled_aux, labeled_refined = ddp(
         labeled_bundle.patch_tokens,
         labeled_bundle.cls_tokens,
-        labeled_rgb,
         memory,
         branch="student_labeled",
         stage=full_stage,
@@ -567,21 +556,17 @@ def _run_ts_single_step(
         labeled_refined, labeled_gt, config
     )
     (labeled_core_loss + labeled_refiner_loss).backward()
-    del labeled_bundle, labeled_rgb, labeled_outputs, labeled_aux, labeled_refined
+    del labeled_bundle, labeled_outputs, labeled_aux, labeled_refined
     del labeled_gt, labeled_core_loss, labeled_refiner_loss
 
     unlabeled_bundle = synthetic_bundle(1, device, dtype=torch.float32, seed=4000 + rank)
-    unlabeled_rgb = synthetic_rgb(1, device, torch.float32)
     with torch.inference_mode():
-        teacher_payload = model.teacher_pseudo(
-            unlabeled_bundle, unlabeled_rgb, memory, full_stage
-        )
+        teacher_payload = model.teacher_pseudo(unlabeled_bundle, memory, full_stage)
     pseudo = prepare_encoder_pc_pseudo_targets(teacher_payload, config)
     del teacher_payload
     unlabeled_outputs, unlabeled_core_aux, unlabeled_refined = ddp(
         unlabeled_bundle.patch_tokens,
         unlabeled_bundle.cls_tokens,
-        unlabeled_rgb,
         memory,
         branch="student_unlabeled",
         stage=full_stage,
@@ -594,7 +579,7 @@ def _run_ts_single_step(
         unlabeled_outputs, student_aux, pseudo, config, ts_epoch=1
     )
     unlabeled_loss.backward()
-    del unlabeled_bundle, unlabeled_rgb, unlabeled_outputs, unlabeled_core_aux
+    del unlabeled_bundle, unlabeled_outputs, unlabeled_core_aux
     del unlabeled_refined, student_aux, pseudo, unlabeled_loss
 
     optimizer_steps = 0

@@ -27,12 +27,12 @@ ARTIFACT_METADATA_KEYS = (
     "pc_frozen",
 )
 TRAINING_DESIGNS = frozenset({"teacher_only", "two_stage", "joint"})
-DECODER_ARCHITECTURES = frozenset({"legacy_transformer", "bgfbr_pc_v1"})
+DECODER_ARCHITECTURES = frozenset({"legacy_transformer"})
 DECODER_CONTRACT_VERSION = 1
 
 ENCODER_PC_FORMAT_VERSION = 3
 ENCODER_PC_ARCHITECTURE = "DINO_SCOD_ENCODER_PC_HBM"
-ENCODER_PC_MODEL_ARCHITECTURE = "dino_encoder_pc_bgfbr_v1"
+ENCODER_PC_MODEL_ARCHITECTURE = "dino_encoder_pc_original_decoder_v1"
 ENCODER_PC_ARTIFACT_KIND = "encoder_pc_model"
 ENCODER_PC_RESUME_KIND = "encoder_pc_training_resume"
 ENCODER_PC_MODEL_ROLES = frozenset({"base", "student"})
@@ -67,10 +67,10 @@ def _module_decoder_identity(module: nn.Module | None) -> tuple[str | None, int 
             candidate, "decoder_architecture", None
         )
         class_name = type(candidate).__name__.lower()
-        if architecture is None and "legacytransformerdecoder" in class_name:
+        if architecture is None and (
+            "legacytransformerdecoder" in class_name or class_name == "decoder"
+        ):
             architecture = "legacy_transformer"
-        elif architecture is None and "bgfbr" in class_name and "decoder" in class_name:
-            architecture = "bgfbr_pc_v1"
         if architecture is None:
             continue
         architecture = str(architecture)
@@ -123,17 +123,16 @@ def _attach_decoder_identity(
 
 
 def _validate_decoder_identity(checkpoint: Mapping[str, Any], target: nn.Module) -> None:
+    # Validate a declared checkpoint identity even when the target is a small
+    # wrapper without architecture attributes.  This keeps removed decoder
+    # artifacts from bypassing the clean-break contract through an untagged
+    # target module.
+    actual_arch, actual_contract = _checkpoint_decoder_identity(checkpoint)
     expected_arch, expected_contract = _module_decoder_identity(target)
     if expected_arch is None:
         return
-    actual_arch, actual_contract = _checkpoint_decoder_identity(checkpoint)
     if actual_arch is None:
-        if expected_arch == "legacy_transformer":
-            return
-        raise RuntimeError(
-            "Decoder checkpoint has no architecture metadata; normal BGFBR loading is forbidden. "
-            "Use load_legacy_into_bgfbr(...) for an explicit legacy migration."
-        )
+        return
     if actual_arch != expected_arch:
         raise RuntimeError(
             f"Decoder architecture mismatch: checkpoint={actual_arch!r}, target={expected_arch!r}"
@@ -549,14 +548,14 @@ def load_encoder_pc_training_resume(
     return dict(checkpoint)
 
 
-def load_bgfbr_decoder_warm_start(
+def load_original_decoder_warm_start(
     decoder: nn.Module,
     source: str | os.PathLike | Mapping[str, Any],
     *,
     drop_prefixes: tuple[str, ...] = ("pc_hbm.",),
     strict_non_pc: bool = True,
 ) -> dict[str, Any]:
-    """Warm-start a detached BGFBR Decoder from complete non-PC weights only.
+    """Warm-start a detached original Decoder from complete non-PC weights only.
 
     ``pc_hbm.*`` is the only source namespace that may be discarded.  Missing
     or additional non-PC tensors are errors, so legacy optimizer, memory, and
@@ -573,21 +572,21 @@ def load_bgfbr_decoder_warm_start(
     target_pc = sorted(key for key in target_state if key.startswith("pc_hbm."))
     if target_pc:
         raise RuntimeError(
-            "Encoder-side warm-start requires a detached BGFBR Decoder; "
+            "Encoder-side warm-start requires a detached original Decoder; "
             f"target contains PC-HBM keys: {target_pc[:5]}"
         )
     target_architecture, _ = _module_decoder_identity(target)
-    if target_architecture not in (None, "bgfbr_pc_v1"):
+    if target_architecture != "legacy_transformer":
         raise RuntimeError(
-            "Encoder-side warm-start target is not BGFBR: "
+            "Encoder-side warm-start target is not the original Decoder: "
             f"{target_architecture!r}"
         )
 
     checkpoint = _load_source(source)
     source_architecture, _ = _checkpoint_decoder_identity(checkpoint)
-    if source_architecture not in (None, "bgfbr_pc_v1"):
+    if source_architecture not in (None, "legacy_transformer"):
         raise RuntimeError(
-            "Warm-start source is not a BGFBR checkpoint: "
+            "Warm-start source is not an original Decoder checkpoint: "
             f"{source_architecture!r}"
         )
     source_state = extract_decoder_state(checkpoint)
@@ -598,9 +597,11 @@ def load_bgfbr_decoder_warm_start(
     missing = sorted(set(target_state) - set(non_pc_state))
     unexpected = sorted(set(non_pc_state) - set(target_state))
     if missing:
-        raise RuntimeError(f"BGFBR warm-start is missing non-PC keys: {missing}")
+        raise RuntimeError(f"Original Decoder warm-start is missing non-PC keys: {missing}")
     if unexpected:
-        raise RuntimeError(f"BGFBR warm-start has unexpected non-PC keys: {unexpected}")
+        raise RuntimeError(
+            f"Original Decoder warm-start has unexpected non-PC keys: {unexpected}"
+        )
     target.load_state_dict(non_pc_state, strict=True)
     return {
         "loaded_keys": tuple(sorted(non_pc_state)),
@@ -829,101 +830,6 @@ def extract_decoder_state(
 
     checkpoint = _load_source(source)
     return _strip_single_module_prefix(_extract_decoder_state(checkpoint))
-
-
-def load_legacy_into_bgfbr(
-    decoder: nn.Module,
-    checkpoint: str | os.PathLike | Mapping[str, Any],
-    *,
-    reuse_projectors: bool = True,
-    reuse_pc_core: bool = False,
-) -> dict[str, Any]:
-    """Explicitly migrate the reusable subset of a legacy Decoder into BGFBR.
-
-    This is intentionally separate from :func:`load_decoder_compatible`.
-    Transformer blocks, segmentation heads, and memory tensors are never
-    imported.  Expanded PC boundary/mixture inputs copy old channels into the
-    leading slice and initialize every newly introduced channel to zero.
-    """
-
-    source_checkpoint = _load_source(checkpoint)
-    if not isinstance(source_checkpoint, Mapping):
-        raise TypeError("Legacy decoder checkpoint must be a mapping")
-    source_arch, _ = _checkpoint_decoder_identity(source_checkpoint)
-    if source_arch not in {None, "legacy_transformer"}:
-        raise RuntimeError(
-            f"Explicit legacy migration requires legacy_transformer weights, got {source_arch!r}"
-        )
-    target = _unwrap(decoder)
-    target_arch, target_contract = _module_decoder_identity(target)
-    if target_arch != "bgfbr_pc_v1":
-        raise RuntimeError(
-            "load_legacy_into_bgfbr target must declare decoder_arch='bgfbr_pc_v1'"
-        )
-
-    source_state = extract_decoder_state(source_checkpoint)
-    target_state = {
-        name: value.detach().clone() if torch.is_tensor(value) else value
-        for name, value in target.state_dict().items()
-    }
-    parameter_names = {name for name, _ in target.named_parameters()}
-    copied: set[str] = set()
-    expanded: set[str] = set()
-    skipped_pc: set[str] = set()
-
-    projector_prefixes = tuple(f"linear_{index}." for index in range(1, 5))
-    for name, source_value in source_state.items():
-        is_projector = name.startswith(projector_prefixes)
-        is_pc = name.startswith("pc_hbm.")
-        if not ((reuse_projectors and is_projector) or (reuse_pc_core and is_pc)):
-            continue
-        target_value = target_state.get(name)
-        if target_value is None or not torch.is_tensor(source_value):
-            if is_pc:
-                skipped_pc.add(name)
-            continue
-        source_value = source_value.detach().to(device=target_value.device, dtype=target_value.dtype)
-        if source_value.shape == target_value.shape:
-            target_state[name] = source_value.clone()
-            copied.add(name)
-            continue
-        if is_pc and reuse_pc_core:
-            can_expand_conv = (
-                source_value.ndim == target_value.ndim == 4
-                and source_value.shape[0] == target_value.shape[0]
-                and source_value.shape[2:] == target_value.shape[2:]
-                and source_value.shape[1] < target_value.shape[1]
-            )
-            can_expand_linear = (
-                source_value.ndim == target_value.ndim == 2
-                and source_value.shape[0] == target_value.shape[0]
-                and source_value.shape[1] < target_value.shape[1]
-            )
-            if can_expand_conv or can_expand_linear:
-                migrated = torch.zeros_like(target_value)
-                migrated[:, : source_value.shape[1], ...] = source_value
-                target_state[name] = migrated
-                copied.add(name)
-                expanded.add(name)
-                continue
-            skipped_pc.add(name)
-
-    target.load_state_dict(target_state, strict=True)
-    reused_parameter_names = tuple(sorted(copied.intersection(parameter_names)))
-    report = {
-        "source_architecture": source_arch or "legacy_transformer",
-        "target_architecture": target_arch,
-        "target_contract_version": target_contract,
-        "reuse_projectors": bool(reuse_projectors),
-        "reuse_pc_core": bool(reuse_pc_core),
-        "copied_state_keys": tuple(sorted(copied)),
-        "expanded_input_state_keys": tuple(sorted(expanded)),
-        "skipped_pc_state_keys": tuple(sorted(skipped_pc)),
-    }
-    return {
-        "reused_parameter_names": reused_parameter_names,
-        "report": report,
-    }
 
 
 def extract_non_pc_decoder_state(
@@ -1190,9 +1096,9 @@ def _validate_encoder_pc_checkpoint(
 def _encoder_pc_decoder_state(decoder: nn.Module) -> Mapping[str, torch.Tensor]:
     target = _unwrap(decoder)
     architecture, _ = _module_decoder_identity(target)
-    if architecture != "bgfbr_pc_v1":
+    if architecture != "legacy_transformer":
         raise RuntimeError(
-            "Encoder-PC format v3 requires a BGFBR Decoder, got "
+            "Encoder-PC format v3 requires the original Decoder, got "
             f"{architecture!r}"
         )
     state = target.state_dict()
@@ -1338,8 +1244,7 @@ __all__ = [
     "load_decoder_compatible",
     "load_encoder_pc_checkpoint",
     "load_encoder_pc_training_resume",
-    "load_bgfbr_decoder_warm_start",
-    "load_legacy_into_bgfbr",
+    "load_original_decoder_warm_start",
     "load_memory_checkpoint",
     "load_pc_hbm_memory",
     "load_training_resume",

@@ -84,8 +84,8 @@ class P2BoundaryRetargetAttention(nn.Module):
         self.head_dim = int(head_dim)
         self.inner = self.num_heads * self.head_dim
         self.boundary_in_ch = int(boundary_in_ch)
-        if self.boundary_in_ch not in {8, 10}:
-            raise ValueError("P2 boundary_in_ch must be 8 (legacy) or 10 (BGFBR)")
+        if self.boundary_in_ch != 8:
+            raise ValueError("P2 boundary_in_ch is fixed to 8 for the original Decoder")
         if self.inner != self.dim:
             raise ValueError("num_heads * head_dim must equal dim")
         self.boundary_head = BoundaryQueryHead2(
@@ -122,8 +122,6 @@ class P2BoundaryRetargetAttention(nn.Module):
         self,
         prob2: torch.Tensor,
         pc_maps: Mapping[str, torch.Tensor],
-        edge_context: torch.Tensor | None = None,
-        dual_uncertainty: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if prob2.ndim != 4 or prob2.size(1) != 1:
             raise ValueError("prob2 must be [B,1,H,W]")
@@ -141,17 +139,6 @@ class P2BoundaryRetargetAttention(nn.Module):
             for name in ("gate_pc_map", "C23_map", "M_pc_map")
         ]
         boundary_input = torch.cat([base, *extras], dim=1)
-        if self.boundary_in_ch == 10:
-            zeros = torch.zeros_like(prob2)
-            edge = zeros if edge_context is None else edge_context
-            dual = zeros if dual_uncertainty is None else dual_uncertainty
-            edge = torch.nn.functional.interpolate(
-                edge, size=target, mode="bilinear", align_corners=False
-            )
-            dual = torch.nn.functional.interpolate(
-                dual, size=target, mode="bilinear", align_corners=False
-            )
-            boundary_input = torch.cat([boundary_input, edge, dual], dim=1)
         if boundary_input.size(1) != self.boundary_in_ch:
             raise RuntimeError(
                 f"P2 boundary contract expected {self.boundary_in_ch} channels, "
@@ -164,8 +151,6 @@ class P2BoundaryRetargetAttention(nn.Module):
         p2: torch.Tensor,
         prob2: torch.Tensor,
         pc_maps: Mapping[str, torch.Tensor],
-        edge_context: torch.Tensor | None = None,
-        dual_uncertainty: torch.Tensor | None = None,
     ) -> Dict[str, torch.Tensor]:
         batch_size, _, height, width = p2.shape
         if (height, width) != (28, 28):
@@ -177,8 +162,6 @@ class P2BoundaryRetargetAttention(nn.Module):
         boundary_input = self.build_boundary_input(
             prob2,
             pc_maps,
-            edge_context=edge_context,
-            dual_uncertainty=dual_uncertainty,
         )
         boundary, indices = self.boundary_head(boundary_input)
         batch_ids = indices["batch_ids"]
