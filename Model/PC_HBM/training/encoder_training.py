@@ -187,6 +187,27 @@ def configure_encoder_pc_stage(
             raise AttributeError(f"Encoder Adapter is missing required module {name!r}")
         trainable[name] = _set_trainable(module, is_enabled)
 
+    # Only CLS4 participates in the route key, and routing starts after the
+    # bootstrap stage.  CLS1--CLS3 have no online, memory, or inference
+    # consumer, so leaving all four projectors trainable creates parameters
+    # with no loss path and breaks DDP reduction on the next iteration.
+    projector = getattr(adapter.bootstrap, "projector", None)
+    cls_projectors = getattr(projector, "cls_projectors", None)
+    if not isinstance(cls_projectors, nn.ModuleList) or len(cls_projectors) != 4:
+        raise AttributeError(
+            "Encoder bootstrap must expose exactly four CLS projectors"
+        )
+    for level, cls_projector in enumerate(cls_projectors):
+        _set_trainable(
+            cls_projector,
+            stage.enable_route_parent and level == 3,
+        )
+    trainable["bootstrap"] = sum(
+        parameter.numel()
+        for parameter in adapter.bootstrap.parameters()
+        if parameter.requires_grad
+    )
+
     trainable["decoder"] = _set_trainable(decoder, True)
     if pseudo_refiner is not None:
         if not isinstance(pseudo_refiner, nn.Module):

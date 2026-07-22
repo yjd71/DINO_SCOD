@@ -105,6 +105,10 @@ def test_configure_stage_applies_exact_gradient_ownership() -> None:
         adapter, decoder, refiner, EncoderPCStage.for_epoch(1, config)
     )
     assert _has_trainable(adapter.bootstrap)
+    assert not any(
+        _has_trainable(projector)
+        for projector in adapter.bootstrap.projector.cls_projectors
+    )
     assert not _has_trainable(adapter.router)
     assert not _has_trainable(adapter.verifier)
     assert not _has_trainable(adapter.route_context)
@@ -118,6 +122,10 @@ def test_configure_stage_applies_exact_gradient_ownership() -> None:
     )
     assert _has_trainable(adapter.router)
     assert not _has_trainable(adapter.verifier)
+    assert [
+        _has_trainable(projector)
+        for projector in adapter.bootstrap.projector.cls_projectors
+    ] == [False, False, False, True]
 
     configure_encoder_pc_stage(
         adapter, decoder, refiner, EncoderPCStage.for_epoch(11, config)

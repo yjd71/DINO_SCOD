@@ -395,6 +395,25 @@ def _assert_stage_gradients(model: EncoderPCSmokePipeline, stage: EncoderPCStage
         if any(not torch.isfinite(value).all() for value in gradients):
             raise AssertionError(f"stage {stage.epoch} {name} has non-finite gradients")
 
+    cls_projectors = model.student_adapter.bootstrap.projector.cls_projectors
+    for level, projector in enumerate(cls_projectors):
+        expected = stage.enable_route_parent and level == 3
+        trainable = [parameter.requires_grad for parameter in projector.parameters()]
+        gradients = [parameter.grad for parameter in projector.parameters()]
+        if not trainable or any(flag != expected for flag in trainable):
+            raise AssertionError(
+                f"stage {stage.epoch} CLS{level + 1} trainability does not "
+                f"match expected={expected}"
+            )
+        if expected and not all(value is not None for value in gradients):
+            raise AssertionError(
+                f"stage {stage.epoch} CLS4 did not receive route gradients"
+            )
+        if not expected and any(value is not None for value in gradients):
+            raise AssertionError(
+                f"stage {stage.epoch} unused CLS{level + 1} received gradients"
+            )
+
 
 def _tensor_checksum(module: nn.Module) -> torch.Tensor:
     first = torch.zeros((), dtype=torch.float64)
@@ -474,34 +493,46 @@ def _run_base_curriculum(
             memory = synthetic_memory(config, producer_fingerprint=producer)
             if memory.compat_meta["producer_fingerprint"] != producer:
                 raise AssertionError("Base memory producer fingerprint mismatch")
-        bundle = synthetic_bundle(
-            1, torch.device("cpu"), dtype=torch.float32, seed=1000 + step + rank
-        )
-        gt = synthetic_gt(1, torch.device("cpu"))
-        optimizer.zero_grad(set_to_none=True)
-        outputs, aux, refined = ddp(
-            bundle.patch_tokens,
-            bundle.cls_tokens,
-            memory,
-            branch="base",
-            stage=stage,
-            image_ids=_query_ids(1, rank),
-        )
-        loss = smoke_labeled_loss(outputs, aux, gt, config, stage)
-        if stage.enable_refiner:
-            refiner_loss, _ = teacher_pseudo_refiner_labeled_loss(refined, gt, config)
-            loss = loss + refiner_loss
-        if not torch.isfinite(loss):
-            raise AssertionError(f"non-finite Base loss at epoch {epoch}")
-        loss.backward()
-        _assert_stage_gradients(model, stage)
-        optimizer.step()
-        update_ema_encoder_adapter(
-            memory_ema,
-            model.student_adapter,
-            decay=config.memory_adapter_ema_decay,
-        )
-        del bundle, gt, outputs, aux, refined, loss, memory
+        # The historical reducer bug appears only when the second forward
+        # checks whether the first bootstrap reduction finished.  Keep two
+        # consecutive iterations in the same stage so this smoke cannot pass
+        # after exercising only one backward graph.
+        iterations = 2 if epoch == 1 else 1
+        for iteration in range(iterations):
+            bundle = synthetic_bundle(
+                1,
+                torch.device("cpu"),
+                dtype=torch.float32,
+                seed=1000 + 10 * step + iteration + rank,
+            )
+            gt = synthetic_gt(1, torch.device("cpu"))
+            optimizer.zero_grad(set_to_none=True)
+            outputs, aux, refined = ddp(
+                bundle.patch_tokens,
+                bundle.cls_tokens,
+                memory,
+                branch="base",
+                stage=stage,
+                image_ids=_query_ids(1, rank),
+            )
+            loss = smoke_labeled_loss(outputs, aux, gt, config, stage)
+            if stage.enable_refiner:
+                refiner_loss, _ = teacher_pseudo_refiner_labeled_loss(
+                    refined, gt, config
+                )
+                loss = loss + refiner_loss
+            if not torch.isfinite(loss):
+                raise AssertionError(f"non-finite Base loss at epoch {epoch}")
+            loss.backward()
+            _assert_stage_gradients(model, stage)
+            optimizer.step()
+            update_ema_encoder_adapter(
+                memory_ema,
+                model.student_adapter,
+                decay=config.memory_adapter_ema_decay,
+            )
+            del bundle, gt, outputs, aux, refined, loss
+        del memory
     _assert_rank_consistent(_tensor_checksum(model.student_head), "Base student")
 
 
@@ -647,7 +678,8 @@ def main() -> None:
         if rank == 0:
             print(
                 "[PASS] encoder_pc CPU DDP: ranks=2, backend=gloo, "
-                "stages=1/6/11/16/21, TS_steps=1, route_images=3"
+                "bootstrap_iters=2, stages=1/6/11/16/21, "
+                "TS_steps=1, route_images=3"
             )
     finally:
         if dist.is_initialized():

@@ -83,7 +83,7 @@ class _Stage21Model(nn.Module):
 
 
 def test_base_epoch21_updates_only_refiner_from_detached_refiner_loss(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, capsys
 ) -> None:
     config = EncoderPCHBMConfig()
     model = _Stage21Model(config)
@@ -116,6 +116,22 @@ def test_base_epoch21_updates_only_refiner_from_detached_refiner_loss(
     monkeypatch.setattr(
         trainer_module, "update_ema_encoder_adapter", lambda *args, **kwargs: None
     )
+    progress_calls = []
+
+    class _RecordingProgress:
+        def __init__(self, iterable, **kwargs) -> None:
+            self.iterable = iterable
+            self.kwargs = kwargs
+            self.postfixes = []
+            progress_calls.append(self)
+
+        def __iter__(self):
+            return iter(self.iterable)
+
+        def set_postfix(self, **kwargs) -> None:
+            self.postfixes.append(kwargs)
+
+    monkeypatch.setattr(trainer_module, "tqdm", _RecordingProgress)
     cfg = SimpleNamespace(
         device="cpu",
         use_amp=False,
@@ -146,9 +162,22 @@ def test_base_epoch21_updates_only_refiner_from_detached_refiner_loss(
     trainer.current_epoch = 21
 
     metrics = trainer.train_epoch(21)
+    captured = capsys.readouterr()
 
     assert model.refiner_flags == [True]
     assert "L_refiner_total" in metrics
+    assert len(progress_calls) == 1
+    assert progress_calls[0].kwargs["disable"] is False
+    assert (
+        "Base encoder-PC epoch 21/30 [hierarchical_refiner]"
+        in progress_calls[0].kwargs["desc"]
+    )
+    assert progress_calls[0].postfixes
+    assert {"loss", "grad"} <= progress_calls[0].postfixes[-1].keys()
+    assert (
+        "[Epoch] Epoch: 21, Stage: hierarchical_refiner, Avg Loss:"
+        in captured.out
+    )
     assert all(parameter.grad is None for parameter in model.dino.parameters())
     for module in (model.encoder_pc_hbm, model.decoder):
         assert all(

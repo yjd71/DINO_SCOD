@@ -215,7 +215,9 @@ class _NoPCTrainingModel(nn.Module):
         return self.decoder(x)
 
 
-def test_no_pc_trainer_updates_only_decoder_and_never_builds_memory(tmp_path) -> None:
+def test_no_pc_trainer_updates_only_decoder_and_never_builds_memory(
+    tmp_path, capsys
+) -> None:
     model = _NoPCTrainingModel()
     cfg = SimpleNamespace(
         device=torch.device("cpu"),
@@ -241,8 +243,11 @@ def test_no_pc_trainer_updates_only_decoder_and_never_builds_memory(tmp_path) ->
     old_bias = model.decoder.bias.detach().clone()
 
     metrics = trainer.train_epoch(1)
+    captured = capsys.readouterr()
 
     assert metrics["pc_enabled"] == 0.0
+    assert "Base no-PC epoch 1/1" in captured.err
+    assert "[Epoch] Epoch: 1, Avg Loss:" in captured.out
     assert not torch.equal(model.decoder.bias.detach(), old_bias)
     assert all(parameter.grad is None for parameter in model.dino.parameters())
     assert model.calls[-1]["memory"] is None

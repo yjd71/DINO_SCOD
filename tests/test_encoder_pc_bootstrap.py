@@ -5,7 +5,11 @@ import torch
 import torch.nn.functional as F
 
 from configs.pc_hbm_dino_config import EncoderPCHBMConfig
-from Model.PC_HBM.encoder import DinoFeatureBundle, EncoderBootstrap
+from Model.PC_HBM.encoder import (
+    DinoFeatureBundle,
+    EncoderBootstrap,
+    EncoderPCHBMAdapter,
+)
 from Model.PC_HBM.training.encoder_losses import encoder_bootstrap_loss
 
 
@@ -107,6 +111,32 @@ def test_bootstrap_losses_use_raw_logits_and_backpropagate_only_modules():
     assert module.global_fusion.coarse_head.weight.grad is not None
     assert module.boundary_query.head[-1].weight.grad is not None
     assert all(not tensor.requires_grad for tensor in bundle.patch_tokens)
+
+
+def test_adapter_bootstrap_aux_excludes_unused_cls_graph_for_ddp():
+    adapter = EncoderPCHBMAdapter(EncoderPCHBMConfig())
+    result = adapter(_bundle(batch=1), mode="bootstrap")
+
+    assert "bootstrap" not in result.aux
+    assert result.aux["coarse_logits"].requires_grad
+    assert result.aux["boundary_logits"].requires_grad
+
+    loss = (
+        result.aux["coarse_logits"].float().mean()
+        + result.aux["boundary_logits"].float().mean()
+    )
+    loss.backward()
+
+    assert any(
+        parameter.grad is not None
+        for projector in adapter.bootstrap.projector.patch_projectors
+        for parameter in projector.parameters()
+    )
+    assert all(
+        parameter.grad is None
+        for projector in adapter.bootstrap.projector.cls_projectors
+        for parameter in projector.parameters()
+    )
 
 
 def test_bootstrap_loss_has_bce_with_logits_zero_logit_value():

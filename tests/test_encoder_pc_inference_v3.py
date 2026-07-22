@@ -113,7 +113,7 @@ def _artifact(tmp_path, *, config=None, role="student", design="teacher_student"
     source = _ArtifactModel()
     producer = module_fingerprint(source.encoder_pc_hbm)
     split = "split-fingerprint-a"
-    path = tmp_path / "encoder_pc_student_v3.pth"
+    path = tmp_path / f"encoder_pc_{role}_v3.pth"
     payload = save_encoder_pc_checkpoint(
         path,
         epoch=15,
@@ -132,10 +132,18 @@ def _artifact(tmp_path, *, config=None, role="student", design="teacher_student"
     return path, payload, producer, split
 
 
-def test_strict_v3_model_and_memory_load_cross_check_fingerprints(tmp_path):
+@pytest.mark.parametrize(
+    ("role", "design"),
+    [("base", "two_stage"), ("student", "teacher_student")],
+)
+def test_strict_v3_model_and_memory_load_cross_check_fingerprints(
+    tmp_path, role, design
+):
     config = EncoderPCHBMConfig()
-    model_path, _, producer, split = _artifact(tmp_path, config=config)
-    memory_path = tmp_path / "encoder_pc_memory_v3.pth"
+    model_path, _, producer, split = _artifact(
+        tmp_path, config=config, role=role, design=design
+    )
+    memory_path = tmp_path / f"encoder_pc_{role}_memory_v3.pth"
     torch.save(_memory(producer, split).state_dict(), memory_path)
     target = _ArtifactModel()
 
@@ -252,7 +260,7 @@ def test_missing_memory_is_formal_error_and_explicit_diagnostic_fallback(tmp_pat
         )
 
 
-def test_model_loader_rejects_config_drift_and_non_student_artifact(tmp_path):
+def test_model_loader_rejects_config_drift_and_invalid_role_design_pair(tmp_path):
     model_path, _, _, _ = _artifact(tmp_path)
     with pytest.raises(RuntimeError, match="live contract"):
         inference_module.load_encoder_pc_model_for_inference(
@@ -262,11 +270,19 @@ def test_model_loader_rejects_config_drift_and_non_student_artifact(tmp_path):
         )
 
     base_path, _, _, _ = _artifact(
-        tmp_path, role="base", design="two_stage"
+        tmp_path, role="base", design="teacher_student"
     )
-    with pytest.raises(RuntimeError, match="model_role mismatch"):
+    with pytest.raises(RuntimeError, match="role/design mismatch"):
         inference_module.load_encoder_pc_model_for_inference(
             base_path, _ArtifactModel(), EncoderPCHBMConfig()
+        )
+
+    student_path, _, _, _ = _artifact(
+        tmp_path, role="student", design="two_stage"
+    )
+    with pytest.raises(RuntimeError, match="role/design mismatch"):
+        inference_module.load_encoder_pc_model_for_inference(
+            student_path, _ArtifactModel(), EncoderPCHBMConfig()
         )
 
 

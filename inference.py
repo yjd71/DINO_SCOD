@@ -36,7 +36,13 @@ from utils.pc_memory_runner import module_fingerprint
 LEGACY_DEFAULT_DECODER_CHECKPOINT = (
     './results/results_random_decoder1x1/ts_model_pseudo/student_epoch_15.pth'
 )
-ENCODER_PC_INFERENCE_TRAINING_DESIGN = 'teacher_student'
+ENCODER_PC_INFERENCE_CONTRACTS = {
+    'base': 'two_stage',
+    'student': 'teacher_student',
+}
+# Kept as an import-compatible alias for callers that refer specifically to
+# the final Teacher/Student artifact contract.
+ENCODER_PC_INFERENCE_TRAINING_DESIGN = ENCODER_PC_INFERENCE_CONTRACTS['student']
 BENCHMARK_WARMUP_ITERATIONS = 10
 BENCHMARK_TIMED_ITERATIONS = 50
 
@@ -272,7 +278,8 @@ def inference(
                         diagnostic_identity_fallback=diagnostic_identity_fallback,
                     )
                 # BaseModel.inference always returns logits. Encoder-PC returns
-                # Student z_core; legacy profiles retain z_main/z_final policy.
+                # the loaded Base/Student z_core; legacy profiles retain the
+                # z_main/z_final policy.
                 with _autocast_context(device, amp_enabled):
                     logits = _call_model_inference(
                         model,
@@ -315,8 +322,8 @@ def parse_args():
         '--model-checkpoint',
         default=None,
         help=(
-            'Canonical complete v3 adapter/decoder/refiner artifact for encoder_pc. '
-            'It is invalid for decoder-side profiles.'
+            'Canonical complete Base or Student v3 adapter/decoder/refiner artifact '
+            'for encoder_pc. It is invalid for decoder-side profiles.'
         ),
     )
     parser.add_argument(
@@ -463,19 +470,43 @@ def _required_encoder_artifact_meta(checkpoint):
     return resolved
 
 
+def _encoder_pc_inference_contract(checkpoint):
+    """Resolve one of the two formal encoder-PC inference artifact contracts."""
+
+    metadata = checkpoint.get('artifact_meta')
+    if not isinstance(metadata, Mapping):
+        raise RuntimeError('Encoder-PC checkpoint is missing artifact_meta')
+    model_role = metadata.get('model_role')
+    if model_role not in ENCODER_PC_INFERENCE_CONTRACTS:
+        raise RuntimeError(
+            'Formal encoder-PC inference accepts model_role base or student; '
+            f'got {model_role!r}.'
+        )
+    expected_design = ENCODER_PC_INFERENCE_CONTRACTS[model_role]
+    actual_design = metadata.get('training_design')
+    if actual_design != expected_design:
+        raise RuntimeError(
+            'Encoder-PC inference artifact role/design mismatch: '
+            f'model_role={model_role!r} requires training_design='
+            f'{expected_design!r}, got {actual_design!r}.'
+        )
+    return model_role, expected_design
+
+
 def load_encoder_pc_model_for_inference(source, model, pc_cfg):
-    """Strictly load the final Student v3 adapter/decoder/refiner artifact."""
+    """Strictly load a formal Base or final Student encoder-PC v3 artifact."""
 
     checkpoint = _load_checkpoint_mapping(
         source, artifact_name='Encoder-PC model artifact'
     )
+    model_role, training_design = _encoder_pc_inference_contract(checkpoint)
     loaded = load_encoder_pc_checkpoint(
         checkpoint,
         encoder_pc_hbm=model.encoder_pc_hbm,
         decoder=model.decoder,
         pseudo_refiner=model.pseudo_refiner,
-        expected_model_role='student',
-        expected_training_design=ENCODER_PC_INFERENCE_TRAINING_DESIGN,
+        expected_model_role=model_role,
+        expected_training_design=training_design,
         expected_config=pc_cfg,
     )
     metadata = _required_encoder_artifact_meta(loaded)

@@ -14,7 +14,7 @@ from Model.PC_HBM.common.utils import gather_tokens
 
 from .child_semantic_detail_verifier import EncoderParentChildDetailVerifier
 from .contracts import DinoFeatureBundle, Tensor4
-from .encoder_global_fusion import EncoderBootstrap, EncoderBootstrapOutput
+from .encoder_global_fusion import EncoderBootstrap
 from .encoder_memory import EncoderPCMemory
 from .encoder_router import EncoderPCRouter
 from .encoder_level_propagation import EncoderLevelPropagation
@@ -143,7 +143,12 @@ class EncoderPCHBMAdapter(nn.Module):
             "mode": mode,
             "pc_active": False,
             "fallback_reason": None,
-            "bootstrap": bootstrap,
+            # Do not expose the full bootstrap dataclass through the DDP
+            # return tree.  It contains projected CLS tensors that are not
+            # part of the epoch 1--5 objective; returning those tensors makes
+            # DDP wait for gradient hooks that the labeled loss never fires.
+            # Loss-bearing tensors are published explicitly below, while
+            # memory construction uses ``forward_memory_features`` directly.
             "coarse_logits": bootstrap.global_output.coarse_logits,
             "coarse_probability": bootstrap.global_output.coarse_probability,
             "boundary_logits": bootstrap.boundary_output.boundary_logits,

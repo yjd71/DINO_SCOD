@@ -11,6 +11,7 @@ import torch
 from torch import nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader, DistributedSampler
+from tqdm import tqdm
 
 from configs.pc_hbm_dino_config import EncoderPCHBMConfig
 from Model.PC_HBM.encoder import (
@@ -27,6 +28,7 @@ from Model.PC_HBM.training.encoder_training import (
 )
 from utils.dataloader import PCLabeledTrainDataset, build_labeled_memory_loader
 from utils.distributed import is_main_process, reduce_mean, synchronize, unwrap_model
+from utils.logging_utils import current_time
 from utils.checkpoint_pc_hbm import (
     capture_rng_state,
     compute_labeled_split_fingerprint,
@@ -188,6 +190,12 @@ class EncoderPCHBMTrainer:
     def _rebuild_epoch_memory(self, stage: EncoderPCStage) -> None:
         if stage.mode == "bootstrap":
             return
+        if is_main_process():
+            print(
+                f"{current_time()} >>> Rebuilding encoder-PC memory "
+                f"for stage={stage.name}.",
+                flush=True,
+            )
         self.memory_rebuild_fn(
             self.model_without_ddp,
             self.ema_adapter,
@@ -199,6 +207,12 @@ class EncoderPCHBMTrainer:
         )
         if not self.memory.is_ready():
             raise RuntimeError("Encoder memory rebuild did not produce ready schema v3.")
+        if is_main_process():
+            print(
+                f"{current_time()} <<< Encoder-PC memory ready "
+                f"for stage={stage.name}.",
+                flush=True,
+            )
 
     def train_epoch(self, epoch: int | None = None) -> dict[str, float]:
         epoch = self.current_epoch if epoch is None else int(epoch)
@@ -222,7 +236,14 @@ class EncoderPCHBMTrainer:
 
         running: dict[str, float] = defaultdict(float)
         batch_count = 0
-        for batch in self.labeled_loader:
+        final_epoch = int(getattr(self.cfg, "epochs", self.pc_cfg.final_epoch))
+        progress = tqdm(
+            self.labeled_loader,
+            disable=not is_main_process(),
+            desc=f"Base encoder-PC epoch {epoch}/{final_epoch} [{stage.name}]",
+            dynamic_ncols=True,
+        )
+        for iteration, batch in enumerate(progress, start=1):
             images, gt, image_ids = self._unpack_labeled_batch(batch)
             images = images.to(self.device, non_blocking=self.device.type == "cuda")
             gt = gt.to(self.device, non_blocking=self.device.type == "cuda")
@@ -289,9 +310,23 @@ class EncoderPCHBMTrainer:
             for name, value in terms.items():
                 if torch.is_tensor(value) and value.numel() == 1:
                     running[name] += float(value.detach())
-            running["loss"] += float(loss.detach())
-            running["grad_norm"] += float(torch.as_tensor(grad_norm).detach())
+            loss_value = float(loss.detach())
+            grad_norm_value = float(torch.as_tensor(grad_norm).detach())
+            running["loss"] += loss_value
+            running["grad_norm"] += grad_norm_value
             batch_count += 1
+            if is_main_process():
+                progress.set_postfix(
+                    loss=f"{loss_value:.4f}",
+                    grad=f"{grad_norm_value:.3f}",
+                )
+                log_interval = max(1, int(getattr(self.cfg, "log_interval", 20)))
+                if iteration % log_interval == 0:
+                    print(
+                        f"[Train] Epoch: {epoch}, Iterate: {iteration}, "
+                        f"Loss: {loss_value}",
+                        flush=True,
+                    )
 
         if batch_count == 0:
             raise RuntimeError("Encoder PC-HBM labeled loader produced no batches.")
@@ -301,6 +336,7 @@ class EncoderPCHBMTrainer:
         }
         metrics["stage_index"] = float(stage.index)
         self.last_epoch_metrics = metrics
+        used_lr = float(self.optimizer.param_groups[0]["lr"])
         self.scheduler.step()
         self.current_epoch = epoch + 1
         interval = int(getattr(self.cfg, "checkpoint_interval", 1))
@@ -313,17 +349,51 @@ class EncoderPCHBMTrainer:
             self._collect_rng_state_by_rank() if should_checkpoint else None
         )
         if should_checkpoint and is_main_process():
-            self._save_resume(epoch, stage, rng_state_by_rank=rng_state_by_rank)
+            checkpoint_path = self._save_resume(
+                epoch, stage, rng_state_by_rank=rng_state_by_rank
+            )
+            print(
+                f"{current_time()} [Checkpoint] saved={checkpoint_path}",
+                flush=True,
+            )
+        if is_main_process():
+            print(
+                f"[Epoch] Epoch: {epoch}, Stage: {stage.name}, "
+                f"Avg Loss: {metrics['loss']}, LR: {used_lr}",
+                flush=True,
+            )
         synchronize()
         return metrics
 
     def train(self) -> None:
         final_epoch = int(getattr(self.cfg, "epochs", self.pc_cfg.final_epoch))
+        if is_main_process():
+            dataset = getattr(self.labeled_loader, "dataset", None)
+            sample_count = len(dataset) if dataset is not None else "injected-loader"
+            print("<<< Start Training.", flush=True)
+            print(f"<<< Labeled Data Num: {sample_count}.", flush=True)
         for epoch in range(self.current_epoch, final_epoch + 1):
+            if is_main_process():
+                print(
+                    f"{current_time()} >>> Epoch: {epoch}/{final_epoch}",
+                    flush=True,
+                )
             self.train_epoch(epoch)
         if self.pseudo_refiner is not None and is_main_process():
-            self._finalize_artifacts(final_epoch)
+            print(
+                f"{current_time()} >>> Rebuilding final encoder-PC memory and "
+                "exporting artifacts.",
+                flush=True,
+            )
+            model_path, memory_path = self._finalize_artifacts(final_epoch)
+            print(
+                f"{current_time()} <<< Final artifacts saved: "
+                f"model={model_path}, memory={memory_path}",
+                flush=True,
+            )
         synchronize()
+        if is_main_process():
+            print("<<< Training Finished.", flush=True)
 
     def _save_resume(
         self,
