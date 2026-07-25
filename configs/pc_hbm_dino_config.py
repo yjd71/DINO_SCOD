@@ -45,8 +45,8 @@ class DinoPCHBMConfig:
     memory_architecture: str = "DINO_SCOD_PC_HBM"
     exclude_self_match: bool = True
 
-    route_top_img_k: int = 8
-    parent_topk: int = 16
+    route_top_img_k: int = 12
+    parent_topk: int = 64
     query_chunk_size: int = 512
 
     # Boundary token selection.

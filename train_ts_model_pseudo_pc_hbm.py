@@ -67,7 +67,7 @@ def parse_args():
         default=None,
         help="Optional stable labeled-key/index file; overrides sampled_images.txt selection.",
     )
-    parser.add_argument("--epochs", type=int, default=15)
+    parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--memory-batch-size", type=int, default=16)
     parser.add_argument("--memory-num-workers", type=int, default=0)

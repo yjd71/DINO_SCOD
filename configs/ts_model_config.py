@@ -44,7 +44,7 @@ class Config():
         self.CUDA = True if torch.cuda.is_available() else False
         self.device = torch.device('cuda' if self.CUDA else 'cpu')
 
-        self.epochs = 15
+        self.epochs = 30
         self.u_batch_size = 32
         self.l_batch_size = 32
 
