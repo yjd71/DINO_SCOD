@@ -46,10 +46,13 @@ def rules_from_config(config: object | None) -> dict[str, RegionSamplingRule]:
     maximum = tuple(getattr(config, "region_max_quota", (48, 48)))
     minimum = tuple(getattr(config, "region_min_quota", (8, 8)))
     ratios = tuple(getattr(config, "region_sampling_ratio", (0.5, 0.5)))
-    if names != REGION_NAMES:
-        raise ValueError(f"PC-HBM-Lite regions are fixed to {REGION_NAMES}")
     if not (len(names) == len(maximum) == len(minimum) == len(ratios) == 2):
         raise ValueError("Two-region sampling configuration is incomplete")
+    if (
+        any(not isinstance(name, str) or not name for name in names)
+        or len(set(names)) != 2
+    ):
+        raise ValueError("region_names must contain two unique non-empty strings")
     return {
         name: RegionSamplingRule(int(max_count), int(min_count), float(ratio))
         for name, max_count, min_count, ratio in zip(
@@ -72,7 +75,7 @@ def sample_region_indices(
     if mask.ndim != 2:
         raise ValueError(f"mask must be [H,W], got {tuple(mask.shape)}")
     policy = DEFAULT_REGION_SAMPLING if rules is None else rules
-    if region not in policy or region not in REGION_NAMES:
+    if region not in policy:
         raise KeyError(f"Unknown PC-HBM-Lite region: {region}")
     available = torch.nonzero(mask.flatten().bool(), as_tuple=False).flatten()
     count = int(available.numel())

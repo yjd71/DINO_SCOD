@@ -140,6 +140,12 @@ class PairVerifier(nn.Module):
             (1.0 - beta) * (parent_cosine / self.tau_parent)
             + beta * (child_cosine / self.tau_child)
         )
+        pair_scores = torch.nan_to_num(
+            pair_scores,
+            nan=0.0,
+            posinf=1.0e4,
+            neginf=-1.0e4,
+        ).clamp(-1.0e4, 1.0e4)
         pair_scores = torch.where(
             valid, pair_scores, pair_scores.new_full((), -1.0e4)
         )

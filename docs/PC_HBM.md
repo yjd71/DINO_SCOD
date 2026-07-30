@@ -4,21 +4,57 @@ PC-HBM-Lite is the only supported PC memory architecture in this repository:
 
 ```text
 global/environment route
-  -> fg_boundary and bg_near Top-K (four from each region)
+  -> fg_boundary and bg_near balanced Top-K
   -> aligned P2 cosine verification
   -> binary region evidence
   -> one gated P3 residual
   -> unchanged legacy Decoder
 ```
 
-The fixed contract is DINO input `392`, DINO layers `(2, 5, 8, 11)`,
-`28x28` tokens, Decoder width `128`, and `98x98` logits. DINO remains frozen.
+These are defaults, not equality locks: DINO input `392`, DINO layers
+`(2, 5, 8, 11)`, `28x28` tokens, Decoder/Memory width `128`, and `98x98`
+logits. Runtime hyperparameters are defined by `DinoPCHBMConfig`; changing
+them changes the corresponding Router, query selector, region builder,
+retriever, verifier, loss, schedule, or diagnostic component.
+
+For example:
+
+```python
+pc_cfg = DinoPCHBMConfig(
+    p3_top_ratio=0.20,
+    p3_min_tokens=8,
+    p3_max_tokens=128,
+    route_top_img_k=6,
+    route_global_weight=0.7,
+    route_environment_weight=0.3,
+    parent_topk_per_region=6,
+    child_window_size=5,
+    tau_parent=0.12,
+    tau_child=0.18,
+)
+```
+
+Validation now checks types, finite values, ranges, and relationships instead
+of comparing tunable fields with their defaults. The remaining structural
+relationships are:
+
+- DINO stays frozen as ViT-B/14, so `encoder_dim=768`,
+  `input_size=14*token_size`, and four unique layers must be selected from
+  `[0, 11]`.
+- `output_size=(14*token_size)//4` follows the unchanged Decoder scale.
+- `memory_dim=decoder_dim` because the parameter-free Router has no channel
+  projection.
+- Evidence remains binary, so `region_names` contains exactly two names.
+- Memory remains labeled-only, CPU-resident, Schema/Format V2, and architecture
+  `DINO_SCOD_PC_HBM_LITE`. These are protocol identifiers rather than
+  optimization hyperparameters.
 
 ## Memory V2
 
 Memory is rebuilt from labeled samples at the start of every epoch. It is
-detached, contiguous, CPU-resident, and FP16. The canonical labeled-key file
-is:
+detached, contiguous, and CPU-resident. `memory_storage_dtype` supports
+`float16`, `bfloat16`, and `float32` (default `float16`). The canonical
+labeled-key file is:
 
 ```text
 data/cache/labeled_indices/pc_bacs_0202_keys.pt
@@ -47,6 +83,13 @@ The serialized state has this shape:
         "region_names": ("fg_boundary", "bg_near"),
         "storage_dtype": "float16",
         "source": "labeled_only",
+        "route_environment_min_mass": 0.001,
+        "fg_boundary_kernel": 3,
+        "bg_near_kernel": 7,
+        "gt_binary_threshold": 0.5,
+        "region_max_quota": (48, 48),
+        "region_min_quota": (8, 8),
+        "region_sampling_ratio": (0.5, 0.5),
         "producer_fingerprint": "...",
     },
     "memory_dim": 128,
@@ -73,6 +116,11 @@ Decoder tensors from an older checkpoint, export them explicitly:
 ```powershell
 python tools/export_non_pc_decoder.py old.pth baseline_only.pth
 ```
+
+Decoder and resume artifacts serialize the complete normalized
+`DinoPCHBMConfig`. Training, TS, and inference reconstruct that configuration
+before building the model, so non-default runtime values are not silently
+replaced by source defaults.
 
 ## Modes and training
 

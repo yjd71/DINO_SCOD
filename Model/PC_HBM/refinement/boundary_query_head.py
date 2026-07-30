@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -24,16 +26,28 @@ class BoundaryQuerySelector(nn.Module):
         self.max_tokens = int(max_tokens)
         self.boundary_weight = float(boundary_weight)
         self.uncertainty_weight = float(uncertainty_weight)
-        if not 0.0 < self.top_ratio <= 1.0:
-            raise ValueError("top_ratio must be in (0, 1]")
-        if self.min_tokens <= 0:
-            raise ValueError("min_tokens must be positive")
+        if not math.isfinite(self.top_ratio) or not 0.0 <= self.top_ratio <= 1.0:
+            raise ValueError("top_ratio must be finite and in [0, 1]")
+        if self.min_tokens < 0:
+            raise ValueError("min_tokens must be non-negative")
         if self.max_tokens < self.min_tokens:
             raise ValueError("max_tokens must be >= min_tokens")
-        if self.boundary_weight != 0.5 or self.uncertainty_weight != 0.5:
+        if (
+            not math.isfinite(self.boundary_weight)
+            or not math.isfinite(self.uncertainty_weight)
+            or self.boundary_weight < 0.0
+            or self.uncertainty_weight < 0.0
+            or max(self.boundary_weight, self.uncertainty_weight) <= 0.0
+        ):
             raise ValueError(
-                "PC-HBM-Lite query weights are fixed to 0.5/0.5"
+                "query weights must be finite, non-negative, and not both zero"
             )
+        weight_scale = max(self.boundary_weight, self.uncertainty_weight)
+        scaled_boundary = self.boundary_weight / weight_scale
+        scaled_uncertainty = self.uncertainty_weight / weight_scale
+        scaled_total = scaled_boundary + scaled_uncertainty
+        self._boundary_mix = scaled_boundary / scaled_total
+        self._uncertainty_mix = scaled_uncertainty / scaled_total
 
     def forward(
         self,
@@ -51,8 +65,8 @@ class BoundaryQuerySelector(nn.Module):
         morph_boundary = (maximum - minimum).clamp(0.0, 1.0)
         uncertainty = (4.0 * work * (1.0 - work)).clamp(0.0, 1.0)
         score = (
-            self.boundary_weight * morph_boundary
-            + self.uncertainty_weight * uncertainty
+            self._boundary_mix * morph_boundary
+            + self._uncertainty_mix * uncertainty
         )
 
         flat_score = score.flatten(2)[:, 0]
@@ -73,8 +87,11 @@ class BoundaryQuerySelector(nn.Module):
             candidate_scores = flat_score[batch_index].index_select(
                 0, candidates
             )
-            local = torch.topk(candidate_scores, k=count, dim=0).indices
-            selected = candidates.index_select(0, local)
+            if count == 0:
+                selected = candidates[:0]
+            else:
+                local = torch.topk(candidate_scores, k=count, dim=0).indices
+                selected = candidates.index_select(0, local)
             batch_ids.append(
                 torch.full(
                     (count,),

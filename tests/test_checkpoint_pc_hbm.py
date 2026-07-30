@@ -18,6 +18,7 @@ from utils.checkpoint_pc_hbm import (
     load_memory_checkpoint,
     load_training_resume,
     read_artifact_metadata,
+    read_pc_config,
     save_decoder_checkpoint,
     save_memory_checkpoint,
     save_training_resume,
@@ -90,6 +91,7 @@ def test_decoder_v2_round_trip_and_baseline_only_loading(tmp_path):
         target,
         path,
         require_pc_complete=True,
+        expected_pc_cfg=cfg,
     )
     for key, value in source.state_dict().items():
         assert torch.equal(value, target.state_dict()[key])
@@ -105,6 +107,40 @@ def test_decoder_v2_round_trip_and_baseline_only_loading(tmp_path):
     load_decoder_compatible(other, baseline)
     for key, value in before_pc.items():
         assert torch.equal(value, other.pc_hbm.state_dict()[key])
+
+
+def test_decoder_config_is_reconstructed_and_mismatch_is_atomic(tmp_path):
+    cfg = DinoPCHBMConfig(
+        route_top_img_k=6,
+        tau_parent=0.12,
+        p3_top_ratio=0.2,
+    )
+    source = TinyDecoder()
+    with torch.no_grad():
+        source.baseline.weight.fill_(7.0)
+    path = tmp_path / "custom_decoder.pth"
+    save_decoder_checkpoint(
+        path,
+        source,
+        cfg,
+        2,
+        artifact_meta=_metadata("decoder"),
+    )
+
+    restored_cfg = read_pc_config(path, context="test Decoder")
+    assert vars(restored_cfg) == vars(cfg)
+
+    target = TinyDecoder()
+    before = copy.deepcopy(target.state_dict())
+    with pytest.raises(RuntimeError, match="config mismatch"):
+        load_decoder_compatible(
+            target,
+            path,
+            require_pc_complete=True,
+            expected_pc_cfg=DinoPCHBMConfig(),
+        )
+    for key, value in before.items():
+        assert torch.equal(value, target.state_dict()[key])
 
 
 def test_old_pc_state_is_rejected_before_decoder_mutation():
@@ -170,6 +206,7 @@ def test_resume_preflight_rejects_bad_model_without_mutation(tmp_path):
             model=model,
             optimizer=optimizer,
             ema_model=ema,
+            pc_cfg=cfg,
             restore_rng=True,
         )
     for key, value in before.items():
@@ -200,10 +237,83 @@ def test_resume_preflights_rng_before_model_mutation(tmp_path):
             model=model,
             optimizer=optimizer,
             ema_model=ema,
+            pc_cfg=cfg,
             restore_rng=True,
         )
     for key, value in before.items():
         assert torch.equal(value, model.state_dict()[key])
+
+
+def test_resume_config_mismatch_is_rejected_before_mutation(tmp_path):
+    cfg = DinoPCHBMConfig(tau_child=0.2)
+    model = TinyDecoder()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1.0e-3)
+    payload = save_training_resume(
+        tmp_path / "resume_config.pth",
+        epoch=2,
+        model=model,
+        optimizer=optimizer,
+        pc_cfg=cfg,
+        artifact_meta=_metadata(),
+    )
+    payload["model"]["baseline.weight"] = torch.full_like(
+        payload["model"]["baseline.weight"],
+        9.0,
+    )
+    before = copy.deepcopy(model.state_dict())
+    with pytest.raises(RuntimeError, match="config mismatch"):
+        load_training_resume(
+            payload,
+            model=model,
+            optimizer=optimizer,
+            pc_cfg=DinoPCHBMConfig(),
+            restore_rng=True,
+        )
+    for key, value in before.items():
+        assert torch.equal(value, model.state_dict()[key])
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("route_environment_min_mass", 0.02),
+        ("fg_boundary_kernel", 5),
+        ("bg_near_kernel", 9),
+        ("gt_binary_threshold", 0.4),
+        ("region_max_quota", (40, 48)),
+        ("region_min_quota", (4, 8)),
+        ("region_sampling_ratio", (0.25, 0.5)),
+    ],
+)
+def test_memory_builder_config_mismatch_is_atomic(field, value):
+    source_cfg = DinoPCHBMConfig(**{field: value})
+    source = _ready_memory(source_cfg)
+    target = PCMemory(config=DinoPCHBMConfig())
+    with pytest.raises(ValueError, match=field):
+        target.load_state_dict(source.state_dict())
+    assert not target.is_ready()
+
+
+def test_memory_compat_excludes_training_only_configuration():
+    baseline = DinoPCHBMConfig().expected_memory_meta()
+    training_only = DinoPCHBMConfig(
+        verify_start_epoch=2,
+        full_pc_start_epoch=4,
+        teacher_only_full_start_epoch=3,
+        pc_injection_ramp_epochs=2,
+        lambda_pair=0.4,
+        lambda_u=0.7,
+        feature_distill_p3_weight=0.2,
+        use_amp=False,
+        grad_clip_norm=0.0,
+        ema_momentum=1.0,
+        diagnostic_window_epochs=5,
+        warn_low_pair_valid_ratio=0.2,
+        warn_pair_acc_near_random=0.2,
+        warn_gate_inactive_threshold=0.2,
+        warn_delta_large_threshold=0.0,
+    ).expected_memory_meta()
+    assert training_only == baseline
 
 
 def test_explicit_export_discards_all_pc_keys(tmp_path):

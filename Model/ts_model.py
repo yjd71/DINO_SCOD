@@ -45,8 +45,12 @@ class TSModel(nn.Module):
         )
         self.dino.requires_grad_(False).eval()
 
-        self.teacher = Decoder(pc_cfg=pc_cfg)
-        self.student = Decoder(pc_cfg=None)
+        decoder_kwargs = {
+            "in_dim": int(pc_cfg.encoder_dim),
+            "out_dim": int(pc_cfg.decoder_dim),
+        }
+        self.teacher = Decoder(pc_cfg=pc_cfg, **decoder_kwargs)
+        self.student = Decoder(pc_cfg=None, **decoder_kwargs)
         self.load_teacher(teacher_pth)
         if student_pth is None:
             self._initialize_raw_student_from_teacher()
@@ -61,9 +65,15 @@ class TSModel(nn.Module):
 
     @torch.no_grad()
     def extract_features(self, x):
-        if x.ndim != 4 or x.shape[1:] != (3, 392, 392):
+        expected_input = (
+            3,
+            int(self.pc_cfg.input_size),
+            int(self.pc_cfg.input_size),
+        )
+        if x.ndim != 4 or tuple(x.shape[1:]) != expected_input:
             raise ValueError(
-                f"DINO input must be [B,3,392,392], got {tuple(x.shape)}"
+                f"DINO input must be [B,{expected_input[0]},"
+                f"{expected_input[1]},{expected_input[2]}], got {tuple(x.shape)}"
             )
         features = self.dino.get_intermediate_layers(
             x=x,
@@ -74,7 +84,11 @@ class TSModel(nn.Module):
         )
         if not isinstance(features, (tuple, list)) or len(features) != 4:
             raise RuntimeError("DINO must return exactly four feature layers")
-        expected = (x.shape[0], 28 * 28, 768)
+        expected = (
+            x.shape[0],
+            int(self.pc_cfg.token_size) ** 2,
+            int(self.pc_cfg.encoder_dim),
+        )
         for index, feature in enumerate(features):
             if not torch.is_tensor(feature) or feature.shape != expected:
                 raise RuntimeError(
@@ -139,6 +153,7 @@ class TSModel(nn.Module):
             self.teacher,
             path,
             require_pc_complete=True,
+            expected_pc_cfg=self.pc_cfg,
         )
         self.teacher.requires_grad_(False).eval()
 

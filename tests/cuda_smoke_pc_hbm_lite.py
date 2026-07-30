@@ -101,6 +101,7 @@ def main() -> None:
         args.labeled_indices_pt
     )
     pc_cfg = DinoPCHBMConfig()
+    cfg.train_size = int(pc_cfg.input_size)
     model = BaseModel(pc_cfg=pc_cfg).to(device).train()
     loader = build_labeled_memory_loader(
         l_image_root=cfg.train_imgs,
@@ -133,8 +134,20 @@ def main() -> None:
     assert_dino_frozen(model)
 
     # Base full: physical batch 16, two AMP optimizer steps.
-    base_images = torch.randn(16, 3, 392, 392, device=device)
-    base_gt = torch.rand(16, 1, 98, 98, device=device)
+    base_images = torch.randn(
+        16,
+        3,
+        pc_cfg.input_size,
+        pc_cfg.input_size,
+        device=device,
+    )
+    base_gt = torch.rand(
+        16,
+        1,
+        pc_cfg.output_size,
+        pc_cfg.output_size,
+        device=device,
+    )
     base_optimizer = torch.optim.Adam(
         (
             parameter
@@ -181,7 +194,13 @@ def main() -> None:
 
     # Teacher pseudo: physical batch 32, terminal injection scale.
     model.eval()
-    teacher_images = torch.randn(32, 3, 392, 392, device=device)
+    teacher_images = torch.randn(
+        32,
+        3,
+        pc_cfg.input_size,
+        pc_cfg.input_size,
+        device=device,
+    )
     reset_peak_memory()
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16):
         features = model.extract_features(teacher_images)
@@ -197,7 +216,11 @@ def main() -> None:
     if set(pseudo) != {"p_soft", "confidence", "p3_corr"}:
         raise AssertionError("Teacher pseudo target contains non-Lite fields")
 
-    student = Decoder(pc_cfg=None).to(device).train()
+    student = Decoder(
+        in_dim=pc_cfg.encoder_dim,
+        out_dim=pc_cfg.decoder_dim,
+        pc_cfg=None,
+    ).to(device).train()
     student.load_state_dict(
         {
             name: value
@@ -207,7 +230,13 @@ def main() -> None:
         strict=True,
     )
     optimizer = torch.optim.Adam(student.parameters(), lr=1.0e-4)
-    labeled_gt = torch.rand(32, 1, 98, 98, device=device)
+    labeled_gt = torch.rand(
+        32,
+        1,
+        pc_cfg.output_size,
+        pc_cfg.output_size,
+        device=device,
+    )
 
     # Raw Student labeled: physical batch 32, two AMP optimizer steps.
     reset_peak_memory()

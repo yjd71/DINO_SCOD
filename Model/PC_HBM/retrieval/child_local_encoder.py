@@ -1,4 +1,4 @@
-"""Three-by-three P2 local-key encoder."""
+"""Configurable odd-window P2 local-key encoder."""
 
 from __future__ import annotations
 
@@ -12,8 +12,10 @@ class ChildLocalEncoder(nn.Module):
         super().__init__()
         self.window = int(window)
         self.dim = int(dim)
-        if self.window != 3:
-            raise ValueError("PC-HBM-Lite child window is fixed to 3")
+        if self.window <= 0 or self.window % 2 == 0:
+            raise ValueError("window must be a positive odd integer")
+        if self.dim <= 0:
+            raise ValueError("dim must be positive")
         hidden = max(64, self.dim // 2)
         groups = 8 if hidden % 8 == 0 else 1
         self.net = nn.Sequential(
@@ -29,11 +31,13 @@ class ChildLocalEncoder(nn.Module):
     def forward(self, patches: torch.Tensor) -> torch.Tensor:
         if patches.ndim != 4:
             raise ValueError(
-                f"patches must be [M,C,3,3], got {tuple(patches.shape)}"
+                "patches must be [M,C,window,window], "
+                f"got {tuple(patches.shape)}"
             )
         if patches.shape[-2:] != (self.window, self.window):
             raise ValueError(
-                f"Expected 3x3 patches, got {tuple(patches.shape[-2:])}"
+                f"Expected {self.window}x{self.window} patches, "
+                f"got {tuple(patches.shape[-2:])}"
             )
         if patches.size(0) == 0:
             return patches.new_empty((0, self.dim))

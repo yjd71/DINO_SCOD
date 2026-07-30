@@ -14,6 +14,7 @@ from Model.base_model import BaseModel
 from utils.checkpoint_pc_hbm import (
     extract_non_pc_decoder_state,
     load_decoder_compatible,
+    read_pc_config,
     state_dict_fingerprint,
     validate_canonical_labeled_indices_pt,
 )
@@ -118,6 +119,11 @@ def validate_training_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "Choose either complete Lite or baseline-only initialization"
         )
+    if args.resume and args.allow_self_match:
+        raise ValueError(
+            "--resume cannot be combined with --allow-self-match because "
+            "resume requires an exact PC-HBM config"
+        )
 
 
 def _load_baseline_only(model: BaseModel, path: str) -> None:
@@ -141,6 +147,7 @@ def main() -> None:
         cfg.training_design = args.training_design
         cfg.memory_batch_size = int(args.memory_batch_size)
         cfg.checkpoint_interval = int(args.checkpoint_interval)
+        cfg.pc_force_no_amp = bool(args.no_amp)
         if args.batch_size is not None:
             cfg.batch_size = int(args.batch_size)
         if args.num_workers is not None:
@@ -153,11 +160,19 @@ def main() -> None:
             args.labeled_indices_pt
         )
 
-        pc_cfg = DinoPCHBMConfig(
-            use_amp=not args.no_amp,
-            exclude_self_match=not args.allow_self_match,
-        )
-        pc_cfg.configure_training_design(args.training_design)
+        if args.resume:
+            pc_cfg = read_pc_config(
+                args.resume,
+                context="Base training resume",
+            )
+        elif args.decoder_checkpoint:
+            pc_cfg = read_pc_config(
+                args.decoder_checkpoint,
+                context="Base Decoder checkpoint",
+            )
+        else:
+            pc_cfg = DinoPCHBMConfig()
+        cfg.train_size = int(pc_cfg.input_size)
         model = BaseModel(pc_cfg=pc_cfg)
         if args.baseline_checkpoint:
             _load_baseline_only(model, args.baseline_checkpoint)
@@ -166,7 +181,11 @@ def main() -> None:
                 model.decoder,
                 args.decoder_checkpoint,
                 require_pc_complete=True,
+                expected_pc_cfg=pc_cfg,
             )
+        pc_cfg.configure_training_design(args.training_design)
+        if args.allow_self_match and not args.resume:
+            pc_cfg.exclude_self_match = False
         cfg.baseline_fingerprint = state_dict_fingerprint(
             {
                 name: value

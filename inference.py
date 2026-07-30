@@ -10,9 +10,12 @@ import argparse
 import warnings
 from contextlib import nullcontext
 
-from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from Model.PC_HBM.memory import PCMemory
-from utils.checkpoint_pc_hbm import load_decoder_compatible, load_memory_checkpoint
+from utils.checkpoint_pc_hbm import (
+    load_decoder_compatible,
+    load_memory_checkpoint,
+    read_pc_config,
+)
 from utils.logging_utils import current_time
 from utils.pc_memory_runner import module_fingerprint
 
@@ -168,7 +171,7 @@ def load_inference_memory(
     pc_cfg=None,
     producer=None,
 ):
-    """Load compatible CPU-FP16 V2 memory; reject any supplied invalid file."""
+    """Load compatible CPU-resident V2 memory; reject invalid artifacts."""
 
     if path is None:
         warnings.warn(
@@ -201,12 +204,22 @@ if __name__ == '__main__':
     from Model.base_model import BaseModel
     args = parse_args()
     cfg = Config()
-    pc_cfg = DinoPCHBMConfig() if args.memory_checkpoint is not None else None
+    pc_cfg = (
+        read_pc_config(
+            args.decoder_checkpoint,
+            context="Inference Decoder checkpoint",
+        )
+        if args.memory_checkpoint is not None
+        else None
+    )
+    if pc_cfg is not None:
+        cfg.test_size = int(pc_cfg.input_size)
     model = BaseModel(pc_cfg=pc_cfg)
     load_decoder_compatible(
         model.decoder,
         args.decoder_checkpoint,
         require_pc_complete=args.memory_checkpoint is not None,
+        expected_pc_cfg=pc_cfg,
     )
     memory = load_inference_memory(
         args.memory_checkpoint,

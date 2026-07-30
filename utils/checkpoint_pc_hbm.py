@@ -44,6 +44,7 @@ def load_decoder_compatible(
     *,
     require_pc_complete: bool = False,
     expected_artifact_meta: Mapping[str, Any] | None = None,
+    expected_pc_cfg: Any | None = None,
 ):
     """Load a baseline or complete V2 Lite Decoder after full preflight."""
 
@@ -76,6 +77,15 @@ def load_decoder_compatible(
         raise RuntimeError("A complete PC-HBM-Lite Decoder checkpoint is required")
     if checkpoint_has_pc:
         _preflight_pc_v2(checkpoint, context="Decoder checkpoint")
+        _validate_pc_config_match(
+            checkpoint.get("pc_cfg"),
+            (
+                expected_pc_cfg
+                if expected_pc_cfg is not None
+                else getattr(decoder, "pc_cfg", None)
+            ),
+            context="Decoder checkpoint",
+        )
     _validate_state_compatible(
         state,
         {key: target_state[key] for key in state},
@@ -87,6 +97,27 @@ def load_decoder_compatible(
     except Exception as error:
         raise RuntimeError("Decoder checkpoint failed load preflight") from error
     return decoder.load_state_dict(state, strict=False)
+
+
+def read_pc_config(
+    source: str | os.PathLike | Mapping[str, Any],
+    *,
+    context: str = "PC-HBM checkpoint",
+):
+    """Reconstruct the canonical runtime config from a V2 Decoder/resume."""
+
+    checkpoint = _load_source(source)
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError(f"{context} must be a mapping")
+    _preflight_pc_v2(checkpoint, context=context)
+    raw_config = checkpoint.get("pc_cfg")
+    _validate_lite_config(raw_config, context=context)
+    from configs.pc_hbm_dino_config import DinoPCHBMConfig
+
+    return DinoPCHBMConfig(**dict(raw_config))
+
+
+load_pc_config_from_checkpoint = read_pc_config
 
 
 def save_decoder_checkpoint(
@@ -231,6 +262,7 @@ def load_training_resume(
     scheduler=None,
     scaler=None,
     ema_model: nn.Module | None = None,
+    pc_cfg: Any | None = None,
     restore_rng: bool = True,
     expected_artifact_meta: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -240,9 +272,19 @@ def load_training_resume(
     if not isinstance(checkpoint, Mapping) or "model" not in checkpoint:
         raise TypeError("Training resume checkpoint must contain a model state")
     _preflight_pc_v2(checkpoint, context="Training resume")
+    target_model = _unwrap(model)
+    resolved_pc_cfg = (
+        pc_cfg
+        if pc_cfg is not None
+        else getattr(target_model, "pc_cfg", None)
+    )
+    _validate_pc_config_match(
+        checkpoint.get("pc_cfg"),
+        resolved_pc_cfg,
+        context="Training resume",
+    )
     if expected_artifact_meta is not None:
         validate_artifact_metadata(checkpoint, expected_artifact_meta)
-    target_model = _unwrap(model)
     state = _align_module_prefix(checkpoint["model"], target_model.state_dict())
     _validate_state_compatible(
         state, target_model.state_dict(), context="Training resume model"
@@ -701,13 +743,74 @@ def _preflight_pc_v2(checkpoint: Mapping[str, Any], *, context: str) -> None:
 def _validate_lite_config(config: Any, *, context: str) -> None:
     if not isinstance(config, Mapping):
         raise RuntimeError(f"{context} requires serialized PC-HBM-Lite config")
-    if int(config.get("memory_schema_version", -1)) != PC_HBM_SCHEMA_VERSION:
+    raw = dict(config)
+    if raw.get("memory_source") != "labeled_only":
+        raise RuntimeError(
+            f"{context} requires memory_source='labeled_only'"
+        )
+    if raw.get("use_unlabeled_memory_update") is not False:
+        raise RuntimeError(
+            f"{context} requires use_unlabeled_memory_update=False"
+        )
+    if raw.get("memory_device") != "cpu":
+        raise RuntimeError(f"{context} requires memory_device='cpu'")
+    if int(raw.get("memory_format_version", -1)) != 2:
+        raise RuntimeError(
+            f"{context} contains an incompatible PC memory format"
+        )
+    if int(raw.get("memory_schema_version", -1)) != PC_HBM_SCHEMA_VERSION:
         raise RuntimeError(
             f"{context} contains an incompatible PC memory schema"
         )
-    if config.get("memory_architecture") != PC_HBM_ARCHITECTURE:
+    if raw.get("memory_architecture") != PC_HBM_ARCHITECTURE:
         raise RuntimeError(
             f"{context} contains an incompatible PC architecture"
+        )
+    try:
+        from configs.pc_hbm_dino_config import DinoPCHBMConfig
+
+        normalized = _config_dict(DinoPCHBMConfig(**raw))
+    except (TypeError, ValueError) as error:
+        raise RuntimeError(
+            f"{context} contains an invalid PC-HBM-Lite config: {error}"
+        ) from error
+    if normalized != raw:
+        differing = sorted(
+            key
+            for key in set(normalized or {}) | set(raw)
+            if (normalized or {}).get(key) != raw.get(key)
+        )
+        raise RuntimeError(
+            f"{context} contains a non-canonical PC-HBM-Lite config; "
+            f"differing keys: {differing}"
+        )
+
+
+def _validate_pc_config_match(
+    saved_config: Any,
+    current_config: Any,
+    *,
+    context: str,
+) -> None:
+    """Require the complete runtime config before any checkpoint mutation."""
+
+    _validate_lite_config(saved_config, context=context)
+    current = _config_dict(current_config)
+    if current is None:
+        raise RuntimeError(
+            f"{context} target must expose the complete PC-HBM-Lite config"
+        )
+    _validate_lite_config(current, context=f"{context} target")
+    saved = dict(saved_config)
+    if saved != current:
+        differing = sorted(
+            key
+            for key in set(saved) | set(current)
+            if saved.get(key) != current.get(key)
+        )
+        raise RuntimeError(
+            f"{context} PC-HBM-Lite config mismatch; "
+            f"differing keys: {differing}"
         )
 
 
@@ -812,10 +915,12 @@ __all__ = [
     "extract_decoder_state",
     "extract_non_pc_decoder_state",
     "load_decoder_compatible",
+    "load_pc_config_from_checkpoint",
     "load_memory_checkpoint",
     "load_training_resume",
     "normalize_sample_key",
     "read_artifact_metadata",
+    "read_pc_config",
     "restore_rng_state",
     "save_decoder_checkpoint",
     "save_memory_checkpoint",

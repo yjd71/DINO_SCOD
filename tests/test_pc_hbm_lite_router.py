@@ -128,8 +128,55 @@ def test_weighted_route_order_and_self_match_exclusion() -> None:
     assert forwarded["route_global"].shape == (1, 128)
 
 
-def test_router_rejects_non_fixed_weights() -> None:
-    with pytest.raises(ValueError, match="fixed to 0.5/0.5"):
-        CamouflageContextRouter(global_weight=0.7, environment_weight=0.4)
-    with pytest.raises(ValueError, match="fixed to 0.5/0.5"):
-        CamouflageContextRouter(global_weight=0.6, environment_weight=0.4)
+def test_router_non_default_and_extreme_weights_are_effective_and_finite() -> None:
+    memory = _ready_route_memory()
+    q_global = _unit(0).unsqueeze(0)
+    q_environment = _unit(1).unsqueeze(0)
+
+    global_heavy = memory.route_query(
+        q_global,
+        q_environment,
+        4,
+        global_weight=0.7,
+        environment_weight=0.3,
+    )
+    environment_heavy = memory.route_query(
+        q_global,
+        q_environment,
+        4,
+        global_weight=0.3,
+        environment_weight=0.7,
+    )
+    assert global_heavy["top_img_ids"] == [["C", "A", "B", "D"]]
+    assert environment_heavy["top_img_ids"] == [["C", "B", "A", "D"]]
+
+    extreme = memory.route_query(
+        q_global,
+        q_environment,
+        4,
+        global_weight=1.0e308,
+        environment_weight=1.0e308,
+    )
+    assert torch.isfinite(extreme["top_img_scores"]).all()
+    assert torch.isfinite(extreme["route_entropy_norm"]).all()
+
+    class CaptureMemory:
+        def __init__(self) -> None:
+            self.kwargs = {}
+
+        def route_query(self, **kwargs):
+            self.kwargs = kwargs
+            return {}
+
+    capture = CaptureMemory()
+    router = CamouflageContextRouter(
+        global_weight=0.7,
+        environment_weight=0.3,
+    )
+    router(
+        torch.randn(1, 128, 2, 2),
+        torch.rand(1, 1, 2, 2),
+        capture,
+    )
+    assert capture.kwargs["global_weight"] == pytest.approx(0.7)
+    assert capture.kwargs["environment_weight"] == pytest.approx(0.3)

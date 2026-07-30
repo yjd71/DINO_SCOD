@@ -8,10 +8,10 @@ import random
 import numpy as np
 import torch
 
-from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from configs.ts_model_config import Config
 from Model.ts_model import TSModel
 from utils.checkpoint_pc_hbm import (
+    read_pc_config,
     validate_canonical_labeled_indices_pt,
 )
 from utils.distributed import (
@@ -89,6 +89,7 @@ def main():
         cfg.train_labeled_indices_pt = args.labeled_indices_pt
         cfg.teacher_pc_checkpoint = args.teacher_checkpoint
         cfg.student_checkpoint = args.student_checkpoint
+        cfg.pc_force_no_amp = bool(args.no_amp)
         # The formal protocol fixes both physical batches at 32.
         cfg.l_batch_size = 32
         cfg.u_batch_size = 32
@@ -99,8 +100,17 @@ def main():
         configure_distributed(cfg, context, args.seed)
         set_seed(cfg.seed, args.deterministic)
 
-        pc_cfg = DinoPCHBMConfig(use_amp=not args.no_amp)
+        pc_cfg = read_pc_config(
+            args.resume if args.resume else args.teacher_checkpoint,
+            context=(
+                "TS training resume"
+                if args.resume
+                else "Teacher Decoder checkpoint"
+            ),
+        )
         pc_cfg.configure_training_design("teacher_only")
+        cfg.l_train_size = int(pc_cfg.input_size)
+        cfg.u_train_size = int(pc_cfg.input_size)
         split_fingerprint = validate_canonical_labeled_indices_pt(
             args.labeled_indices_pt
         )

@@ -8,6 +8,7 @@ verification -> binary evidence -> gated P3 residual.
 
 from __future__ import annotations
 
+from numbers import Integral
 from typing import Any, Mapping, Optional, Sequence
 
 import torch
@@ -33,7 +34,7 @@ class DinoPCHBMEngine(nn.Module):
     def __init__(self, cfg) -> None:
         super().__init__()
         self.cfg = cfg
-        self._validate_fixed_contract(cfg)
+        self._validate_runtime_contract(cfg)
         self.query_selector = BoundaryQuerySelector(
             top_ratio=cfg.p3_top_ratio,
             min_tokens=cfg.p3_min_tokens,
@@ -76,26 +77,63 @@ class DinoPCHBMEngine(nn.Module):
         )
 
     @staticmethod
-    def _validate_fixed_contract(cfg) -> None:
-        expected = {
-            "input_size": 392,
-            "encoder_dim": 768,
-            "decoder_dim": 128,
-            "memory_dim": 128,
-            "token_size": 28,
-            "output_size": 98,
-            "child_window_size": 3,
-            "parent_topk_per_region": 4,
-        }
-        for name, value in expected.items():
+    def _validate_runtime_contract(cfg) -> None:
+        positive_integer_fields = (
+            "input_size",
+            "encoder_dim",
+            "decoder_dim",
+            "memory_dim",
+            "token_size",
+            "output_size",
+            "route_top_img_k",
+            "parent_topk_per_region",
+            "query_chunk_size",
+        )
+        for name in positive_integer_fields:
             actual = getattr(cfg, name, None)
-            if actual != value:
-                raise ValueError(
-                    f"PC-HBM-Lite requires {name}={value!r}, got {actual!r}"
-                )
-        if tuple(cfg.dino_layer_indices) != (2, 5, 8, 11):
+            if (
+                not isinstance(actual, Integral)
+                or isinstance(actual, bool)
+                or int(actual) <= 0
+            ):
+                raise ValueError(f"{name} must be a positive integer")
+
+        if int(cfg.memory_dim) != int(cfg.decoder_dim):
             raise ValueError(
-                "PC-HBM-Lite requires DINO layers (2, 5, 8, 11)"
+                "memory_dim must equal decoder_dim because the parameter-free "
+                "Router pools x3 without a channel projection"
+            )
+        child_window = getattr(cfg, "child_window_size", None)
+        if (
+            not isinstance(child_window, Integral)
+            or isinstance(child_window, bool)
+            or int(child_window) <= 0
+            or int(child_window) % 2 == 0
+        ):
+            raise ValueError("child_window_size must be a positive odd integer")
+        region_names = tuple(getattr(cfg, "region_names", ()))
+        if (
+            len(region_names) != 2
+            or any(not isinstance(name, str) or not name for name in region_names)
+            or len(set(region_names)) != 2
+        ):
+            raise ValueError(
+                "binary region evidence requires two unique non-empty region names"
+            )
+        layer_indices = tuple(getattr(cfg, "dino_layer_indices", ()))
+        if (
+            len(layer_indices) != 4
+            or any(
+                not isinstance(index, Integral)
+                or isinstance(index, bool)
+                or int(index) < 0
+                for index in layer_indices
+            )
+            or len(set(int(index) for index in layer_indices)) != 4
+        ):
+            raise ValueError(
+                "legacy Decoder integration requires four unique non-negative "
+                "DINO layer indices"
             )
 
     def _validate_inputs(

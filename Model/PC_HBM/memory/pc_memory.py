@@ -1,9 +1,10 @@
-"""CPU-FP16, labeled-only Route/Pair memory for PC-HBM-Lite."""
+"""CPU-resident, configurable-float labeled Route/Pair memory."""
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
+import math
 from typing import Any
 
 import torch
@@ -26,6 +27,13 @@ _REQUIRED_META_KEYS = (
     "region_names",
     "storage_dtype",
     "source",
+    "route_environment_min_mass",
+    "fg_boundary_kernel",
+    "bg_near_kernel",
+    "gt_binary_threshold",
+    "region_max_quota",
+    "region_min_quota",
+    "region_sampling_ratio",
 )
 
 
@@ -52,22 +60,59 @@ class PCMemory:
 
     def __init__(
         self,
-        memory_dim: int = 128,
+        memory_dim: int | None = None,
         *,
-        storage_dtype: torch.dtype | str = torch.float16,
+        storage_dtype: torch.dtype | str | None = None,
         compat_meta: Mapping[str, Any] | None = None,
         config: Any | None = None,
     ) -> None:
-        self.memory_dim = int(memory_dim)
-        if self.memory_dim != 128:
-            raise ValueError(f"PC-HBM-Lite memory_dim is fixed to 128, got {self.memory_dim}")
-        self.storage_dtype = _parse_storage_dtype(storage_dtype)
         self.config = config
-        initial_meta = _default_compat_meta()
         if config is not None:
             if not hasattr(config, "expected_memory_meta"):
                 raise TypeError("config must provide expected_memory_meta()")
-            initial_meta.update(dict(config.expected_memory_meta()))
+            config_meta = dict(config.expected_memory_meta())
+            config_memory_dim = int(config_meta["memory_dim"])
+            if memory_dim is not None and int(memory_dim) != config_memory_dim:
+                raise ValueError(
+                    "memory_dim must match config.memory_dim: "
+                    f"{memory_dim} != {config_memory_dim}"
+                )
+            resolved_memory_dim = config_memory_dim
+            config_dtype = config_meta["storage_dtype"]
+            if (
+                storage_dtype is not None
+                and _parse_storage_dtype(storage_dtype)
+                != _parse_storage_dtype(config_dtype)
+            ):
+                raise ValueError(
+                    "storage_dtype must match config.memory_storage_dtype"
+                )
+            resolved_storage_dtype = config_dtype
+            expected_meta = config_meta
+        else:
+            resolved_memory_dim = 128 if memory_dim is None else int(memory_dim)
+            resolved_storage_dtype = (
+                torch.float16 if storage_dtype is None else storage_dtype
+            )
+            expected_meta = _default_compat_meta(
+                memory_dim=resolved_memory_dim,
+                storage_dtype=_storage_dtype_name(
+                    _parse_storage_dtype(resolved_storage_dtype)
+                ),
+            )
+        self.memory_dim = int(resolved_memory_dim)
+        if self.memory_dim < 1:
+            raise ValueError("memory_dim must be positive")
+        self.storage_dtype = _parse_storage_dtype(resolved_storage_dtype)
+        self.region_names = tuple(expected_meta["region_names"])
+        if (
+            len(self.region_names) != 2
+            or any(not isinstance(name, str) or not name for name in self.region_names)
+            or len(set(self.region_names)) != 2
+        ):
+            raise ValueError("region_names must contain two unique non-empty strings")
+        self._expected_compat_meta = dict(expected_meta)
+        initial_meta = dict(expected_meta)
         initial_meta.update(dict(compat_meta or {}))
         self._initial_compat_meta = initial_meta
         self.clear()
@@ -197,7 +242,11 @@ class PCMemory:
         if regions.numel() and not bool(((regions == 0) | (regions == 1)).all()):
             raise ValueError("Pair region IDs must be 0 or 1")
         normalized_meta = [
-            _normalize_pair_meta(metadata, int(region_id))
+            _normalize_pair_meta(
+                metadata,
+                int(region_id),
+                self.region_names,
+            )
             for metadata, region_id in zip(pair_meta, regions.tolist())
         ]
         self._pair_p3_list.append(self._store_float(p3_keys))
@@ -208,13 +257,17 @@ class PCMemory:
     def finalize(
         self,
         device: torch.device | str = "cpu",
-        dtype: torch.dtype = torch.float16,
+        dtype: torch.dtype | None = None,
         *,
         compat_meta: Mapping[str, Any] | None = None,
     ) -> None:
         device = torch.device(device)
-        if device.type != "cpu" or dtype != torch.float16:
-            raise ValueError("PC-HBM-Lite memory must be finalized as CPU float16")
+        resolved_dtype = self.storage_dtype if dtype is None else dtype
+        if device.type != "cpu" or resolved_dtype != self.storage_dtype:
+            raise ValueError(
+                "PC-HBM-Lite memory must be finalized on CPU using its "
+                f"configured storage dtype {_storage_dtype_name(self.storage_dtype)}"
+            )
         route = {
             "global_keys": _cat_float(
                 self._route_global_list,
@@ -244,8 +297,13 @@ class PCMemory:
         }
         meta = dict(self.compat_meta)
         meta.update(dict(compat_meta or {}))
-        _validate_meta(meta, _default_compat_meta())
-        _validate_tables(route, pairs, self.memory_dim)
+        _validate_meta(meta, self._expected_compat_meta)
+        _validate_tables(
+            route,
+            pairs,
+            self.memory_dim,
+            self.region_names,
+        )
 
         self.route = route
         self.pairs = pairs
@@ -275,12 +333,12 @@ class PCMemory:
         if not self._finalized:
             return CompatibilityResult(False, "memory_not_finalized")
         try:
-            _validate_meta(self.compat_meta, _default_compat_meta())
+            _validate_meta(self.compat_meta, self._expected_compat_meta)
         except (TypeError, ValueError) as exc:
             return CompatibilityResult(False, str(exc))
 
         if expected is None:
-            expected_meta = _default_compat_meta()
+            expected_meta = dict(self._expected_compat_meta)
         elif isinstance(expected, Mapping):
             expected_meta = dict(expected)
         elif hasattr(expected, "expected_memory_meta"):
@@ -309,6 +367,8 @@ class PCMemory:
         *,
         query_image_ids: Sequence[object] | None = None,
         exclude_self_match: bool = True,
+        global_weight: float | None = None,
+        environment_weight: float | None = None,
     ) -> dict[str, Any]:
         """Rank labeled images by separate global/environment cosine scores."""
 
@@ -351,11 +411,24 @@ class PCMemory:
         )
         global_scores = query_global @ memory_global.transpose(0, 1)
         environment_scores = query_environment @ memory_environment.transpose(0, 1)
-        global_weight = float(getattr(self.config, "route_global_weight", 0.5))
-        environment_weight = float(getattr(self.config, "route_environment_weight", 0.5))
-        if global_weight != 0.5 or environment_weight != 0.5:
-            raise ValueError("PC-HBM-Lite route weights are fixed to 0.5/0.5")
-        combined = global_weight * global_scores + environment_weight * environment_scores
+        raw_global_weight = (
+            getattr(self.config, "route_global_weight", 0.5)
+            if global_weight is None
+            else global_weight
+        )
+        raw_environment_weight = (
+            getattr(self.config, "route_environment_weight", 0.5)
+            if environment_weight is None
+            else environment_weight
+        )
+        normalized_global, normalized_environment = _normalize_route_weights(
+            raw_global_weight,
+            raw_environment_weight,
+        )
+        combined = (
+            normalized_global * global_scores
+            + normalized_environment * environment_scores
+        )
         valid = torch.ones_like(combined, dtype=torch.bool)
 
         if exclude_self_match and query_image_ids is not None:
@@ -477,7 +550,7 @@ class PCMemory:
             "schema_version": self.DEFAULT_SCHEMA_VERSION,
             "compat_meta": dict(self.compat_meta),
             "memory_dim": self.memory_dim,
-            "storage_dtype": "float16",
+            "storage_dtype": _storage_dtype_name(self.storage_dtype),
             "route": _cpu_group_copy(self.route),
             "pairs": _cpu_group_copy(self.pairs),
             "finalized": True,
@@ -499,8 +572,11 @@ class PCMemory:
             raise TypeError("Nested PC-HBM-Lite state must be a mapping")
         if device is not None and torch.device(device).type != "cpu":
             raise ValueError("Loaded PC-HBM-Lite memory must remain on CPU")
-        if dtype is not None and dtype != torch.float16:
-            raise ValueError("Loaded PC-HBM-Lite memory must remain float16")
+        if dtype is not None and dtype != self.storage_dtype:
+            raise ValueError(
+                "Loaded PC-HBM-Lite memory dtype must match the configured "
+                f"{_storage_dtype_name(self.storage_dtype)} storage"
+            )
 
         required = {
             "format_version",
@@ -527,18 +603,30 @@ class PCMemory:
             raise ValueError("Incompatible PC-HBM memory: memory_not_finalized")
         if int(raw["memory_dim"]) != self.memory_dim:
             raise ValueError("Incompatible PC-HBM memory: compat_mismatch:memory_dim")
-        if raw["storage_dtype"] != "float16":
+        if raw["storage_dtype"] != _storage_dtype_name(self.storage_dtype):
             raise ValueError(
                 "Incompatible PC-HBM memory: compat_mismatch:storage_dtype"
             )
 
         meta = dict(raw["compat_meta"])
-        _validate_meta(meta, _default_compat_meta())
-        if self.config is not None:
-            _validate_meta(meta, dict(self.config.expected_memory_meta()))
-        route = _load_route_table(raw["route"], self.memory_dim)
-        pairs = _load_pair_table(raw["pairs"], self.memory_dim)
-        _validate_tables(route, pairs, self.memory_dim)
+        _validate_meta(meta, self._expected_compat_meta)
+        route = _load_route_table(
+            raw["route"],
+            self.memory_dim,
+            self.storage_dtype,
+        )
+        pairs = _load_pair_table(
+            raw["pairs"],
+            self.memory_dim,
+            self.storage_dtype,
+            self.region_names,
+        )
+        _validate_tables(
+            route,
+            pairs,
+            self.memory_dim,
+            self.region_names,
+        )
 
         # Commit only after the entire incoming state has passed preflight.
         self._route_global_list = []
@@ -583,9 +671,15 @@ class PCMemory:
         if not bool(torch.isfinite(tensor).all()):
             raise ValueError(f"{name} contains NaN/Inf")
         if tensor.numel() and bool(
-            (tensor.detach().float().abs() > torch.finfo(torch.float16).max).any()
+            (
+                tensor.detach().float().abs()
+                > torch.finfo(self.storage_dtype).max
+            ).any()
         ):
-            raise ValueError(f"{name} exceeds the finite float16 range")
+            raise ValueError(
+                f"{name} exceeds the finite "
+                f"{_storage_dtype_name(self.storage_dtype)} range"
+            )
 
     def _check_query_pair(
         self,
@@ -620,10 +714,13 @@ class PCMemory:
                     continue
                 if (
                     value.device.type != "cpu"
-                    or value.dtype != torch.float16
+                    or value.dtype != self.storage_dtype
                     or not value.is_contiguous()
                 ):
-                    raise ValueError(f"{group_name}.{name} must be contiguous CPU float16")
+                    raise ValueError(
+                        f"{group_name}.{name} must be contiguous CPU "
+                        f"{_storage_dtype_name(self.storage_dtype)}"
+                    )
                 if not bool(torch.isfinite(value).all()):
                     raise ValueError(f"{group_name}.{name} contains NaN/Inf")
 
@@ -669,7 +766,11 @@ class PCMemory:
         }
 
 
-def _default_compat_meta() -> dict[str, Any]:
+def _default_compat_meta(
+    *,
+    memory_dim: int = 128,
+    storage_dtype: str = "float16",
+) -> dict[str, Any]:
     return {
         "architecture": _ARCHITECTURE,
         "schema_version": 2,
@@ -679,18 +780,38 @@ def _default_compat_meta() -> dict[str, Any]:
         "dino_layer_indices": (2, 5, 8, 11),
         "encoder_dim": 768,
         "decoder_dim": 128,
-        "memory_dim": 128,
+        "memory_dim": int(memory_dim),
         "child_window_size": 3,
         "region_names": _REGION_NAMES,
-        "storage_dtype": "float16",
+        "storage_dtype": str(storage_dtype),
         "source": "labeled_only",
+        "route_environment_min_mass": 1.0e-3,
+        "fg_boundary_kernel": 3,
+        "bg_near_kernel": 7,
+        "gt_binary_threshold": 0.5,
+        "region_max_quota": (48, 48),
+        "region_min_quota": (8, 8),
+        "region_sampling_ratio": (0.5, 0.5),
     }
 
 
 def _parse_storage_dtype(dtype: torch.dtype | str) -> torch.dtype:
     if dtype in (torch.float16, "float16", "fp16", "torch.float16"):
         return torch.float16
+    if dtype in (torch.bfloat16, "bfloat16", "bf16", "torch.bfloat16"):
+        return torch.bfloat16
+    if dtype in (torch.float32, "float32", "fp32", "torch.float32"):
+        return torch.float32
     raise ValueError(f"Unsupported PC-HBM-Lite storage dtype: {dtype}")
+
+
+def _storage_dtype_name(dtype: torch.dtype | str) -> str:
+    resolved = _parse_storage_dtype(dtype)
+    return {
+        torch.float16: "float16",
+        torch.bfloat16: "bfloat16",
+        torch.float32: "float32",
+    }[resolved]
 
 
 def _normalize_image_ids(values: Sequence[object]) -> list[str]:
@@ -702,7 +823,11 @@ def _normalize_image_ids(values: Sequence[object]) -> list[str]:
     return normalized
 
 
-def _normalize_pair_meta(metadata: Mapping[str, Any], region_id: int) -> dict[str, Any]:
+def _normalize_pair_meta(
+    metadata: Mapping[str, Any],
+    region_id: int,
+    region_names: Sequence[str] = _REGION_NAMES,
+) -> dict[str, Any]:
     if not isinstance(metadata, Mapping):
         raise TypeError("Each pair metadata item must be a mapping")
     result = dict(metadata)
@@ -712,7 +837,9 @@ def _normalize_pair_meta(metadata: Mapping[str, Any], region_id: int) -> dict[st
         raise ValueError("Pair metadata must come from labeled data")
     if result.get("is_labeled", True) is False:
         raise ValueError("Pair metadata must come from labeled data")
-    expected_name = _REGION_NAMES[int(region_id)]
+    if len(region_names) != 2:
+        raise ValueError("region_names must contain exactly two entries")
+    expected_name = str(region_names[int(region_id)])
     if "region_id" in result and int(result["region_id"]) != int(region_id):
         raise ValueError("Pair metadata region ID does not match its tensor")
     if "region" in result and str(result["region"]) != expected_name:
@@ -784,6 +911,7 @@ def _validate_tables(
     route: Mapping[str, Any],
     pairs: Mapping[str, Any],
     memory_dim: int,
+    region_names: Sequence[str] = _REGION_NAMES,
 ) -> None:
     route_keys = {"global_keys", "environment_keys", "img_ids"}
     pair_keys = {"p3_keys", "p2_keys", "region_ids", "pair_meta"}
@@ -818,12 +946,20 @@ def _validate_tables(
         raise ValueError("Incompatible PC-HBM memory: invalid_region_ids")
     route_id_set = set(route_ids)
     for metadata, region_id in zip(pair_meta, region_ids.tolist()):
-        normalized = _normalize_pair_meta(metadata, int(region_id))
+        normalized = _normalize_pair_meta(
+            metadata,
+            int(region_id),
+            region_names,
+        )
         if normalized["image_id"] not in route_id_set:
             raise ValueError("Pair image IDs must be present in the route table")
 
 
-def _load_route_table(raw: Any, memory_dim: int) -> dict[str, Any]:
+def _load_route_table(
+    raw: Any,
+    memory_dim: int,
+    storage_dtype: torch.dtype,
+) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise TypeError("Incompatible PC-HBM memory: route_not_mapping")
     if set(raw) != {"global_keys", "environment_keys", "img_ids"}:
@@ -832,19 +968,40 @@ def _load_route_table(raw: Any, memory_dim: int) -> dict[str, Any]:
     if not isinstance(raw_img_ids, list):
         raise TypeError("Incompatible PC-HBM memory: img_ids must be list[str]")
     return {
-        "global_keys": _load_float_matrix(raw["global_keys"], memory_dim),
-        "environment_keys": _load_float_matrix(raw["environment_keys"], memory_dim),
+        "global_keys": _load_float_matrix(
+            raw["global_keys"],
+            memory_dim,
+            storage_dtype,
+        ),
+        "environment_keys": _load_float_matrix(
+            raw["environment_keys"],
+            memory_dim,
+            storage_dtype,
+        ),
         "img_ids": _normalize_image_ids(raw_img_ids),
     }
 
 
-def _load_pair_table(raw: Any, memory_dim: int) -> dict[str, Any]:
+def _load_pair_table(
+    raw: Any,
+    memory_dim: int,
+    storage_dtype: torch.dtype,
+    region_names: Sequence[str],
+) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise TypeError("Incompatible PC-HBM memory: pairs_not_mapping")
     if set(raw) != {"p3_keys", "p2_keys", "region_ids", "pair_meta"}:
         raise ValueError("Incompatible PC-HBM memory: invalid_pair_structure")
-    p3_keys = _load_float_matrix(raw["p3_keys"], memory_dim)
-    p2_keys = _load_float_matrix(raw["p2_keys"], memory_dim)
+    p3_keys = _load_float_matrix(
+        raw["p3_keys"],
+        memory_dim,
+        storage_dtype,
+    )
+    p2_keys = _load_float_matrix(
+        raw["p2_keys"],
+        memory_dim,
+        storage_dtype,
+    )
     raw_region_ids = torch.as_tensor(raw["region_ids"])
     if raw_region_ids.ndim != 1 or raw_region_ids.dtype != torch.long:
         raise ValueError(
@@ -857,7 +1014,11 @@ def _load_pair_table(raw: Any, memory_dim: int) -> dict[str, Any]:
     if len(raw_meta) != region_ids.numel():
         raise ValueError("Incompatible PC-HBM memory: invalid_pair_shape")
     pair_meta = [
-        _normalize_pair_meta(metadata, int(region_id))
+        _normalize_pair_meta(
+            metadata,
+            int(region_id),
+            region_names,
+        )
         for metadata, region_id in zip(raw_meta, region_ids.tolist())
     ]
     return {
@@ -868,7 +1029,11 @@ def _load_pair_table(raw: Any, memory_dim: int) -> dict[str, Any]:
     }
 
 
-def _load_float_matrix(value: Any, width: int) -> torch.Tensor:
+def _load_float_matrix(
+    value: Any,
+    width: int,
+    storage_dtype: torch.dtype,
+) -> torch.Tensor:
     tensor = torch.as_tensor(value)
     if not tensor.is_floating_point():
         raise TypeError(
@@ -880,11 +1045,12 @@ def _load_float_matrix(value: Any, width: int) -> torch.Tensor:
         )
     if (
         tensor.device.type != "cpu"
-        or tensor.dtype != torch.float16
+        or tensor.dtype != storage_dtype
         or not tensor.is_contiguous()
     ):
         raise ValueError(
-            "Incompatible PC-HBM memory: pair/route keys must be contiguous CPU float16"
+            "Incompatible PC-HBM memory: pair/route keys must be contiguous "
+            f"CPU {_storage_dtype_name(storage_dtype)}"
         )
     work = tensor.detach().float()
     if not bool(torch.isfinite(work).all()):
@@ -892,10 +1058,11 @@ def _load_float_matrix(value: Any, width: int) -> torch.Tensor:
             "Incompatible PC-HBM memory: pair/route keys contain NaN/Inf"
         )
     if work.numel() and bool(
-        (work.abs() > torch.finfo(torch.float16).max).any()
+        (work.abs() > torch.finfo(storage_dtype).max).any()
     ):
         raise ValueError(
-            "Incompatible PC-HBM memory: pair/route keys overflow float16"
+            "Incompatible PC-HBM memory: pair/route keys overflow "
+            f"{_storage_dtype_name(storage_dtype)}"
         )
     return tensor.detach().clone()
 
@@ -927,6 +1094,32 @@ def _normalized_masked_entropy(
     denominator = count.clamp_min(2).float().log()
     normalized = torch.where(count > 1, entropy / denominator, torch.zeros_like(entropy))
     return torch.nan_to_num(normalized).clamp(0.0, 1.0)
+
+
+def _normalize_route_weights(
+    global_weight: object,
+    environment_weight: object,
+) -> tuple[float, float]:
+    global_value = float(global_weight)
+    environment_value = float(environment_weight)
+    if (
+        not math.isfinite(global_value)
+        or not math.isfinite(environment_value)
+        or global_value < 0.0
+        or environment_value < 0.0
+        or max(global_value, environment_value) <= 0.0
+    ):
+        raise ValueError(
+            "route weights must be finite, non-negative, and not both zero"
+        )
+    scale = max(global_value, environment_value)
+    scaled_global = global_value / scale
+    scaled_environment = environment_value / scale
+    scaled_total = scaled_global + scaled_environment
+    return (
+        scaled_global / scaled_total,
+        scaled_environment / scaled_total,
+    )
 
 
 def _cpu_group_copy(group: Mapping[str, Any]) -> dict[str, Any]:

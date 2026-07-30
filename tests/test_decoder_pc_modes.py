@@ -46,6 +46,8 @@ class _Memory:
         top_img_k,
         query_image_ids=None,
         exclude_self_match=True,
+        global_weight=None,
+        environment_weight=None,
     ):
         batch = q_global.size(0)
         return {
@@ -146,8 +148,41 @@ def test_decoder_missing_memory_falls_back_but_incompatible_memory_raises(
 def test_decoder_lite_rejects_nonfixed_dino_grid() -> None:
     model = Decoder(pc_cfg=DinoPCHBMConfig()).eval()
     features = tuple(torch.randn(1, 14 * 14, 768) for _ in range(4))
-    with pytest.raises(ValueError, match="28x28"):
+    with pytest.raises(ValueError, match="token_size=28"):
         model(features, pc_mode="off")
+
+
+def test_decoder_off_path_supports_configured_grid_and_width() -> None:
+    cfg = DinoPCHBMConfig(
+        input_size=140,
+        token_size=10,
+        output_size=35,
+        decoder_dim=64,
+        memory_dim=64,
+        dino_layer_indices=(1, 4, 7, 10),
+    )
+    model = Decoder(
+        in_dim=cfg.encoder_dim,
+        out_dim=cfg.decoder_dim,
+        pc_cfg=cfg,
+    ).eval()
+    features = tuple(
+        torch.randn(1, cfg.token_size**2, cfg.encoder_dim)
+        for _ in range(4)
+    )
+
+    outputs, aux = model(features, pc_mode="off", return_aux=True)
+
+    assert all(
+        output.shape == (1, 1, cfg.output_size, cfg.output_size)
+        for output in outputs
+    )
+    assert aux["features"]["p3"].shape == (
+        1,
+        cfg.decoder_dim,
+        cfg.token_size,
+        cfg.token_size,
+    )
 
 
 def test_decoder_memory_features_are_lite_builder_inputs(

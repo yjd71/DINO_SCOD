@@ -59,6 +59,17 @@ def test_teacher_only_still_requires_baseline_checkpoint(monkeypatch):
         base_entrypoint.validate_training_args(args)
 
 
+def test_resume_rejects_self_match_override(monkeypatch):
+    args = _parse_args(
+        monkeypatch,
+        "--resume",
+        "resume.pth",
+        "--allow-self-match",
+    )
+    with pytest.raises(ValueError, match="exact PC-HBM config"):
+        base_entrypoint.validate_training_args(args)
+
+
 def test_labeled_selection_falls_back_to_sampled_txt(tmp_path):
     items = [
         {"key": "TR-CAMO/camo_001", "stem": "camo_001"},

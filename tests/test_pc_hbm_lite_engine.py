@@ -18,12 +18,18 @@ class _Compatible:
 
 
 class _PairMemory:
-    def __init__(self, *, both_regions: bool = True, compatible: bool = True):
+    def __init__(
+        self,
+        *,
+        both_regions: bool = True,
+        compatible: bool = True,
+        dim: int = 128,
+    ):
         torch.manual_seed(17)
         count = 8 if both_regions else 4
         self.pairs = {
-            "p3_keys": torch.randn(count, 128),
-            "p2_keys": torch.randn(count, 128),
+            "p3_keys": torch.randn(count, dim),
+            "p2_keys": torch.randn(count, dim),
             "region_ids": torch.tensor(
                 [0, 0, 0, 0] + ([1, 1, 1, 1] if both_regions else [])
             ),
@@ -45,6 +51,8 @@ class _PairMemory:
         top_img_k,
         query_image_ids=None,
         exclude_self_match=True,
+        global_weight=None,
+        environment_weight=None,
     ):
         batch = q_global.size(0)
         return {
@@ -131,3 +139,56 @@ def test_engine_invalid_side_has_zero_correction_confidence_and_gate() -> None:
     assert torch.count_nonzero(result["gate_map"]) == 0
     assert torch.equal(result["p3_corr"], p3)
     assert torch.isfinite(result["pair_logits"]).all()
+
+
+def test_engine_uses_non_default_runtime_hyperparameters() -> None:
+    cfg = DinoPCHBMConfig(
+        input_size=140,
+        token_size=10,
+        output_size=35,
+        decoder_dim=64,
+        memory_dim=64,
+        dino_layer_indices=(10, 1, 7, 4),
+        route_top_img_k=3,
+        route_global_weight=0.7,
+        route_environment_weight=0.3,
+        route_environment_min_mass=0.0,
+        p3_top_ratio=0.2,
+        p3_min_tokens=0,
+        p3_max_tokens=100,
+        query_boundary_weight=0.8,
+        query_uncertainty_weight=0.2,
+        fg_boundary_kernel=5,
+        bg_near_kernel=9,
+        region_names=("edge", "near"),
+        region_max_quota=(20, 24),
+        region_min_quota=(2, 3),
+        region_sampling_ratio=(0.25, 0.75),
+        parent_topk_per_region=2,
+        query_chunk_size=7,
+        child_window_size=5,
+        tau_parent=0.2,
+        tau_child=0.3,
+    )
+    engine = DinoPCHBMEngine(cfg)
+    x3 = torch.randn(1, 64, 10, 10)
+    p3 = torch.randn_like(x3)
+    p2 = torch.randn_like(x3)
+    m3 = torch.randn(1, 1, 10, 10)
+
+    result = engine.forward_lite(
+        x3,
+        p3,
+        p2,
+        m3,
+        _PairMemory(dim=64),
+        mode="full",
+    )
+
+    assert result["query_flat_indices"].numel() == 20
+    assert result["retrieval_valid"].shape == (20, 2, 2)
+    assert result["pair_logits"].shape == (20, 2)
+    assert result["p3_corr"].shape == p3.shape
+    assert torch.isfinite(result["p3_corr"]).all()
+    assert engine.child_query.window == 5
+    assert engine.router.top_img_k == 3

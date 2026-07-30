@@ -47,7 +47,10 @@ class DinoMemoryBuilder:
                 f"x3 must be [B,{self.cfg.memory_dim},H,W], got {tuple(x3.shape)}"
             )
         if p3.shape != x3.shape or child_map.shape != x3.shape:
-            raise ValueError("x3, p3, and p2 must share [B,128,H,W]")
+            raise ValueError(
+                "x3, p3, and p2 must share "
+                f"[B,{self.cfg.memory_dim},H,W]"
+            )
         if (
             m3.ndim != 4
             or m3.size(0) != x3.size(0)
@@ -58,7 +61,8 @@ class DinoMemoryBuilder:
         batch_size, _, height, width = x3.shape
         if (height, width) != (int(self.cfg.token_size), int(self.cfg.token_size)):
             raise ValueError(
-                f"Memory token grid is fixed to {self.cfg.token_size}x{self.cfg.token_size}"
+                "Memory token grid must match configured token_size "
+                f"{self.cfg.token_size}x{self.cfg.token_size}"
             )
         normalized_image_ids = [str(image_id) for image_id in image_ids]
         if len(normalized_image_ids) != batch_size:
@@ -75,6 +79,7 @@ class DinoMemoryBuilder:
             boundary_kernel=int(self.cfg.fg_boundary_kernel),
             bg_near_kernel=int(self.cfg.bg_near_kernel),
             threshold=float(self.cfg.gt_binary_threshold),
+            region_names=tuple(self.cfg.region_names),
         )
         rules = rules_from_config(self.cfg)
 
@@ -113,7 +118,7 @@ class DinoMemoryBuilder:
         encoded_p3_map = self.parent_retriever.encode_k_map(p3)
         if encoded_p3_map.shape != p3.shape:
             raise ValueError(
-                "Parent key encoder must preserve [B,128,H,W], "
+                "Parent key encoder must preserve the configured feature shape, "
                 f"got {tuple(encoded_p3_map.shape)}"
             )
 

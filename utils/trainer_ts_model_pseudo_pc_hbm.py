@@ -125,7 +125,9 @@ class PCHBMPseudoTrainer:
             eta_min=float(cfg.min_lr),
         )
         self.amp_enabled = bool(
-            getattr(pc_cfg, "use_amp", True) and self.device.type == "cuda"
+            getattr(pc_cfg, "use_amp", True)
+            and not bool(getattr(self.cfg, "pc_force_no_amp", False))
+            and self.device.type == "cuda"
         )
         self.scaler = torch.amp.GradScaler(
             "cuda", enabled=self.amp_enabled
@@ -583,6 +585,7 @@ class PCHBMPseudoTrainer:
             scheduler=self.scheduler,
             scaler=self.scaler,
             ema_model=self.core_model.teacher,
+            pc_cfg=self.pc_cfg,
             restore_rng=True,
         )
         self.current_epoch = completed + 1

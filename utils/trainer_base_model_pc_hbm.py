@@ -165,7 +165,9 @@ class BasePCHBMTrainer:
         )
 
         self.amp_enabled = bool(
-            getattr(self.pc_cfg, "use_amp", True) and self.device.type == "cuda"
+            getattr(self.pc_cfg, "use_amp", True)
+            and not bool(getattr(self.cfg, "pc_force_no_amp", False))
+            and self.device.type == "cuda"
         )
         self.scaler = scaler or torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
         self.memory_decoder = memory_decoder or make_ema_copy(self.decoder)
@@ -543,6 +545,7 @@ class BasePCHBMTrainer:
             scheduler=self.scheduler,
             scaler=self.scaler,
             ema_model=self.memory_decoder,
+            pc_cfg=self.pc_cfg,
             restore_rng=restore_rng,
         )
         self.current_epoch = completed_epoch + 1

@@ -140,6 +140,35 @@ def test_pair_verifier_fully_invalid_query_is_exact_zero_without_nan() -> None:
         assert torch.count_nonzero(result[key]) == 0, key
 
 
+def test_pair_verifier_extreme_temperatures_remain_finite() -> None:
+    verifier = PairVerifier(
+        dim=4,
+        tau_parent=1.0e-300,
+        tau_child=1.0e-300,
+        child_mix_init_logit=1.0e3,
+    )
+    valid = torch.ones(2, 2, 2, dtype=torch.bool)
+    result = verifier(
+        q3=torch.randn(2, 4),
+        q_child=torch.randn(2, 4),
+        retrieval=_retrieval(valid),
+        query_score=torch.ones(2, 1),
+    )
+    for key in (
+        "parent_cosine",
+        "child_cosine",
+        "pair_scores",
+        "pair_weight",
+        "pair_logits",
+        "region_prob",
+        "candidate_entropy",
+        "memory_confidence",
+        "gate",
+        "correction",
+    ):
+        assert torch.isfinite(result[key]).all(), key
+
+
 def test_retrieval_and_verifier_accept_zero_queries() -> None:
     query = torch.empty(0, 4)
     valid = torch.empty(0, 2, 4, dtype=torch.bool)

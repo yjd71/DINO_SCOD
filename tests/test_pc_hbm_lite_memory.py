@@ -61,6 +61,13 @@ def test_lite_config_contract_and_stage_schedules() -> None:
         "region_names": ("fg_boundary", "bg_near"),
         "storage_dtype": "float16",
         "source": "labeled_only",
+        "route_environment_min_mass": 1.0e-3,
+        "fg_boundary_kernel": 3,
+        "bg_near_kernel": 7,
+        "gt_binary_threshold": 0.5,
+        "region_max_quota": (48, 48),
+        "region_min_quota": (8, 8),
+        "region_sampling_ratio": (0.5, 0.5),
     }
     assert [cfg.pc_mode_for_epoch(epoch) for epoch in (1, 5, 6, 10, 11)] == [
         "off",
@@ -85,17 +92,221 @@ def test_lite_config_contract_and_stage_schedules() -> None:
         cfg.configure_training_design("unsupported")
 
 
-def test_lite_config_rejects_changes_to_fixed_contract() -> None:
-    with pytest.raises(ValueError, match="route_global_weight"):
-        DinoPCHBMConfig(route_global_weight=0.6)
-    with pytest.raises(ValueError, match="region_max_quota"):
-        DinoPCHBMConfig(region_max_quota=(32, 32))
-    with pytest.raises(ValueError, match="child_window_size"):
-        DinoPCHBMConfig(child_window_size=5)
-    with pytest.raises(ValueError, match="temperatures"):
-        DinoPCHBMConfig(tau_child=float("nan"))
-    with pytest.raises(ValueError, match="loss weights"):
-        DinoPCHBMConfig(lambda_pair=float("inf"))
+def test_lite_config_accepts_tunable_hyperparameters() -> None:
+    cfg = DinoPCHBMConfig(
+        enabled=False,
+        input_size=420,
+        encoder_dim=768,
+        decoder_dim=256,
+        token_size=30,
+        output_size=105,
+        dino_layer_indices=(10, 1, 7, 4),
+        memory_dim=256,
+        memory_source="labeled_only",
+        use_unlabeled_memory_update=False,
+        memory_storage_dtype="bf16",
+        memory_device="cpu",
+        memory_format_version=2,
+        memory_schema_version=2,
+        memory_architecture="DINO_SCOD_PC_HBM_LITE",
+        exclude_self_match=False,
+        route_top_img_k=6,
+        route_global_weight=0.7,
+        route_environment_weight=0.3,
+        route_environment_min_mass=0.02,
+        p3_top_ratio=0.2,
+        p3_min_tokens=12,
+        p3_max_tokens=120,
+        query_boundary_weight=0.8,
+        query_uncertainty_weight=0.2,
+        fg_boundary_kernel=5,
+        bg_near_kernel=9,
+        gt_binary_threshold=0.4,
+        region_names=("edge", "near"),
+        region_max_quota=(60, 72),
+        region_min_quota=(4, 6),
+        region_sampling_ratio=(0.25, 0.75),
+        parent_topk_per_region=6,
+        query_chunk_size=128,
+        child_window_size=5,
+        tau_parent=0.12,
+        tau_child=0.18,
+        child_mix_init_logit=0.4,
+        verify_start_epoch=2,
+        full_pc_start_epoch=4,
+        teacher_only_full_start_epoch=3,
+        pc_injection_ramp_epochs=2,
+        lambda_pair=0.35,
+        lambda_u=0.8,
+        feature_distill_p3_weight=0.1,
+        use_amp=False,
+        grad_clip_norm=2.5,
+        ema_momentum=0.98,
+        diagnostic_window_epochs=5,
+        warn_low_pair_valid_ratio=0.1,
+        warn_pair_acc_near_random=0.15,
+        warn_gate_inactive_threshold=0.08,
+        warn_delta_large_threshold=1.5,
+    )
+
+    assert cfg.p3_top_ratio == pytest.approx(0.2)
+    assert cfg.route_global_weight == pytest.approx(0.7)
+    assert cfg.region_max_quota == (60, 72)
+    assert cfg.child_window_size == 5
+    assert cfg.memory_storage_dtype == "bfloat16"
+    assert cfg.dino_layer_indices == (1, 4, 7, 10)
+    assert cfg.expected_memory_meta() == {
+        "architecture": "DINO_SCOD_PC_HBM_LITE",
+        "schema_version": 2,
+        "input_size": 420,
+        "token_hw": (30, 30),
+        "output_hw": (105, 105),
+        "dino_layer_indices": (1, 4, 7, 10),
+        "encoder_dim": 768,
+        "decoder_dim": 256,
+        "memory_dim": 256,
+        "child_window_size": 5,
+        "region_names": ("edge", "near"),
+        "storage_dtype": "bfloat16",
+        "source": "labeled_only",
+        "route_environment_min_mass": 0.02,
+        "fg_boundary_kernel": 5,
+        "bg_near_kernel": 9,
+        "gt_binary_threshold": 0.4,
+        "region_max_quota": (60, 72),
+        "region_min_quota": (4, 6),
+        "region_sampling_ratio": (0.25, 0.75),
+    }
+    cfg.configure_training_design("two_stage")
+    assert [cfg.pc_mode_for_epoch(epoch) for epoch in (1, 2, 3, 4)] == [
+        "off",
+        "verify_only",
+        "verify_only",
+        "full",
+    ]
+    assert [cfg.injection_scale(epoch) for epoch in (3, 4, 5)] == [
+        0.0,
+        pytest.approx(0.5),
+        1.0,
+    ]
+    cfg.configure_training_design("teacher_only")
+    assert [cfg.pc_mode_for_epoch(epoch) for epoch in (1, 2, 3)] == [
+        "verify_only",
+        "verify_only",
+        "full",
+    ]
+
+
+def test_lite_config_accepts_safe_zero_and_closed_boundary_values() -> None:
+    cfg = DinoPCHBMConfig(
+        decoder_dim=130,
+        memory_dim=130,
+        p3_top_ratio=0.0,
+        p3_min_tokens=0,
+        p3_max_tokens=0,
+        route_environment_min_mass=0.0,
+        grad_clip_norm=0.0,
+        ema_momentum=1.0,
+        warn_delta_large_threshold=0.0,
+    )
+    assert cfg.decoder_dim == cfg.memory_dim == 130
+    assert cfg.p3_top_ratio == 0.0
+    assert cfg.p3_min_tokens == cfg.p3_max_tokens == 0
+    assert cfg.route_environment_min_mass == 0.0
+    assert cfg.grad_clip_norm == 0.0
+    assert cfg.ema_momentum == 1.0
+    assert cfg.warn_delta_large_threshold == 0.0
+
+
+@pytest.mark.parametrize(
+    ("configured", "canonical", "dtype"),
+    [
+        ("fp16", "float16", torch.float16),
+        ("bf16", "bfloat16", torch.bfloat16),
+        ("fp32", "float32", torch.float32),
+    ],
+)
+def test_memory_storage_dtype_is_tunable_on_cpu(
+    configured: str,
+    canonical: str,
+    dtype: torch.dtype,
+) -> None:
+    cfg = DinoPCHBMConfig(memory_storage_dtype=configured)
+    memory = PCMemory(config=cfg)
+    memory.append(_entry(("A",)))
+    memory.finalize(compat_meta=cfg.expected_memory_meta())
+    assert cfg.memory_storage_dtype == canonical
+    assert memory.route["global_keys"].device.type == "cpu"
+    assert memory.route["global_keys"].dtype == dtype
+    assert memory.pairs["p3_keys"].dtype == dtype
+    restored = PCMemory(config=cfg)
+    restored.load_state_dict(memory.state_dict())
+    assert restored.route["environment_keys"].dtype == dtype
+    assert restored.pairs["p2_keys"].dtype == dtype
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"input_size": 393}, "input_size"),
+        ({"token_size": 29}, "input_size"),
+        ({"output_size": 99}, "output_size"),
+        ({"encoder_dim": 1024}, "encoder_dim"),
+        ({"decoder_dim": 130}, "memory_dim"),
+        ({"dino_layer_indices": (1, 2, 3)}, "exactly 4"),
+        ({"dino_layer_indices": (1, 3, 3, 8)}, "unique"),
+        ({"dino_layer_indices": (1, 4, 8, 12)}, r"\[0,11\]"),
+        ({"route_top_img_k": True}, "route_top_img_k"),
+        (
+            {
+                "route_global_weight": 0.0,
+                "route_environment_weight": 0.0,
+            },
+            "route weights",
+        ),
+        ({"p3_top_ratio": float("nan")}, "p3_top_ratio"),
+        ({"p3_top_ratio": 1.01}, "p3_top_ratio"),
+        ({"p3_min_tokens": 65, "p3_max_tokens": 64}, "p3_min_tokens"),
+        ({"p3_max_tokens": 785}, "p3_max_tokens"),
+        ({"query_boundary_weight": float("inf")}, "query_boundary_weight"),
+        ({"fg_boundary_kernel": 4}, "fg_boundary_kernel"),
+        ({"gt_binary_threshold": -0.1}, "gt_binary_threshold"),
+        ({"region_names": ("same", "same")}, "unique"),
+        ({"region_names": ("pair_union", "near")}, "reserved"),
+        ({"region_max_quota": (48,)}, "exactly 2"),
+        (
+            {
+                "region_min_quota": (16, 8),
+                "region_max_quota": (8, 48),
+            },
+            r"region_min_quota\[0\]",
+        ),
+        ({"region_sampling_ratio": (0.5, float("inf"))}, "finite"),
+        ({"child_window_size": 2}, "child_window_size"),
+        ({"tau_child": 0.0}, "tau_child"),
+        ({"child_mix_init_logit": float("nan")}, "child_mix_init_logit"),
+        (
+            {"verify_start_epoch": 5, "full_pc_start_epoch": 4},
+            "full_pc_start_epoch",
+        ),
+        ({"pc_injection_ramp_epochs": 0}, "pc_injection_ramp_epochs"),
+        ({"lambda_pair": float("inf")}, "lambda_pair"),
+        ({"warn_low_pair_valid_ratio": float("nan")}, "finite"),
+        ({"memory_storage_dtype": "int8"}, "memory_storage_dtype"),
+        ({"memory_source": "pseudo"}, "labeled_only"),
+        ({"use_unlabeled_memory_update": True}, "must be False"),
+        ({"memory_device": "cuda"}, "requires memory_device"),
+        ({"memory_format_version": 3}, "requires memory_format_version"),
+        ({"memory_schema_version": 3}, "requires memory_schema_version"),
+        ({"memory_architecture": "CUSTOM"}, "requires memory_architecture"),
+    ],
+)
+def test_lite_config_rejects_invalid_types_ranges_and_relations(
+    kwargs: dict,
+    match: str,
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        DinoPCHBMConfig(**kwargs)
 
 
 def test_append_multiple_batches_finalizes_as_cpu_fp16() -> None:

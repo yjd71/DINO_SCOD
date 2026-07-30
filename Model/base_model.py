@@ -18,7 +18,13 @@ class BaseModel(nn.Module):
         self.dino.eval()
 
         self.pc_cfg = pc_cfg
-        self.decoder = Decoder(pc_cfg=pc_cfg)
+        decoder_kwargs = {}
+        if pc_cfg is not None and getattr(pc_cfg, 'enabled', False):
+            decoder_kwargs = {
+                'in_dim': int(pc_cfg.encoder_dim),
+                'out_dim': int(pc_cfg.decoder_dim),
+            }
+        self.decoder = Decoder(pc_cfg=pc_cfg, **decoder_kwargs)
 
     def train(self, mode=True):
         super().train(mode)
@@ -38,7 +44,8 @@ class BaseModel(nn.Module):
             != (self.pc_cfg.input_size, self.pc_cfg.input_size)
         ):
             raise ValueError(
-                'PC-HBM-Lite requires 392x392 input, '
+                f'PC-HBM-Lite requires {self.pc_cfg.input_size}x'
+                f'{self.pc_cfg.input_size} input, '
                 f'got {tuple(x.shape[-2:])}.'
             )
         with torch.no_grad():
@@ -128,5 +135,8 @@ class BaseModel(nn.Module):
             self.decoder,
             path,
             require_pc_complete=bool(require_pc_complete),
+            expected_pc_cfg=(
+                self.pc_cfg if bool(require_pc_complete) else None
+            ),
         )
         print(f'Successfully load seg parameters from {path}.')

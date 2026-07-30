@@ -107,9 +107,20 @@ def _profile(call, warmup: int, samples: int) -> dict[str, float]:
     }
 
 
-def _features(batch: int, device: torch.device):
+def _features(
+    batch: int,
+    device: torch.device,
+    *,
+    token_size: int,
+    encoder_dim: int,
+):
     return tuple(
-        torch.randn(batch, 28 * 28, 768, device=device)
+        torch.randn(
+            batch,
+            token_size * token_size,
+            encoder_dim,
+            device=device,
+        )
         for _ in range(4)
     )
 
@@ -172,6 +183,7 @@ def main() -> None:
         args.labeled_indices_pt
     )
     pc_cfg = DinoPCHBMConfig()
+    cfg.train_size = int(pc_cfg.input_size)
     model = BaseModel(pc_cfg=pc_cfg).to(device).eval()
     if args.decoder_checkpoint is not None:
         model.load_decoder_checkpoint(
@@ -209,8 +221,18 @@ def main() -> None:
     decoder = model.decoder.eval()
     # Timings intentionally use precomputed DINO tokens, matching the complex
     # baseline protocol and isolating Decoder/PC cost.
-    features16 = _features(16, device)
-    features32 = _features(32, device)
+    features16 = _features(
+        16,
+        device,
+        token_size=pc_cfg.token_size,
+        encoder_dim=pc_cfg.encoder_dim,
+    )
+    features32 = _features(
+        32,
+        device,
+        token_size=pc_cfg.token_size,
+        encoder_dim=pc_cfg.encoder_dim,
+    )
     model.dino = None
     torch.cuda.empty_cache()
 
@@ -254,7 +276,11 @@ def main() -> None:
     candidate_valid = pc["retrieval_valid"].float()
     query_count = int(query_valid.numel())
 
-    student = Decoder(pc_cfg=None).to(device).train()
+    student = Decoder(
+        in_dim=pc_cfg.encoder_dim,
+        out_dim=pc_cfg.decoder_dim,
+        pc_cfg=None,
+    ).to(device).train()
     student.load_state_dict(
         {
             name: value
@@ -264,7 +290,13 @@ def main() -> None:
         strict=True,
     )
     optimizer = torch.optim.Adam(student.parameters(), lr=1.0e-4)
-    labeled_gt = torch.rand(32, 1, 98, 98, device=device)
+    labeled_gt = torch.rand(
+        32,
+        1,
+        pc_cfg.output_size,
+        pc_cfg.output_size,
+        device=device,
+    )
 
     def run_ts_step():
         optimizer.zero_grad(set_to_none=True)

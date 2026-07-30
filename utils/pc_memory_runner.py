@@ -68,14 +68,38 @@ def build_memory_compat_meta(
             ),
             "storage_dtype": str(getattr(config, "memory_storage_dtype", "float16")),
             "source": str(getattr(config, "memory_source", "labeled_only")),
+            "route_environment_min_mass": float(
+                getattr(config, "route_environment_min_mass", 1.0e-3)
+            ),
+            "fg_boundary_kernel": int(
+                getattr(config, "fg_boundary_kernel", 3)
+            ),
+            "bg_near_kernel": int(
+                getattr(config, "bg_near_kernel", 7)
+            ),
+            "gt_binary_threshold": float(
+                getattr(config, "gt_binary_threshold", 0.5)
+            ),
+            "region_max_quota": tuple(
+                getattr(config, "region_max_quota", (48, 48))
+            ),
+            "region_min_quota": tuple(
+                getattr(config, "region_min_quota", (8, 8))
+            ),
+            "region_sampling_ratio": tuple(
+                getattr(config, "region_sampling_ratio", (0.5, 0.5))
+            ),
         }
         meta["producer_fingerprint"] = fingerprint
     if meta.get("source") != "labeled_only":
         raise ValueError("PC-HBM memory compatibility source must be labeled_only")
     if meta.get("architecture") != "DINO_SCOD_PC_HBM_LITE":
-        raise ValueError("PC-HBM-Lite compatibility architecture is fixed")
+        raise ValueError(
+            "PC-HBM-Lite compatibility requires architecture "
+            "'DINO_SCOD_PC_HBM_LITE'"
+        )
     if int(meta.get("schema_version", -1)) != 2:
-        raise ValueError("PC-HBM-Lite compatibility schema version is fixed to 2")
+        raise ValueError("PC-HBM-Lite compatibility requires schema version 2")
     return meta
 
 
@@ -124,7 +148,7 @@ def rebuild_memory(
     entry_builder: Callable[..., Mapping[str, Any]] | None = None,
     use_amp: bool = True,
 ):
-    """Rebuild one rank's complete CPU-FP16 memory from labeled data only."""
+    """Rebuild one rank's CPU-resident memory from labeled data only."""
 
     device = torch.device(device)
     _validate_memory_loader(memory_loader)
@@ -176,7 +200,7 @@ def rebuild_memory(
         compat_meta = build_memory_compat_meta(config, decoder)
     memory.finalize(
         device=torch.device("cpu"),
-        dtype=torch.float16,
+        dtype=memory.storage_dtype,
         compat_meta=dict(compat_meta or {}),
     )
     if not memory.is_ready():

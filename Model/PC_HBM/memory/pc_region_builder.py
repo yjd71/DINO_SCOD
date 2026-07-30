@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 import torch.nn.functional as F
 
@@ -9,6 +11,8 @@ import torch.nn.functional as F
 REGION_FG_BOUNDARY = 0
 REGION_BG_NEAR = 1
 REGION_IGNORE = -1
+DEFAULT_REGION_NAMES = ("fg_boundary", "bg_near")
+_RESERVED_OUTPUT_NAMES = {"pair_union", "pair_labels"}
 
 
 def build_boundary_pair_regions(
@@ -18,6 +22,7 @@ def build_boundary_pair_regions(
     boundary_kernel: int = 3,
     bg_near_kernel: int = 7,
     threshold: float = 0.5,
+    region_names: Sequence[str] = DEFAULT_REGION_NAMES,
 ) -> dict[str, torch.Tensor]:
     """Build foreground-boundary and near-background masks at token scale."""
 
@@ -36,6 +41,16 @@ def build_boundary_pair_regions(
             raise ValueError(f"{name} must be a positive odd integer")
     if not 0.0 <= float(threshold) <= 1.0:
         raise ValueError("threshold must be in [0,1]")
+    names = tuple(str(name) for name in region_names)
+    if (
+        len(names) != 2
+        or any(not name for name in names)
+        or len(set(names)) != 2
+        or any(name in _RESERVED_OUTPUT_NAMES for name in names)
+    ):
+        raise ValueError(
+            "region_names must contain two unique, non-empty, non-reserved names"
+        )
 
     if gt.size(0) == 0:
         foreground = torch.empty(
@@ -87,8 +102,8 @@ def build_boundary_pair_regions(
     pair_labels[fg_boundary[:, 0]] = REGION_FG_BOUNDARY
     pair_labels[bg_near[:, 0]] = REGION_BG_NEAR
     return {
-        "fg_boundary": fg_boundary,
-        "bg_near": bg_near,
+        names[REGION_FG_BOUNDARY]: fg_boundary,
+        names[REGION_BG_NEAR]: bg_near,
         "pair_union": pair_union,
         "pair_labels": pair_labels,
     }
@@ -96,6 +111,7 @@ def build_boundary_pair_regions(
 
 __all__ = [
     "REGION_BG_NEAR",
+    "DEFAULT_REGION_NAMES",
     "REGION_FG_BOUNDARY",
     "REGION_IGNORE",
     "build_boundary_pair_regions",

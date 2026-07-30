@@ -102,10 +102,14 @@ class Decoder(nn.Module):
         if (
             pc_cfg is not None
             and getattr(pc_cfg, 'enabled', False)
-            and (self.in_dim, self.out_dim) != (768, 128)
+            and (
+                self.in_dim != int(pc_cfg.encoder_dim)
+                or self.out_dim != int(pc_cfg.decoder_dim)
+            )
         ):
             raise ValueError(
-                'PC-HBM-Lite requires Decoder in_dim=768 and out_dim=128.'
+                'Decoder dimensions must match the active PC-HBM config: '
+                f'in_dim={pc_cfg.encoder_dim}, out_dim={pc_cfg.decoder_dim}.'
             )
 
         self.linear_1 = nn.Sequential(
@@ -199,19 +203,21 @@ class Decoder(nn.Module):
         if (
             self.pc_cfg is not None
             and getattr(self.pc_cfg, 'enabled', False)
-            and patches != 28
+            and patches != int(self.pc_cfg.token_size)
         ):
             raise ValueError(
-                f'PC-HBM-Lite requires a 28x28 DINO grid, got {patches}x{patches}.'
+                'PC-HBM-Lite token grid must match token_size='
+                f'{self.pc_cfg.token_size}, got {patches}x{patches}.'
             )
         seg_res = (patches * 14) // 4
         if (
             self.pc_cfg is not None
             and getattr(self.pc_cfg, 'enabled', False)
-            and seg_res != 98
+            and seg_res != int(self.pc_cfg.output_size)
         ):
             raise ValueError(
-                f'PC-HBM-Lite requires 98x98 output, got {seg_res}x{seg_res}.'
+                'PC-HBM-Lite output grid must match output_size='
+                f'{self.pc_cfg.output_size}, got {seg_res}x{seg_res}.'
             )
 
         query = self.linear_1234(torch.cat([f_1, f_2, f_3, f_4], dim=-1))
@@ -270,7 +276,7 @@ class Decoder(nn.Module):
         seg_1_tokens = self._forward_t1(state, seg_2_tokens)
 
         # Keep the baseline numerical path unchanged while exposing the raw
-        # 28x28 decoder features used by teacher-only feature distillation.
+        # token-grid decoder features used by teacher-only distillation.
         p3_map = tokens_to_map(seg_3_tokens, *state['token_hw'])
         p2_map = tokens_to_map(seg_2_tokens, *state['token_hw'])
 
@@ -419,7 +425,7 @@ class Decoder(nn.Module):
 
         p2_map = tokens_to_map(t2, *token_hw)
         t1 = self._forward_t1(state, t2)
-        z_main, p1_98 = self._predict_side(
+        z_main, p1_output = self._predict_side(
             t1, torch.sigmoid(m2), self.seg_head_1, token_hw, output_hw
         )
         z_final = z_main
@@ -447,7 +453,7 @@ class Decoder(nn.Module):
             'features': {
                 'p3': p3_map,
                 'p2': p2_map,
-                'p1': p1_98,
+                'p1': p1_output,
             },
         }
         return outputs, aux

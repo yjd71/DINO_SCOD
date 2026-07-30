@@ -28,17 +28,25 @@ class CamouflageContextRouter(nn.Module):
         self.global_weight = float(global_weight)
         self.environment_weight = float(environment_weight)
         self.min_environment_mass = float(min_environment_mass)
-        if self.dim != 128:
-            raise ValueError(f"PC-HBM-Lite route dim is fixed to 128, got {self.dim}")
-        if self.top_img_k != 4:
-            raise ValueError(f"PC-HBM-Lite route Top-K is fixed to 4, got {self.top_img_k}")
-        if self.global_weight != 0.5 or self.environment_weight != 0.5:
-            raise ValueError("PC-HBM-Lite route weights are fixed to 0.5/0.5")
+        if self.dim <= 0:
+            raise ValueError("dim must be positive")
+        if self.top_img_k <= 0:
+            raise ValueError("top_img_k must be positive")
+        if (
+            not math.isfinite(self.global_weight)
+            or not math.isfinite(self.environment_weight)
+            or self.global_weight < 0.0
+            or self.environment_weight < 0.0
+            or max(self.global_weight, self.environment_weight) <= 0.0
+        ):
+            raise ValueError(
+                "route weights must be finite, non-negative, and not both zero"
+            )
         if (
             not math.isfinite(self.min_environment_mass)
-            or self.min_environment_mass <= 0
+            or self.min_environment_mass < 0
         ):
-            raise ValueError("min_environment_mass must be positive")
+            raise ValueError("min_environment_mass must be non-negative")
 
     def encode_route_tokens(
         self,
@@ -110,6 +118,8 @@ class CamouflageContextRouter(nn.Module):
             top_img_k=self.top_img_k if top_img_k is None else int(top_img_k),
             query_image_ids=query_image_ids,
             exclude_self_match=exclude_self_match,
+            global_weight=self.global_weight,
+            environment_weight=self.environment_weight,
         )
         routed.update(contexts)
         return routed

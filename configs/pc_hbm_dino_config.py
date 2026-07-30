@@ -2,10 +2,78 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 import math
-from numbers import Integral
+from numbers import Integral, Real
 from typing import Any
+
+
+def _as_bool(name: str, value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a bool")
+    return value
+
+
+def _as_int(
+    name: str,
+    value: Any,
+    *,
+    minimum: int | None = None,
+) -> int:
+    if not isinstance(value, Integral) or isinstance(value, bool):
+        raise ValueError(f"{name} must be an integer")
+    normalized = int(value)
+    if minimum is not None and normalized < minimum:
+        raise ValueError(f"{name} must be >= {minimum}")
+    return normalized
+
+
+def _as_float(
+    name: str,
+    value: Any,
+    *,
+    minimum: float | None = None,
+    maximum: float | None = None,
+    minimum_open: bool = False,
+    maximum_open: bool = False,
+) -> float:
+    if not isinstance(value, Real) or isinstance(value, bool):
+        raise ValueError(f"{name} must be a real number")
+    normalized = float(value)
+    if not math.isfinite(normalized):
+        raise ValueError(f"{name} must be finite")
+    if minimum is not None:
+        invalid = (
+            normalized <= minimum if minimum_open else normalized < minimum
+        )
+        if invalid:
+            bracket = ">" if minimum_open else ">="
+            raise ValueError(f"{name} must be {bracket} {minimum}")
+    if maximum is not None:
+        invalid = (
+            normalized >= maximum if maximum_open else normalized > maximum
+        )
+        if invalid:
+            bracket = "<" if maximum_open else "<="
+            raise ValueError(f"{name} must be {bracket} {maximum}")
+    return normalized
+
+
+def _as_nonempty_str(name: str, value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value.strip()
+
+
+def _as_tuple(name: str, value: Any, *, length: int) -> tuple[Any, ...]:
+    if (
+        isinstance(value, (str, bytes))
+        or not isinstance(value, Sequence)
+        or len(value) != length
+    ):
+        raise ValueError(f"{name} must contain exactly {length} values")
+    return tuple(value)
 
 
 @dataclass
@@ -14,7 +82,7 @@ class DinoPCHBMConfig:
 
     enabled: bool = True
 
-    # Fixed DINO / legacy Decoder contract.
+    # DINO / legacy Decoder shape contract.
     input_size: int = 392
     encoder_dim: int = 768
     decoder_dim: int = 128
@@ -22,7 +90,7 @@ class DinoPCHBMConfig:
     output_size: int = 98
     dino_layer_indices: tuple[int, int, int, int] = (2, 5, 8, 11)
 
-    # Labeled-only CPU-FP16 pair memory.
+    # Labeled-only CPU pair memory with configurable floating storage.
     memory_dim: int = 128
     memory_source: str = "labeled_only"
     use_unlabeled_memory_update: bool = False
@@ -87,120 +155,327 @@ class DinoPCHBMConfig:
     warn_delta_large_threshold: float = 1.0
 
     def __post_init__(self) -> None:
-        fixed: tuple[tuple[str, Any, Any], ...] = (
-            ("input_size", self.input_size, 392),
-            ("encoder_dim", self.encoder_dim, 768),
-            ("decoder_dim", self.decoder_dim, 128),
-            ("token_size", self.token_size, 28),
-            ("output_size", self.output_size, 98),
-            ("dino_layer_indices", tuple(self.dino_layer_indices), (2, 5, 8, 11)),
-            ("memory_dim", self.memory_dim, 128),
-            ("memory_source", self.memory_source, "labeled_only"),
-            ("use_unlabeled_memory_update", self.use_unlabeled_memory_update, False),
-            ("memory_storage_dtype", self.memory_storage_dtype, "float16"),
-            ("memory_device", self.memory_device, "cpu"),
-            ("memory_format_version", self.memory_format_version, 2),
-            ("memory_schema_version", self.memory_schema_version, 2),
-            ("memory_architecture", self.memory_architecture, "DINO_SCOD_PC_HBM_LITE"),
-            ("route_top_img_k", self.route_top_img_k, 4),
-            ("route_global_weight", self.route_global_weight, 0.5),
-            ("route_environment_weight", self.route_environment_weight, 0.5),
-            ("p3_top_ratio", self.p3_top_ratio, 0.10),
-            ("p3_min_tokens", self.p3_min_tokens, 16),
-            ("p3_max_tokens", self.p3_max_tokens, 64),
-            ("query_boundary_weight", self.query_boundary_weight, 0.5),
-            ("query_uncertainty_weight", self.query_uncertainty_weight, 0.5),
-            ("fg_boundary_kernel", self.fg_boundary_kernel, 3),
-            ("bg_near_kernel", self.bg_near_kernel, 7),
-            ("gt_binary_threshold", self.gt_binary_threshold, 0.5),
-            ("region_names", tuple(self.region_names), ("fg_boundary", "bg_near")),
-            ("region_max_quota", tuple(self.region_max_quota), (48, 48)),
-            ("region_min_quota", tuple(self.region_min_quota), (8, 8)),
-            ("region_sampling_ratio", tuple(self.region_sampling_ratio), (0.5, 0.5)),
-            ("parent_topk_per_region", self.parent_topk_per_region, 4),
-            ("child_window_size", self.child_window_size, 3),
-            ("child_mix_init_logit", self.child_mix_init_logit, 0.0),
-            ("verify_start_epoch", self.verify_start_epoch, 6),
-            ("full_pc_start_epoch", self.full_pc_start_epoch, 11),
-            (
-                "teacher_only_full_start_epoch",
-                self.teacher_only_full_start_epoch,
-                6,
-            ),
-            ("pc_injection_ramp_epochs", self.pc_injection_ramp_epochs, 3),
-        )
-        for name, actual, expected in fixed:
-            if actual != expected:
-                raise ValueError(f"{name} is fixed to {expected!r}, got {actual!r}")
+        for name in (
+            "enabled",
+            "use_unlabeled_memory_update",
+            "exclude_self_match",
+            "use_amp",
+        ):
+            setattr(self, name, _as_bool(name, getattr(self, name)))
 
-        if (
-            not math.isfinite(float(self.route_environment_min_mass))
-            or self.route_environment_min_mass <= 0
+        for name in (
+            "input_size",
+            "encoder_dim",
+            "decoder_dim",
+            "token_size",
+            "output_size",
+            "memory_dim",
+            "memory_format_version",
+            "memory_schema_version",
+            "route_top_img_k",
+            "parent_topk_per_region",
+            "query_chunk_size",
+            "verify_start_epoch",
+            "full_pc_start_epoch",
+            "teacher_only_full_start_epoch",
+            "pc_injection_ramp_epochs",
+            "diagnostic_window_epochs",
         ):
-            raise ValueError("route_environment_min_mass must be positive")
-        if (
-            not isinstance(self.query_chunk_size, Integral)
-            or isinstance(self.query_chunk_size, bool)
-            or self.query_chunk_size < 1
+            setattr(
+                self,
+                name,
+                _as_int(name, getattr(self, name), minimum=1),
+            )
+        self.p3_min_tokens = _as_int(
+            "p3_min_tokens", self.p3_min_tokens, minimum=0
+        )
+        self.p3_max_tokens = _as_int(
+            "p3_max_tokens", self.p3_max_tokens, minimum=0
+        )
+
+        if self.input_size != self.token_size * 14:
+            raise ValueError(
+                "input_size must equal token_size * 14 for the frozen "
+                "DINOv2 ViT-B/14 backbone"
+            )
+        expected_output_size = (self.token_size * 14) // 4
+        if self.output_size != expected_output_size:
+            raise ValueError(
+                "output_size must equal (token_size * 14) // 4 for the "
+                f"legacy Decoder, expected {expected_output_size}"
+            )
+        if self.encoder_dim != 768:
+            raise ValueError(
+                "the frozen DINOv2 ViT-B/14 backbone requires "
+                "encoder_dim=768"
+            )
+        if self.memory_dim != self.decoder_dim:
+            raise ValueError(
+                "memory_dim must equal decoder_dim because the "
+                "parameter-free Router pools decoder features directly"
+            )
+
+        dino_layers = _as_tuple(
+            "dino_layer_indices",
+            self.dino_layer_indices,
+            length=4,
+        )
+        self.dino_layer_indices = tuple(
+            _as_int(f"dino_layer_indices[{index}]", value, minimum=0)
+            for index, value in enumerate(dino_layers)
+        )
+        if len(set(self.dino_layer_indices)) != 4:
+            raise ValueError(
+                "dino_layer_indices must contain four unique layer indices"
+            )
+        if max(self.dino_layer_indices) >= 12:
+            raise ValueError(
+                "dino_layer_indices must be in [0,11] for DINOv2 ViT-B/14"
+            )
+        self.dino_layer_indices = tuple(sorted(self.dino_layer_indices))
+
+        for name in (
+            "memory_source",
+            "memory_device",
+            "memory_architecture",
         ):
-            raise ValueError("query_chunk_size must be positive")
-        if (
-            not math.isfinite(float(self.tau_parent))
-            or not math.isfinite(float(self.tau_child))
-            or self.tau_parent <= 0
-            or self.tau_child <= 0
+            setattr(
+                self,
+                name,
+                _as_nonempty_str(name, getattr(self, name)),
+            )
+        self.memory_device = self.memory_device.lower()
+        if self.memory_source != "labeled_only":
+            raise ValueError(
+                "PC-HBM-Lite protocol requires memory_source='labeled_only'"
+            )
+        if self.use_unlabeled_memory_update:
+            raise ValueError(
+                "use_unlabeled_memory_update must be False because Memory "
+                "may only be rebuilt from labeled data"
+            )
+        if self.memory_device != "cpu":
+            raise ValueError(
+                "PC-HBM-Lite protocol requires memory_device='cpu'"
+            )
+        if self.memory_format_version != 2:
+            raise ValueError(
+                "PC-HBM-Lite protocol requires memory_format_version=2"
+            )
+        if self.memory_schema_version != 2:
+            raise ValueError(
+                "PC-HBM-Lite protocol requires memory_schema_version=2"
+            )
+        if self.memory_architecture != "DINO_SCOD_PC_HBM_LITE":
+            raise ValueError(
+                "PC-HBM-Lite protocol requires memory_architecture="
+                "'DINO_SCOD_PC_HBM_LITE'"
+            )
+        self.memory_storage_dtype = _as_nonempty_str(
+            "memory_storage_dtype",
+            self.memory_storage_dtype,
+        ).lower()
+        dtype_aliases = {
+            "float16": "float16",
+            "fp16": "float16",
+            "torch.float16": "float16",
+            "bfloat16": "bfloat16",
+            "bf16": "bfloat16",
+            "torch.bfloat16": "bfloat16",
+            "float32": "float32",
+            "fp32": "float32",
+            "torch.float32": "float32",
+        }
+        if self.memory_storage_dtype not in dtype_aliases:
+            raise ValueError(
+                "memory_storage_dtype must be float16, bfloat16, or float32"
+            )
+        self.memory_storage_dtype = dtype_aliases[self.memory_storage_dtype]
+
+        for name in (
+            "route_global_weight",
+            "route_environment_weight",
+            "query_boundary_weight",
+            "query_uncertainty_weight",
         ):
-            raise ValueError("cosine temperatures must be positive")
-        if self.verify_start_epoch < 1:
-            raise ValueError("verify_start_epoch must be at least one")
+            setattr(
+                self,
+                name,
+                _as_float(name, getattr(self, name), minimum=0.0),
+            )
+        if self.route_global_weight + self.route_environment_weight <= 0.0:
+            raise ValueError("route weights must not both be zero")
+        if self.query_boundary_weight + self.query_uncertainty_weight <= 0.0:
+            raise ValueError("query weights must not both be zero")
+        self.route_environment_min_mass = _as_float(
+            "route_environment_min_mass",
+            self.route_environment_min_mass,
+            minimum=0.0,
+        )
+
+        self.p3_top_ratio = _as_float(
+            "p3_top_ratio",
+            self.p3_top_ratio,
+            minimum=0.0,
+            maximum=1.0,
+        )
+        token_count = self.token_size * self.token_size
+        if self.p3_min_tokens > self.p3_max_tokens:
+            raise ValueError("p3_min_tokens must not exceed p3_max_tokens")
+        if self.p3_max_tokens > token_count:
+            raise ValueError(
+                "p3_max_tokens must not exceed token_size squared "
+                f"({token_count})"
+            )
+
+        for name in (
+            "fg_boundary_kernel",
+            "bg_near_kernel",
+            "child_window_size",
+        ):
+            value = _as_int(name, getattr(self, name), minimum=1)
+            if value % 2 == 0:
+                raise ValueError(f"{name} must be a positive odd integer")
+            setattr(self, name, value)
+        self.gt_binary_threshold = _as_float(
+            "gt_binary_threshold",
+            self.gt_binary_threshold,
+            minimum=0.0,
+            maximum=1.0,
+        )
+
+        region_names = _as_tuple(
+            "region_names",
+            self.region_names,
+            length=2,
+        )
+        self.region_names = tuple(
+            _as_nonempty_str(f"region_names[{index}]", value)
+            for index, value in enumerate(region_names)
+        )
+        if len(set(self.region_names)) != 2:
+            raise ValueError("region_names must contain two unique names")
+        if any(
+            name in {"pair_union", "pair_labels"}
+            for name in self.region_names
+        ):
+            raise ValueError(
+                "region_names must not use reserved names "
+                "'pair_union' or 'pair_labels'"
+            )
+
+        minimum_quota = _as_tuple(
+            "region_min_quota",
+            self.region_min_quota,
+            length=2,
+        )
+        maximum_quota = _as_tuple(
+            "region_max_quota",
+            self.region_max_quota,
+            length=2,
+        )
+        sampling_ratio = _as_tuple(
+            "region_sampling_ratio",
+            self.region_sampling_ratio,
+            length=2,
+        )
+        self.region_min_quota = tuple(
+            _as_int(f"region_min_quota[{index}]", value, minimum=0)
+            for index, value in enumerate(minimum_quota)
+        )
+        self.region_max_quota = tuple(
+            _as_int(f"region_max_quota[{index}]", value, minimum=0)
+            for index, value in enumerate(maximum_quota)
+        )
+        self.region_sampling_ratio = tuple(
+            _as_float(
+                f"region_sampling_ratio[{index}]",
+                value,
+                minimum=0.0,
+                maximum=1.0,
+            )
+            for index, value in enumerate(sampling_ratio)
+        )
+        for index, (minimum, maximum) in enumerate(
+            zip(self.region_min_quota, self.region_max_quota)
+        ):
+            if minimum > maximum:
+                raise ValueError(
+                    f"region_min_quota[{index}] must not exceed "
+                    f"region_max_quota[{index}]"
+                )
+            if maximum > token_count:
+                raise ValueError(
+                    f"region_max_quota[{index}] must not exceed token_size "
+                    f"squared ({token_count})"
+                )
+
+        for name in ("tau_parent", "tau_child"):
+            setattr(
+                self,
+                name,
+                _as_float(
+                    name,
+                    getattr(self, name),
+                    minimum=0.0,
+                    minimum_open=True,
+                ),
+            )
+        self.child_mix_init_logit = _as_float(
+            "child_mix_init_logit",
+            self.child_mix_init_logit,
+        )
+
         if self.full_pc_start_epoch < self.verify_start_epoch:
             raise ValueError("full_pc_start_epoch must not precede verification")
-        if self.teacher_only_full_start_epoch < 2:
-            raise ValueError("teacher_only_full_start_epoch must leave a verification warmup")
-        loss_weights = (
-            float(self.lambda_pair),
-            float(self.lambda_u),
-            float(self.feature_distill_p3_weight),
+
+        for name in (
+            "lambda_pair",
+            "lambda_u",
+            "feature_distill_p3_weight",
+        ):
+            setattr(
+                self,
+                name,
+                _as_float(name, getattr(self, name), minimum=0.0),
+            )
+        self.grad_clip_norm = _as_float(
+            "grad_clip_norm",
+            self.grad_clip_norm,
+            minimum=0.0,
         )
-        if (
-            not all(math.isfinite(value) for value in loss_weights)
-            or any(value < 0 for value in loss_weights)
-        ):
-            raise ValueError("loss weights must be non-negative")
-        if (
-            not math.isfinite(float(self.grad_clip_norm))
-            or self.grad_clip_norm <= 0
-        ):
-            raise ValueError("grad_clip_norm must be positive")
-        if not 0.0 <= self.ema_momentum < 1.0:
-            raise ValueError("ema_momentum must be in [0,1)")
-        if (
-            not isinstance(self.diagnostic_window_epochs, Integral)
-            or isinstance(self.diagnostic_window_epochs, bool)
-            or self.diagnostic_window_epochs < 1
-        ):
-            raise ValueError("diagnostic_window_epochs must be positive")
+        self.ema_momentum = _as_float(
+            "ema_momentum",
+            self.ema_momentum,
+            minimum=0.0,
+            maximum=1.0,
+        )
         for name in (
             "warn_low_pair_valid_ratio",
             "warn_pair_acc_near_random",
             "warn_gate_inactive_threshold",
         ):
-            value = float(getattr(self, name))
-            if not 0.0 <= value <= 1.0:
-                raise ValueError(f"{name} must be in [0,1]")
-        if (
-            not math.isfinite(float(self.warn_delta_large_threshold))
-            or self.warn_delta_large_threshold <= 0
-        ):
-            raise ValueError("warn_delta_large_threshold must be positive")
+            setattr(
+                self,
+                name,
+                _as_float(
+                    name,
+                    getattr(self, name),
+                    minimum=0.0,
+                    maximum=1.0,
+                ),
+            )
+        self.warn_delta_large_threshold = _as_float(
+            "warn_delta_large_threshold",
+            self.warn_delta_large_threshold,
+            minimum=0.0,
+        )
 
     def configure_training_design(self, training_design: str) -> None:
         """Configure one of the two supported stage schedules."""
 
         design = str(training_design)
         if design == "two_stage":
-            self.verify_start_epoch = 6
-            self.full_pc_start_epoch = 11
             return
         if design == "teacher_only":
             self.verify_start_epoch = 1
@@ -248,6 +523,13 @@ class DinoPCHBMConfig:
             "region_names": tuple(self.region_names),
             "storage_dtype": self.memory_storage_dtype,
             "source": self.memory_source,
+            "route_environment_min_mass": self.route_environment_min_mass,
+            "fg_boundary_kernel": self.fg_boundary_kernel,
+            "bg_near_kernel": self.bg_near_kernel,
+            "gt_binary_threshold": self.gt_binary_threshold,
+            "region_max_quota": tuple(self.region_max_quota),
+            "region_min_quota": tuple(self.region_min_quota),
+            "region_sampling_ratio": tuple(self.region_sampling_ratio),
         }
         if producer_fingerprint is not None:
             meta["producer_fingerprint"] = str(producer_fingerprint)

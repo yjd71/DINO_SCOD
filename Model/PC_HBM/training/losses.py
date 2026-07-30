@@ -130,7 +130,7 @@ def binary_pair_loss(
         gt = gt.unsqueeze(1)
     if gt.ndim != 4 or gt.shape[1] != 1:
         raise ValueError(f"gt must be [B,1,H,W], got {tuple(gt.shape)}")
-    token_hw = _token_hw(pc, flat_indices)
+    token_hw = _token_hw(pc)
     target_map = build_pair_label_map(
         gt,
         token_hw,
@@ -276,15 +276,12 @@ def _validate_active_aux(aux, mode: str) -> None:
 
 def _token_hw(
     pc: Mapping[str, Any],
-    flat_indices: torch.Tensor,
 ) -> tuple[int, int]:
     query_map = pc.get("query_mask_map")
     if torch.is_tensor(query_map):
         if query_map.ndim != 4 or query_map.shape[1] != 1:
             raise ValueError("query_mask_map must be [B,1,H,W]")
         return int(query_map.shape[-2]), int(query_map.shape[-1])
-    if flat_indices.numel() == 0:
-        return 28, 28
     raise KeyError("query_mask_map is required to establish the query grid")
 
 

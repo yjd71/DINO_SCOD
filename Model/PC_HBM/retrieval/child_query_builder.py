@@ -12,15 +12,19 @@ from .child_local_encoder import ChildLocalEncoder
 
 
 class ChildQueryBuilder(nn.Module):
-    """Encode a 3x3 P2 patch at every selected P3 coordinate."""
+    """Encode an odd-window P2 patch at every selected P3 coordinate."""
 
     def __init__(self, p2_ch: int, dim: int = 128, window: int = 3) -> None:
         super().__init__()
         self.p2_ch = int(p2_ch)
         self.dim = int(dim)
         self.window = int(window)
-        if self.window != 3:
-            raise ValueError("PC-HBM-Lite child window is fixed to 3")
+        if self.p2_ch <= 0:
+            raise ValueError("p2_ch must be positive")
+        if self.dim <= 0:
+            raise ValueError("dim must be positive")
+        if self.window <= 0 or self.window % 2 == 0:
+            raise ValueError("window must be a positive odd integer")
         self.encoder = ChildLocalEncoder(
             self.p2_ch, dim=self.dim, window=self.window
         )
