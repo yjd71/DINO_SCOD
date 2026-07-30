@@ -29,6 +29,18 @@ class BaseModel(nn.Module):
     def extract_features(self, x):
         if x.dim() != 4:
             raise ValueError(f'Expected image batch [B,C,H,W], got {tuple(x.shape)}.')
+        if x.size(1) != 3:
+            raise ValueError(f'Expected three image channels, got {x.size(1)}.')
+        if (
+            self.pc_cfg is not None
+            and getattr(self.pc_cfg, 'enabled', False)
+            and tuple(x.shape[-2:])
+            != (self.pc_cfg.input_size, self.pc_cfg.input_size)
+        ):
+            raise ValueError(
+                'PC-HBM-Lite requires 392x392 input, '
+                f'got {tuple(x.shape[-2:])}.'
+            )
         with torch.no_grad():
             layer_indices = (
                 list(self.pc_cfg.dino_layer_indices)
@@ -44,12 +56,20 @@ class BaseModel(nn.Module):
             )
         if len(features) != 4:
             raise RuntimeError(f'DINO returned {len(features)} feature levels instead of four.')
+        if self.pc_cfg is not None and getattr(self.pc_cfg, 'enabled', False):
+            expected_shape = (
+                x.size(0),
+                self.pc_cfg.token_size * self.pc_cfg.token_size,
+                self.pc_cfg.encoder_dim,
+            )
+            for index, feature in enumerate(features):
+                if tuple(feature.shape) != expected_shape:
+                    raise RuntimeError(
+                        f'DINO layer {self.pc_cfg.dino_layer_indices[index]} '
+                        f'must be {expected_shape}, got {tuple(feature.shape)}.'
+                    )
         return features
 
-    def _extract_features(self, x):
-        """Backward-compatible alias used by the original training scripts."""
-        return self.extract_features(x)
-        
     def forward(
         self,
         x,

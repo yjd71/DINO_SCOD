@@ -1,6 +1,5 @@
-"""DINOv2-adapted Parent-Child Hypothesis-Verified Boundary Memory."""
+"""DINO_SCOD_PC_HBM_LITE runtime."""
 
-from .dino_channel_spec import DinoPCHBMChannelSpec
 from .dino_engine import DinoPCHBMEngine
 
-__all__ = ['DinoPCHBMChannelSpec', 'DinoPCHBMEngine']
+__all__ = ["DinoPCHBMEngine"]

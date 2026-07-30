@@ -1,451 +1,334 @@
-"""DINOv2 same-grid orchestration for PC-HBM."""
+"""DINO PC-HBM-Lite orchestration.
+
+The engine contains exactly one correction path:
+
+dual-context route -> balanced Pair Memory retrieval -> P2 cosine
+verification -> binary evidence -> gated P3 residual.
+"""
 
 from __future__ import annotations
 
-from typing import Dict, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
+from torch import nn
 
-from .common.utils import gather_tokens, merge_parent_results
-from .dino_channel_spec import DinoPCHBMChannelSpec
+from .common.utils import gather_tokens
 from .dino_memory_builder import DinoMemoryBuilder
-from .fusion.hypothesis_token_builder import HypothesisTokenBuilder
-from .fusion.p3_gated_residual import P3GatedResidual
-from .fusion.pc_hca import PCHCA
-from .fusion.pc_scatter import pc_scatter
-from .fusion.pc_token_decoder import PCTokenDecoder
-from .fusion.query_state_builder import QueryStateBuilder
-from .fusion.structured_gate_mlp import StructuredGateMLP
-from .refinement.adaptive_mixture_head import AdaptiveMixtureHead
-from .refinement.boundary_query_head import BoundaryQueryHead3
-from .refinement.p1_pixel_refinement_attention import P1PixelRefinementAttention
-from .refinement.p2_boundary_retarget_attention import P2BoundaryRetargetAttention
-from .retrieval.child_query_builder import DinoChildQueryBuilder
-from .retrieval.child_verifier_v2 import ChildVerifierV2
-from .retrieval.parent_retriever import ParentRetriever
-from .routing.camouflage_context_router import CamouflageContextRouter
-
-
-def _boundary_features(probability: torch.Tensor) -> torch.Tensor:
-    probability = probability.clamp(1e-6, 1.0 - 1e-6)
-    dilated = F.max_pool2d(probability, kernel_size=3, stride=1, padding=1)
-    eroded = -F.max_pool2d(-probability, kernel_size=3, stride=1, padding=1)
-    morphology = (dilated - eroded).clamp(0.0, 1.0)
-    uncertainty = 4.0 * probability * (1.0 - probability)
-    dx = F.pad(probability[..., :, 1:] - probability[..., :, :-1], (0, 1, 0, 0))
-    dy = F.pad(probability[..., 1:, :] - probability[..., :-1, :], (0, 0, 0, 1))
-    gradient = torch.sqrt(dx.square() + dy.square() + 1e-6).clamp(0.0, 1.0)
-    entropy = -(
-        probability * torch.log(probability)
-        + (1.0 - probability) * torch.log(1.0 - probability)
-    ) / 0.6931471805599453
-    return torch.cat([morphology, uncertainty, gradient, entropy, probability], dim=1)
+from .fusion import P3GatedResidual
+from .refinement import BoundaryQuerySelector
+from .retrieval import (
+    BalancedParentRetriever,
+    ChildQueryBuilder,
+    PairVerifier,
+)
+from .routing import CamouflageContextRouter
 
 
 class DinoPCHBMEngine(nn.Module):
-    """Compose route, hypothesis verification and hierarchical refinements."""
+    """Compose the complete PC-HBM-Lite path."""
+
+    VALID_MODES = {"verify_only", "full", "teacher_pseudo"}
 
     def __init__(self, cfg) -> None:
         super().__init__()
         self.cfg = cfg
-        spec = DinoPCHBMChannelSpec(
-            x3=cfg.decoder_dim,
-            p3=cfg.decoder_dim,
-            p2=cfg.decoder_dim,
-            p1=cfg.decoder_dim,
-            pc_dim=cfg.memory_dim,
-            value_dim=cfg.value_dim,
-            geometry_dim=cfg.geometry_dim,
-        )
-        dim = cfg.memory_dim
-
-        self.boundary3 = BoundaryQueryHead3(
+        self._validate_fixed_contract(cfg)
+        self.query_selector = BoundaryQuerySelector(
             top_ratio=cfg.p3_top_ratio,
             min_tokens=cfg.p3_min_tokens,
             max_tokens=cfg.p3_max_tokens,
+            boundary_weight=cfg.query_boundary_weight,
+            uncertainty_weight=cfg.query_uncertainty_weight,
         )
         self.router = CamouflageContextRouter(
-            x3_ch=spec.x3, dim=dim, top_img_k=cfg.route_top_img_k
+            dim=cfg.memory_dim,
+            top_img_k=cfg.route_top_img_k,
+            global_weight=cfg.route_global_weight,
+            environment_weight=cfg.route_environment_weight,
+            min_environment_mass=cfg.route_environment_min_mass,
         )
-        self.parent_retriever = ParentRetriever(
-            p3_ch=spec.p3,
-            dim=dim,
-            topk=cfg.parent_topk,
-            tau=cfg.tau_parent,
+        self.parent_retriever = BalancedParentRetriever(
+            p3_ch=cfg.decoder_dim,
+            dim=cfg.memory_dim,
+            topk_per_region=cfg.parent_topk_per_region,
         )
-        self.child_query = DinoChildQueryBuilder(
-            p2_ch=spec.p2, dim=dim, window=cfg.child_window_size
+        self.child_query = ChildQueryBuilder(
+            p2_ch=cfg.decoder_dim,
+            dim=cfg.memory_dim,
+            window=cfg.child_window_size,
         )
-        self.child_verifier = ChildVerifierV2(
-            dim=dim,
-            value_dim=cfg.value_dim,
-            geometry_dim=cfg.geometry_dim,
-            tau=cfg.tau_child,
+        self.pair_verifier = PairVerifier(
+            dim=cfg.memory_dim,
+            tau_parent=cfg.tau_parent,
+            tau_child=cfg.tau_child,
+            child_mix_init_logit=cfg.child_mix_init_logit,
         )
-        self.hyp_builder = HypothesisTokenBuilder(
-            dim=dim,
-            value_dim=cfg.value_dim,
-            geometry_dim=cfg.geometry_dim,
-        )
-        self.query_state = QueryStateBuilder(dim=dim)
-        self.hca = PCHCA(
-            dim=dim,
-            num_heads=cfg.attn_num_heads,
-            head_dim=cfg.attn_head_dim,
-            tau=cfg.tau_hca,
-        )
-        self.token_decoder = PCTokenDecoder(
-            dim=dim, value_dim=cfg.value_dim, geometry_dim=cfg.geometry_dim
-        )
-        self.gate_mlp = StructuredGateMLP()
-        self.p3_residual = P3GatedResidual(dim=dim, p3_ch=spec.p3)
-        self.p2_bra = P2BoundaryRetargetAttention(
-            p2_ch=spec.p2,
-            dim=dim,
-            window=cfg.p2_local_window,
-            tau=cfg.tau_bra,
-            top_ratio=cfg.p2_top_ratio,
-            min_tokens=cfg.p2_min_tokens,
-            max_tokens=cfg.p2_max_tokens,
-            detach_refs=cfg.detach_p3_refs_for_p2,
-            num_heads=cfg.attn_num_heads,
-            head_dim=cfg.attn_head_dim,
-        )
-        self.p1_pra = P1PixelRefinementAttention(
-            p1_ch=spec.p1,
-            dim=dim,
-            window=cfg.p1_local_window,
-            tau=cfg.tau_pra,
-            top_ratio=cfg.p1_top_ratio,
-            min_tokens=cfg.p1_min_tokens,
-            max_tokens=cfg.p1_max_tokens,
-            detach_refs=cfg.detach_p2_refs_for_p1,
-            num_heads=cfg.attn_num_heads,
-            head_dim=cfg.attn_head_dim,
-        )
-        self.mixture = AdaptiveMixtureHead(
-            r_max=cfg.r_max,
-            max_offset=cfg.max_offset,
-            mask_corr_epsilon=cfg.mask_corr_epsilon,
-            init_bias=cfg.mixture_init_bias,
-            use_branch_quality=True,
-            use_branch_dropout=True,
+        self.p3_residual = P3GatedResidual(
+            dim=cfg.memory_dim,
+            p3_ch=cfg.decoder_dim,
         )
         self.memory_builder = DinoMemoryBuilder(
-            cfg, self.router, self.parent_retriever, self.child_query
+            cfg,
+            self.router,
+            self.parent_retriever,
+            self.child_query,
         )
 
     @staticmethod
-    def _selected(index_dict: Dict[str, torch.Tensor], key: str) -> torch.Tensor:
-        if key not in index_dict:
-            raise KeyError(f'Boundary index dictionary is missing {key!r}.')
-        return index_dict[key]
-
-    def _empty_parent_result(self, reference: torch.Tensor) -> Dict[str, object]:
-        k = self.cfg.parent_topk
-        dim = self.cfg.memory_dim
-        value_dim = self.cfg.value_dim
-        geo_dim = self.cfg.geometry_dim
-        return {
-            'q3': reference.new_empty((0, dim)),
-            'top_parent_keys': reference.new_empty((0, k, dim)),
-            'top_parent_values': reference.new_empty((0, k, value_dim)),
-            'top_parent_geo': reference.new_empty((0, k, geo_dim)),
-            'top_child_ptrs': torch.empty((0, k), device=reference.device, dtype=torch.long),
-            'top_parent_indices': torch.empty((0, k), device=reference.device, dtype=torch.long),
-            'top_parent_scores': reference.new_empty((0, k)),
-            'top_parent_valid': torch.empty((0, k), device=reference.device, dtype=torch.bool),
-            'A_parent': reference.new_empty((0, k)),
-            'P3_group': reference.new_empty((0, 4)),
-            'S_fg_parent': reference.new_empty((0, 1)),
-            'S_bg_parent': reference.new_empty((0, 1)),
-            'M_parent': reference.new_empty((0, 1)),
-            'parent_entropy': reference.new_empty((0,)),
-            'top_parent_region_ids': torch.empty((0, k), device=reference.device, dtype=torch.long),
-            'top_parent_reliability': reference.new_empty((0, k)),
-            'top_parent_meta': [],
+    def _validate_fixed_contract(cfg) -> None:
+        expected = {
+            "input_size": 392,
+            "encoder_dim": 768,
+            "decoder_dim": 128,
+            "memory_dim": 128,
+            "token_size": 28,
+            "output_size": 98,
+            "child_window_size": 3,
+            "parent_topk_per_region": 4,
         }
-
-    def _routed_parent_retrieval(
-        self,
-        p3: torch.Tensor,
-        batch_ids: torch.Tensor,
-        flat_indices: torch.Tensor,
-        route: Dict[str, object],
-        memory,
-        query_image_ids: Optional[Sequence[str]],
-    ) -> Dict[str, object]:
-        q_map = self.parent_retriever.encode_q_map(p3)
-        q3 = gather_tokens(q_map, batch_ids, flat_indices)
-        if q3.shape[0] == 0:
-            return self._empty_parent_result(p3)
-
-        results = []
-        for batch_index in range(p3.shape[0]):
-            output_positions = torch.where(batch_ids == batch_index)[0]
-            if output_positions.numel() == 0:
-                continue
-            q_b = q3.index_select(0, output_positions)
-            exclude_id = None
-            if self.cfg.exclude_self_match and query_image_ids is not None:
-                exclude_id = str(query_image_ids[batch_index])
-            bank_b = memory.get_parent_subbank(
-                route['top_img_ids'][batch_index],
-                exclude_image_id=exclude_id,
-                device=p3.device,
-                dtype=p3.dtype,
+        for name, value in expected.items():
+            actual = getattr(cfg, name, None)
+            if actual != value:
+                raise ValueError(
+                    f"PC-HBM-Lite requires {name}={value!r}, got {actual!r}"
+                )
+        if tuple(cfg.dino_layer_indices) != (2, 5, 8, 11):
+            raise ValueError(
+                "PC-HBM-Lite requires DINO layers (2, 5, 8, 11)"
             )
-            result = self.parent_retriever.retrieve_q(
-                q_b, bank_b, chunk_size=self.cfg.query_chunk_size
-            )
-            result['output_positions'] = output_positions
-            results.append(result)
 
-        merged = merge_parent_results(results, total_queries=q3.shape[0])
-        merged['q3'] = q3
-        return merged
-
-    def forward_parent_only(
+    def _validate_inputs(
         self,
         x3: torch.Tensor,
         p3: torch.Tensor,
+        p2: torch.Tensor,
+        m3: torch.Tensor,
+    ) -> None:
+        expected_feature = (
+            x3.size(0),
+            self.cfg.decoder_dim,
+            self.cfg.token_size,
+            self.cfg.token_size,
+        )
+        for name, value in (("x3", x3), ("p3", p3), ("p2", p2)):
+            if value.ndim != 4 or tuple(value.shape) != expected_feature:
+                raise ValueError(
+                    f"{name} must be {expected_feature}, got {tuple(value.shape)}"
+                )
+        expected_mask = (
+            x3.size(0),
+            1,
+            self.cfg.token_size,
+            self.cfg.token_size,
+        )
+        if m3.ndim != 4 or tuple(m3.shape) != expected_mask:
+            raise ValueError(
+                f"m3 must be {expected_mask}, got {tuple(m3.shape)}"
+            )
+        if not (x3.device == p3.device == p2.device == m3.device):
+            raise ValueError("x3, p3, p2 and m3 must share one device")
+
+    def _routed_retrieval(
+        self,
+        q3: torch.Tensor,
+        batch_ids: torch.Tensor,
+        route: Mapping[str, Any],
+        memory,
+        query_image_ids: Optional[Sequence[str]],
+    ) -> dict[str, torch.Tensor]:
+        result = self.parent_retriever.empty_result(q3)
+        top_img_ids = route.get("top_img_ids")
+        if not isinstance(top_img_ids, Sequence) or len(top_img_ids) != int(
+            route["route_global"].size(0)
+        ):
+            raise ValueError(
+                "Router top_img_ids must contain one routed list per image"
+            )
+        for batch_index in range(len(top_img_ids)):
+            output_positions = torch.nonzero(
+                batch_ids == batch_index, as_tuple=False
+            ).flatten()
+            if output_positions.numel() == 0:
+                continue
+            exclude_image_id = None
+            if (
+                bool(self.cfg.exclude_self_match)
+                and query_image_ids is not None
+            ):
+                exclude_image_id = str(query_image_ids[batch_index])
+            pair_subbank = memory.get_pair_subbank(
+                top_img_ids[batch_index],
+                device=q3.device,
+                dtype=q3.dtype,
+                exclude_image_id=exclude_image_id,
+            )
+            selected_q3 = q3.index_select(0, output_positions)
+            selected = self.parent_retriever.retrieve_q(
+                selected_q3,
+                pair_subbank,
+                chunk_size=self.cfg.query_chunk_size,
+            )
+            for key in (
+                "parent_keys",
+                "paired_p2_keys",
+                "scores",
+                "indices",
+                "valid",
+                "query_valid",
+            ):
+                result[key].index_copy_(
+                    0, output_positions, selected[key]
+                )
+        return result
+
+    @staticmethod
+    def _scatter_scalar(
+        batch_size: int,
+        height: int,
+        width: int,
+        batch_ids: torch.Tensor,
+        flat_indices: torch.Tensor,
+        values: torch.Tensor,
+    ) -> torch.Tensor:
+        output = torch.zeros(
+            (batch_size, 1, height, width),
+            device=values.device,
+            dtype=torch.float32,
+        )
+        if batch_ids.numel() == 0:
+            return output
+        row = torch.div(flat_indices, width, rounding_mode="floor")
+        col = flat_indices.remainder(width)
+        output[batch_ids, 0, row, col] = values.reshape(-1).float()
+        return output
+
+    def forward_lite(
+        self,
+        x3: torch.Tensor,
+        p3: torch.Tensor,
+        p2: torch.Tensor,
         m3: torch.Tensor,
         memory,
+        mode: str,
+        *,
+        injection_scale: float = 1.0,
         query_image_ids: Optional[Sequence[str]] = None,
-    ) -> Dict[str, object]:
-        prob3 = torch.sigmoid(m3)
-        boundary_input = _boundary_features(prob3)
-        b3, boundary_indices = self.boundary3(boundary_input)
-        batch_ids = self._selected(boundary_indices, 'batch_ids')
-        flat_indices = self._selected(boundary_indices, 'flat_indices')
+    ) -> dict[str, object]:
+        if mode not in self.VALID_MODES:
+            raise ValueError(
+                f"Unsupported Lite engine mode {mode!r}; "
+                f"expected one of {sorted(self.VALID_MODES)}"
+            )
+        self._validate_inputs(x3, p3, p2, m3)
+        if memory is None:
+            raise ValueError("forward_lite requires a ready V2 Pair Memory")
+        if query_image_ids is not None and len(query_image_ids) != x3.size(0):
+            raise ValueError("query_image_ids must match the batch size")
+
+        probability = torch.sigmoid(m3.float())
+        _, selected = self.query_selector(probability)
+        batch_ids = selected["batch_ids"]
+        flat_indices = selected["flat_indices"]
+        query_scores = selected["token_scores"]
+
         route = self.router(
             x3,
-            prob3,
+            probability,
             memory,
             top_img_k=self.cfg.route_top_img_k,
             query_image_ids=query_image_ids,
             exclude_self_match=self.cfg.exclude_self_match,
         )
-        parent_ret = self._routed_parent_retrieval(
-            p3, batch_ids, flat_indices, route, memory, query_image_ids
+        q3_map = self.parent_retriever.encode_q_map(p3)
+        q3 = gather_tokens(q3_map, batch_ids, flat_indices)
+        retrieval = self._routed_retrieval(
+            q3,
+            batch_ids,
+            route,
+            memory,
+            query_image_ids,
         )
-        route_context = route['route_embed'].index_select(0, batch_ids)
-        uncertainty_map = 4.0 * prob3 * (1.0 - prob3)
-        uncertainty = gather_tokens(uncertainty_map, batch_ids, flat_indices)
-        token_scores = self._selected(boundary_indices, 'token_scores').reshape(-1, 1)
-        return {
-            'B3': b3,
-            'boundary_indices3': boundary_indices,
-            'batch_ids3': batch_ids,
-            'flat_indices3': flat_indices,
-            'boundary_confidence': token_scores,
-            'uncertainty_token': uncertainty,
-            'route': route,
-            'route_context_token': route_context,
-            'route_entropy': route.get('route_entropy'),
-            'route_entropy_norm': route.get('route_entropy_norm'),
-            'parent_ret': parent_ret,
-            'parent_entropy': parent_ret['parent_entropy'],
-            'query_valid': parent_ret['top_parent_valid'].any(dim=1),
-        }
-
-    def forward_parent_child(
-        self,
-        x3: torch.Tensor,
-        p3: torch.Tensor,
-        child_map: torch.Tensor,
-        m3: torch.Tensor,
-        m2_pre: torch.Tensor,
-        memory,
-        epoch: Optional[int],
-        query_image_ids: Optional[Sequence[str]] = None,
-    ) -> Dict[str, object]:
-        aux = self.forward_parent_only(x3, p3, m3, memory, query_image_ids)
-        parent_ret = aux['parent_ret']
-        batch_ids = aux['batch_ids3']
-        flat_indices = aux['flat_indices3']
-        query_valid = aux['query_valid']
-        child_query = self.child_query(
-            child_map,
-            m2_pre,
+        child = self.child_query(
+            p2,
             batch_ids,
             flat_indices,
             p3_hw=p3.shape[-2:],
         )
-        child_bank = memory.get_child_by_ptr(
-            parent_ret['top_child_ptrs'],
-            device=p3.device,
-            dtype=p3.dtype,
-            valid_mask=parent_ret['top_parent_valid'],
+        verified = self.pair_verifier(
+            q3,
+            child["q_child"],
+            retrieval,
+            query_score=query_scores,
         )
-        child_ver = self.child_verifier(
-            child_query['q_child'],
-            child_query['G2_query'],
-            parent_ret,
-            child_bank,
-        )
-        candidate_valid = child_ver['top_parent_valid']
-        query_valid = candidate_valid.any(dim=1)
-        hypothesis = self.hyp_builder(
-            parent_ret,
-            child_ver,
-            top_parent_valid=candidate_valid,
-            query_valid=query_valid,
-        )
-        q_state = self.query_state(
-            parent_ret['q3'],
-            child_query['q_child'],
-            aux['route_context_token'],
-            child_ver['C23_token'],
-            parent_ret['parent_entropy'],
-            query_valid=query_valid,
-        )
-        q_new, attn = self.hca(
-            q_state,
-            hypothesis,
-            child_ver['prior_bias'],
-            aux['route_context_token'],
-            mask=candidate_valid,
-            query_valid=query_valid,
-        )
-        token_aux = self.token_decoder(
-            q_new,
-            attn,
-            parent_ret,
-            child_ver,
-            top_parent_valid=candidate_valid,
-            query_valid=query_valid,
-        )
-        gate_pc = self.gate_mlp(
-            aux['boundary_confidence'],
-            child_ver['C23_token'],
-            aux['uncertainty_token'],
-            parent_ret['parent_entropy'],
-            child_ver['child_entropy'],
-            child_ver['S_child'],
-            child_ver['S_geo'],
-            top_parent_valid=candidate_valid,
-            query_valid=query_valid,
-        )
-        injection_scale = self.cfg.injection_scale(epoch or self.cfg.full_pc_start_epoch)
-        p3_corr, p3_delta = self.p3_residual(
-            p3,
+
+        if mode == "verify_only":
+            p3_corr = p3
+            p3_delta = p3.new_zeros((batch_ids.numel(), p3.size(1)))
+            effective_scale = 0.0
+        else:
+            effective_scale = float(injection_scale)
+            p3_corr, p3_delta = self.p3_residual(
+                p3,
+                batch_ids,
+                flat_indices,
+                verified["correction"],
+                verified["gate"],
+                verified["query_valid"],
+                injection_scale=effective_scale,
+            )
+
+        height, width = p3.shape[-2:]
+        query_mask_map = self._scatter_scalar(
+            p3.size(0),
+            height,
+            width,
             batch_ids,
             flat_indices,
-            token_aux['Z3_token'],
-            gate=injection_scale,
-            gate_pc=gate_pc,
-            query_valid=query_valid,
+            torch.ones_like(query_scores, dtype=torch.float32),
         )
-        pc_maps = pc_scatter(
-            batch_size=p3.shape[0],
-            height=p3.shape[-2],
-            width=p3.shape[-1],
-            batch_ids=batch_ids,
-            flat_indices=flat_indices,
-            token_aux=token_aux,
-            gate_pc_token=gate_pc,
-            c23_token=child_ver['C23_token'],
-            query_valid=query_valid,
+        memory_confidence_map = self._scatter_scalar(
+            p3.size(0),
+            height,
+            width,
+            batch_ids,
+            flat_indices,
+            verified["memory_confidence"],
         )
-        aux.update(
-            {
-                'child_query': child_query,
-                'child_ver': child_ver,
-                'hypothesis_tokens': hypothesis,
-                'q_state': q_state,
-                'q_new': q_new,
-                'pc_attention': attn,
-                'token_aux': token_aux,
-                'gate_pc_token': gate_pc,
-                'query_valid': query_valid,
-                'p3_delta': p3_delta,
-                'p3_corr': p3_corr,
-                'pc_maps': pc_maps,
-                'C23_map': pc_maps['C23_map'],
-                'gate_pc_map': pc_maps['gate_pc_map'],
-                'injection_scale': injection_scale,
-            }
-        )
-        return aux
-
-    def forward_p2(
-        self, p2: torch.Tensor, prob2: torch.Tensor, pc_maps: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
-        return self.p2_bra(p2=p2, prob2=prob2, pc_maps=pc_maps)
-
-    def forward_p1(
-        self, p1: torch.Tensor, z_main: torch.Tensor, p2_aux: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
-        return self.p1_pra(p1=p1, z_main=z_main, p2_aux=p2_aux)
-
-    def forward_mixture(
-        self,
-        z_main: torch.Tensor,
-        p1_aux: Dict[str, torch.Tensor],
-        pc_maps: Dict[str, torch.Tensor],
-        epoch: Optional[int],
-        *,
-        ts_continuation: bool = False,
-    ) -> Dict[str, torch.Tensor]:
-        temperature, epsilon = self.cfg.mixture_schedule(
-            epoch, ts_continuation=ts_continuation
-        )
-        return self.mixture(
-            z_main=z_main,
-            p1_aux=p1_aux,
-            pc_maps=pc_maps,
-            epoch=epoch,
-            temperature=temperature,
-            eps_floor=epsilon,
+        gate_map = self._scatter_scalar(
+            p3.size(0),
+            height,
+            width,
+            batch_ids,
+            flat_indices,
+            verified["gate"],
         )
 
-    @torch.no_grad()
+        return {
+            "query_batch_ids": batch_ids,
+            "query_flat_indices": flat_indices,
+            "query_valid": verified["query_valid"],
+            "pair_logits": verified["pair_logits"],
+            "region_prob": verified["region_prob"],
+            "parent_cosine": verified["parent_cosine"],
+            "child_cosine": verified["child_cosine"],
+            "candidate_entropy": verified["candidate_entropy"],
+            "memory_confidence": verified["memory_confidence"],
+            "gate": verified["gate"],
+            "beta": verified["beta"],
+            "retrieval_valid": retrieval["valid"],
+            "route": route,
+            "query_mask_map": query_mask_map,
+            "memory_confidence_map": memory_confidence_map,
+            "gate_map": gate_map,
+            "p3_delta": p3_delta,
+            "p3_corr": p3_corr,
+        }
+
     def build_memory_entries(
         self,
-        features: Dict[str, torch.Tensor],
+        features: dict[str, torch.Tensor],
         gt: torch.Tensor,
         image_ids: Sequence[str],
-    ) -> Dict[str, Dict[str, object]]:
+    ) -> dict[str, Any]:
         return self.memory_builder(features, gt, image_ids)
-
-    @staticmethod
-    def slim_aux(aux: Dict[str, object], mode: str) -> Dict[str, object]:
-        if mode == 'full' or mode == 'parent_only':
-            return aux
-        slim = dict(aux)
-        slim.pop('features', None)
-        pc_aux = slim.get('pc_hbm')
-        if isinstance(pc_aux, dict):
-            if mode == 'student_core':
-                keep = {'p3_corr'}
-            else:
-                keep = {
-                    'C23_map', 'gate_pc_map', 'route_entropy', 'route_entropy_norm',
-                    'pc_maps', 'injection_scale', 'query_valid',
-                }
-            slim['pc_hbm'] = {key: value for key, value in pc_aux.items() if key in keep}
-        if mode == 'student_core':
-            p2_aux = slim.get('p2_bra')
-            if isinstance(p2_aux, dict):
-                slim['p2_bra'] = {
-                    key: value
-                    for key, value in p2_aux.items()
-                    if key == 'p2_refined'
-                }
-            p1_aux = slim.get('p1_pra')
-            if isinstance(p1_aux, dict):
-                p1_keep = {
-                    'B1', 'G1_raw_map', 'R1_map', 'O1_map', 'R_sup_map',
-                    'valid1_map',
-                }
-                slim['p1_pra'] = {
-                    key: value for key, value in p1_aux.items() if key in p1_keep
-                }
-        mixture = slim.get('mixture')
-        if isinstance(mixture, dict) and mode == 'teacher_pseudo':
-            keep = {'pi', 'z_final', 'p_final', 'Mask_corr'}
-            slim['mixture'] = {key: value for key, value in mixture.items() if key in keep}
-        return slim
