@@ -108,7 +108,10 @@ def main():
                 else "Teacher Decoder checkpoint"
             ),
         )
-        pc_cfg.configure_training_design("teacher_only")
+        # Keep the artifact-owned config exact. TS dispatches the Teacher as
+        # teacher_pseudo and the Student as off explicitly, so remapping the
+        # Base stage schedule here would only invalidate strict checkpoint
+        # compatibility (and would make a later TS resume inconsistent).
         cfg.l_train_size = int(pc_cfg.input_size)
         cfg.u_train_size = int(pc_cfg.input_size)
         split_fingerprint = validate_canonical_labeled_indices_pt(

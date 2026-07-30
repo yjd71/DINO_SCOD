@@ -93,10 +93,12 @@ class PCHBMPseudoTrainer:
         )
         if self.training_design != "teacher_only":
             raise ValueError("PC-HBM-Lite TS supports only teacher_only")
-        configure = getattr(pc_cfg, "configure_training_design", None)
-        if not callable(configure):
-            raise RuntimeError("pc_cfg.configure_training_design() is required")
-        configure("teacher_only")
+        if pc_cfg is None:
+            raise ValueError("pc_cfg is required for teacher_only TS")
+        # This config belongs to the frozen Teacher artifact and must remain
+        # byte-for-byte compatible with it. TS modes are explicit
+        # (Teacher=teacher_pseudo, Student=off), so Base schedule remapping is
+        # neither required at runtime nor valid for checkpoint/resume loading.
 
         self.device = torch.device(cfg.device)
         self.distributed = bool(getattr(cfg, "distributed", False))
