@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import copy
 import random
 import hashlib
 import json
@@ -18,15 +19,23 @@ import torch
 from torch import nn
 
 
-ARTIFACT_METADATA_VERSION = 1
+ARTIFACT_METADATA_VERSION = 2
+PC_HBM_ARCHITECTURE = "DINO_SCOD_PC_HBM_LITE"
+PC_HBM_SCHEMA_VERSION = 2
+CANONICAL_LABELED_SPLIT_COUNT = 202
+CANONICAL_LABELED_SPLIT_FINGERPRINT = (
+    "1f7cbfa5cd9f3afcc72910d482a762fb5bdb81b35585285d5626be6d1a2698b0"
+)
 ARTIFACT_METADATA_KEYS = (
+    "architecture",
+    "schema_version",
     "training_design",
     "artifact_role",
     "labeled_split_fingerprint",
     "baseline_fingerprint",
     "pc_frozen",
 )
-TRAINING_DESIGNS = frozenset({"teacher_only", "two_stage", "joint"})
+TRAINING_DESIGNS = frozenset({"teacher_only", "two_stage"})
 
 
 def load_decoder_compatible(
@@ -36,28 +45,48 @@ def load_decoder_compatible(
     require_pc_complete: bool = False,
     expected_artifact_meta: Mapping[str, Any] | None = None,
 ):
-    """Load raw/nested Decoder weights with a single ``module.`` normalization.
-
-    A truly legacy checkpoint may omit every ``pc_hbm.*`` key.  Once a
-    checkpoint contains any PC-HBM key, partial PC state is rejected.
-    Non-PC missing keys and every unexpected key are always errors.
-    """
+    """Load a baseline or complete V2 Lite Decoder after full preflight."""
 
     checkpoint = _load_source(source)
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError("Decoder checkpoint must be a mapping")
     if expected_artifact_meta is not None:
         validate_artifact_metadata(checkpoint, expected_artifact_meta)
     state = extract_decoder_state(checkpoint)
-    result = decoder.load_state_dict(state, strict=False)
-    invalid_missing = [key for key in result.missing_keys if not key.startswith("pc_hbm.")]
+    target_state = decoder.state_dict()
+    unexpected = sorted(set(state) - set(target_state))
+    if unexpected:
+        raise RuntimeError(f"Unexpected decoder checkpoint keys: {unexpected}")
+    invalid_missing = sorted(
+        key
+        for key in target_state
+        if key not in state and not key.startswith("pc_hbm.")
+    )
     if invalid_missing:
         raise RuntimeError(f"Unexpected missing decoder keys: {invalid_missing}")
-    if result.unexpected_keys:
-        raise RuntimeError(f"Unexpected decoder checkpoint keys: {result.unexpected_keys}")
-    missing_pc = [key for key in result.missing_keys if key.startswith("pc_hbm.")]
+    missing_pc = sorted(
+        key for key in target_state if key.startswith("pc_hbm.") and key not in state
+    )
     checkpoint_has_pc = any(key.startswith("pc_hbm.") for key in state)
     if missing_pc and (require_pc_complete or checkpoint_has_pc):
-        raise RuntimeError(f"Incomplete PC-HBM decoder checkpoint; missing keys: {missing_pc}")
-    return result
+        raise RuntimeError(
+            f"Incomplete PC-HBM-Lite decoder checkpoint; missing keys: {missing_pc}"
+        )
+    if require_pc_complete and not checkpoint_has_pc:
+        raise RuntimeError("A complete PC-HBM-Lite Decoder checkpoint is required")
+    if checkpoint_has_pc:
+        _preflight_pc_v2(checkpoint, context="Decoder checkpoint")
+    _validate_state_compatible(
+        state,
+        {key: target_state[key] for key in state},
+        context="Decoder checkpoint",
+    )
+    candidate_decoder = copy.deepcopy(decoder)
+    try:
+        candidate_decoder.load_state_dict(copy.deepcopy(state), strict=False)
+    except Exception as error:
+        raise RuntimeError("Decoder checkpoint failed load preflight") from error
+    return decoder.load_state_dict(state, strict=False)
 
 
 def save_decoder_checkpoint(
@@ -74,11 +103,16 @@ def save_decoder_checkpoint(
 ) -> dict[str, Any]:
     """Save the version-2 standalone Decoder artifact."""
 
+    config_state = _config_dict(pc_cfg)
+    _validate_lite_config(config_state, context="Decoder save")
     payload: dict[str, Any] = {
         "format_version": 2,
+        "schema_version": PC_HBM_SCHEMA_VERSION,
+        "architecture": PC_HBM_ARCHITECTURE,
+        "checkpoint_type": "decoder",
         "epoch": int(epoch),
         "decoder": _unwrap(decoder).state_dict(),
-        "pc_cfg": _config_dict(pc_cfg),
+        "pc_cfg": config_state,
     }
     _optional_state(payload, "optimizer", optimizer)
     _optional_state(payload, "scheduler", scheduler)
@@ -101,8 +135,13 @@ def save_memory_checkpoint(
 
     state = memory.state_dict()
     resolved_meta = dict(compat_meta or state.get("compat_meta", {}) or {})
+    if int(state.get("format_version", -1)) != PC_HBM_SCHEMA_VERSION:
+        raise RuntimeError("Memory save requires a V2 PCMemory state")
     payload = {
-        "format_version": 1,
+        "format_version": 2,
+        "schema_version": PC_HBM_SCHEMA_VERSION,
+        "architecture": PC_HBM_ARCHITECTURE,
+        "checkpoint_type": "memory",
         "memory": state,
         "compat_meta": resolved_meta,
     }
@@ -122,9 +161,15 @@ def load_memory_checkpoint(
     checkpoint = _load_source(path)
     if not isinstance(checkpoint, Mapping):
         raise TypeError("Memory checkpoint must be a mapping")
-    memory.load_state_dict(checkpoint)
+    state = checkpoint.get("memory", checkpoint)
+    if not isinstance(state, Mapping):
+        raise TypeError("Memory checkpoint state must be a mapping")
+    if "memory" in checkpoint:
+        _preflight_pc_v2(checkpoint, context="Memory checkpoint")
+    candidate = copy.deepcopy(memory)
+    candidate.load_state_dict(state)
     if expected_compat is not None:
-        result = memory.validate_compat(
+        result = candidate.validate_compat(
             dict(expected_compat), require_producer_match=bool(require_producer_match)
         )
         if isinstance(result, tuple):
@@ -133,8 +178,9 @@ def load_memory_checkpoint(
             compatible, reason = bool(result), "memory compatibility validation failed"
         if not compatible:
             raise RuntimeError(f"Incompatible PC-HBM memory: {reason}")
-    if not memory.is_ready():
+    if not candidate.is_ready():
         raise RuntimeError("Loaded PC-HBM memory is not finalized/ready")
+    memory.load_state_dict(state)
     return dict(checkpoint)
 
 
@@ -153,12 +199,17 @@ def save_training_resume(
 ) -> dict[str, Any]:
     """Save exact optimizer/AMP/EMA/config/RNG state for deterministic resume."""
 
+    config_state = _config_dict(pc_cfg)
+    _validate_lite_config(config_state, context="Training resume save")
     payload: dict[str, Any] = {
         "format_version": 2,
+        "schema_version": PC_HBM_SCHEMA_VERSION,
+        "architecture": PC_HBM_ARCHITECTURE,
+        "checkpoint_type": "training_resume",
         "epoch": int(epoch),
         "model": _unwrap(model).state_dict(),
         "optimizer": optimizer.state_dict(),
-        "pc_cfg": _config_dict(pc_cfg),
+        "pc_cfg": config_state,
         "rng_state": capture_rng_state(),
     }
     _optional_state(payload, "scheduler", scheduler)
@@ -188,23 +239,47 @@ def load_training_resume(
     checkpoint = _load_source(path)
     if not isinstance(checkpoint, Mapping) or "model" not in checkpoint:
         raise TypeError("Training resume checkpoint must contain a model state")
+    _preflight_pc_v2(checkpoint, context="Training resume")
     if expected_artifact_meta is not None:
         validate_artifact_metadata(checkpoint, expected_artifact_meta)
     target_model = _unwrap(model)
     state = _align_module_prefix(checkpoint["model"], target_model.state_dict())
-    target_model.load_state_dict(state, strict=True)
-    _restore_optional_state(checkpoint, "optimizer", optimizer)
-    _restore_optional_state(checkpoint, "scheduler", scheduler)
-    _restore_optional_state(checkpoint, "scaler", scaler)
+    _validate_state_compatible(
+        state, target_model.state_dict(), context="Training resume model"
+    )
+    _preflight_module_state(
+        target_model, state, context="Training resume model"
+    )
+    _preflight_optional_state(checkpoint, "optimizer", optimizer)
+    _preflight_optional_state(checkpoint, "scheduler", scheduler)
+    _preflight_optional_state(checkpoint, "scaler", scaler)
+    target_ema = None
+    ema_state = None
     if ema_model is not None:
         if "ema_model" not in checkpoint:
             raise RuntimeError("Resume requested ema_model but checkpoint has none")
         target_ema = _unwrap(ema_model)
         ema_state = _align_module_prefix(checkpoint["ema_model"], target_ema.state_dict())
-        target_ema.load_state_dict(ema_state, strict=True)
+        _validate_state_compatible(
+            ema_state, target_ema.state_dict(), context="Training resume EMA"
+        )
+        _preflight_module_state(
+            target_ema, ema_state, context="Training resume EMA"
+        )
     if restore_rng:
         if "rng_state" not in checkpoint:
             raise RuntimeError("Resume checkpoint has no RNG state")
+        _preflight_rng_state(checkpoint["rng_state"])
+
+    # Mutation starts only after every model, optional state, metadata and RNG
+    # contract has passed the checks above.
+    target_model.load_state_dict(state, strict=True)
+    _restore_optional_state(checkpoint, "optimizer", optimizer)
+    _restore_optional_state(checkpoint, "scheduler", scheduler)
+    _restore_optional_state(checkpoint, "scaler", scaler)
+    if target_ema is not None and ema_state is not None:
+        target_ema.load_state_dict(ema_state, strict=True)
+    if restore_rng:
         restore_rng_state(checkpoint["rng_state"])
     return dict(checkpoint)
 
@@ -277,6 +352,28 @@ def compute_labeled_split_fingerprint_from_indices_pt(
     this is still deterministic for comparing two runs using the same catalog.
     """
 
+    values = _load_labeled_indices_values(indices_pt)
+    if all(isinstance(value, str) for value in values):
+        return compute_labeled_split_fingerprint(values)
+    if not all(isinstance(value, Integral) and not isinstance(value, bool) for value in values):
+        raise TypeError("labeled indices must be uniformly strings or integers")
+    indices = [int(value) for value in values]
+    if any(index < 0 for index in indices):
+        raise IndexError("labeled indices must be non-negative")
+    if all_sample_keys is None:
+        return compute_labeled_split_fingerprint([f"@index/{index}" for index in indices])
+    catalog = list(all_sample_keys)
+    out_of_range = [index for index in indices if index >= len(catalog)]
+    if out_of_range:
+        raise IndexError(
+            f"labeled index {out_of_range[0]} is outside sample-key catalog of size {len(catalog)}"
+        )
+    return compute_labeled_split_fingerprint([catalog[index] for index in indices])
+
+
+def _load_labeled_indices_values(
+    indices_pt: str | os.PathLike,
+) -> list[Any]:
     try:
         values = torch.load(indices_pt, map_location="cpu", weights_only=False)
     except TypeError:
@@ -304,22 +401,47 @@ def compute_labeled_split_fingerprint_from_indices_pt(
         )
     if not values:
         raise ValueError("labeled indices file must not be empty")
-    if all(isinstance(value, str) for value in values):
-        return compute_labeled_split_fingerprint(values)
-    if not all(isinstance(value, Integral) and not isinstance(value, bool) for value in values):
-        raise TypeError("labeled indices must be uniformly strings or integers")
-    indices = [int(value) for value in values]
-    if any(index < 0 for index in indices):
-        raise IndexError("labeled indices must be non-negative")
-    if all_sample_keys is None:
-        return compute_labeled_split_fingerprint([f"@index/{index}" for index in indices])
-    catalog = list(all_sample_keys)
-    out_of_range = [index for index in indices if index >= len(catalog)]
-    if out_of_range:
-        raise IndexError(
-            f"labeled index {out_of_range[0]} is outside sample-key catalog of size {len(catalog)}"
+    return values
+
+
+def validate_canonical_labeled_split_fingerprint(
+    fingerprint: str,
+) -> str:
+    """Reject any labeled split other than the fixed 202-key protocol."""
+
+    fingerprint = str(fingerprint)
+    if fingerprint != CANONICAL_LABELED_SPLIT_FINGERPRINT:
+        raise RuntimeError(
+            "PC-HBM-Lite requires the canonical 202-key labeled split: "
+            f"expected={CANONICAL_LABELED_SPLIT_FINGERPRINT}, "
+            f"got={fingerprint}"
         )
-    return compute_labeled_split_fingerprint([catalog[index] for index in indices])
+    return fingerprint
+
+
+def validate_canonical_labeled_indices_pt(
+    indices_pt: str | os.PathLike,
+) -> str:
+    """Validate exact content, cardinality and identity of the fixed key file."""
+
+    values = _load_labeled_indices_values(indices_pt)
+    if len(values) != CANONICAL_LABELED_SPLIT_COUNT:
+        raise RuntimeError(
+            "PC-HBM-Lite labeled key file must contain exactly "
+            f"{CANONICAL_LABELED_SPLIT_COUNT} entries, got {len(values)}"
+        )
+    if not all(isinstance(value, str) for value in values):
+        raise TypeError(
+            "The canonical PC-HBM-Lite split must store stable sample keys"
+        )
+    normalized = [normalize_sample_key(value) for value in values]
+    if len(set(normalized)) != CANONICAL_LABELED_SPLIT_COUNT:
+        raise RuntimeError(
+            "Canonical PC-HBM-Lite labeled sample keys must be unique"
+        )
+    return validate_canonical_labeled_split_fingerprint(
+        compute_labeled_split_fingerprint(normalized)
+    )
 
 
 def build_artifact_metadata(
@@ -335,6 +457,8 @@ def build_artifact_metadata(
     return _normalize_artifact_metadata(
         {
             "artifact_metadata_version": ARTIFACT_METADATA_VERSION,
+            "architecture": PC_HBM_ARCHITECTURE,
+            "schema_version": PC_HBM_SCHEMA_VERSION,
             "training_design": training_design,
             "artifact_role": artifact_role,
             "labeled_split_fingerprint": labeled_split_fingerprint,
@@ -367,15 +491,8 @@ def read_artifact_metadata(
 def validate_artifact_metadata(
     source: str | os.PathLike | Mapping[str, Any],
     expected: Mapping[str, Any],
-    *,
-    allow_untagged_joint: bool = True,
 ) -> dict[str, Any]:
-    """Validate artifact identity and prevent silent cross-design loading.
-
-    Untagged legacy checkpoints are accepted only when the caller explicitly
-    expects the ``joint`` training design.  Tagged callers may provide a
-    collection of accepted designs for an explicit compatibility boundary.
-    """
+    """Validate V2 artifact identity before any state is restored."""
 
     if not isinstance(expected, Mapping):
         raise TypeError("expected artifact metadata must be a mapping")
@@ -398,13 +515,7 @@ def validate_artifact_metadata(
         )
     metadata = read_artifact_metadata(source)
     if metadata is None:
-        # Preserve the legacy exception exactly: a disjunctive expectation that
-        # happens to include ``joint`` must not make an untagged artifact valid.
-        if allow_untagged_joint and expected_design == "joint":
-            return {}
-        raise RuntimeError(
-            "Untagged legacy checkpoint is allowed only with training_design='joint'"
-        )
+        raise RuntimeError("Untagged or pre-V2 PC-HBM artifact is not loadable")
     for key, expected_value in expected.items():
         if key not in ARTIFACT_METADATA_KEYS and key != "artifact_metadata_version":
             raise KeyError(f"unsupported expected artifact metadata key: {key}")
@@ -516,6 +627,18 @@ def _normalize_artifact_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
     missing = [key for key in ARTIFACT_METADATA_KEYS if key not in metadata]
     if missing:
         raise RuntimeError(f"Artifact metadata is incomplete; missing keys: {missing}")
+    if metadata["architecture"] != PC_HBM_ARCHITECTURE:
+        raise RuntimeError(
+            "Artifact architecture mismatch: "
+            f"expected {PC_HBM_ARCHITECTURE!r}, "
+            f"got {metadata['architecture']!r}"
+        )
+    if int(metadata["schema_version"]) != PC_HBM_SCHEMA_VERSION:
+        raise RuntimeError(
+            "Artifact schema mismatch: "
+            f"expected {PC_HBM_SCHEMA_VERSION}, "
+            f"got {metadata['schema_version']!r}"
+        )
     design = metadata["training_design"]
     if design not in TRAINING_DESIGNS:
         raise ValueError(f"Unsupported training_design: {design!r}")
@@ -560,6 +683,101 @@ def _restore_optional_state(checkpoint, name, object_with_state):
     object_with_state.load_state_dict(checkpoint[name])
 
 
+def _preflight_pc_v2(checkpoint: Mapping[str, Any], *, context: str) -> None:
+    if int(checkpoint.get("format_version", -1)) != 2:
+        raise RuntimeError(f"{context} must use format_version=2")
+    if int(checkpoint.get("schema_version", -1)) != PC_HBM_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"{context} must use schema_version={PC_HBM_SCHEMA_VERSION}"
+        )
+    if checkpoint.get("architecture") != PC_HBM_ARCHITECTURE:
+        raise RuntimeError(
+            f"{context} architecture must be {PC_HBM_ARCHITECTURE!r}"
+        )
+    if "pc_cfg" in checkpoint:
+        _validate_lite_config(checkpoint.get("pc_cfg"), context=context)
+
+
+def _validate_lite_config(config: Any, *, context: str) -> None:
+    if not isinstance(config, Mapping):
+        raise RuntimeError(f"{context} requires serialized PC-HBM-Lite config")
+    if int(config.get("memory_schema_version", -1)) != PC_HBM_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"{context} contains an incompatible PC memory schema"
+        )
+    if config.get("memory_architecture") != PC_HBM_ARCHITECTURE:
+        raise RuntimeError(
+            f"{context} contains an incompatible PC architecture"
+        )
+
+
+def _validate_state_compatible(
+    state: Mapping[str, Any],
+    target_state: Mapping[str, Any],
+    *,
+    context: str,
+) -> None:
+    if not isinstance(state, Mapping):
+        raise TypeError(f"{context} state must be a mapping")
+    missing = sorted(set(target_state) - set(state))
+    unexpected = sorted(set(state) - set(target_state))
+    if missing or unexpected:
+        raise RuntimeError(
+            f"{context} keys mismatch; missing={missing}, unexpected={unexpected}"
+        )
+    mismatched = []
+    for key, target in target_state.items():
+        value = state[key]
+        if not torch.is_tensor(value) or value.shape != target.shape:
+            shape = tuple(value.shape) if torch.is_tensor(value) else type(value).__name__
+            mismatched.append(f"{key}: expected {tuple(target.shape)}, got {shape}")
+    if mismatched:
+        raise RuntimeError(f"{context} tensor mismatch: {mismatched}")
+
+
+def _preflight_optional_state(checkpoint, name, object_with_state) -> None:
+    if object_with_state is None:
+        return
+    if name not in checkpoint:
+        raise RuntimeError(f"Resume requested {name} but checkpoint has none")
+    candidate = copy.deepcopy(object_with_state)
+    try:
+        candidate.load_state_dict(copy.deepcopy(checkpoint[name]))
+    except Exception as error:
+        raise RuntimeError(f"Invalid resume {name} state") from error
+
+
+def _preflight_module_state(
+    module: nn.Module,
+    state: Mapping[str, Any],
+    *,
+    context: str,
+) -> None:
+    candidate = copy.deepcopy(module)
+    try:
+        candidate.load_state_dict(copy.deepcopy(state), strict=True)
+    except Exception as error:
+        raise RuntimeError(f"{context} failed load preflight") from error
+
+
+def _preflight_rng_state(state: Mapping[str, Any]) -> None:
+    if not isinstance(state, Mapping):
+        raise TypeError("rng_state must be a mapping")
+    required = {"python", "numpy", "torch"}
+    missing = sorted(required - set(state))
+    if missing:
+        raise RuntimeError(f"rng_state is incomplete; missing {missing}")
+    if not torch.is_tensor(state["torch"]):
+        raise TypeError("rng_state['torch'] must be a tensor")
+    current = capture_rng_state()
+    try:
+        restore_rng_state(copy.deepcopy(state))
+    except Exception as error:
+        raise RuntimeError("Invalid resume RNG state") from error
+    finally:
+        restore_rng_state(current)
+
+
 def _atomic_torch_save(payload, path) -> None:
     destination = Path(path)
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -581,15 +799,11 @@ def _unwrap(module):
     return module.module if hasattr(module, "module") else module
 
 
-# Concise aliases used by the new CLI entry points.
-save_pc_hbm_decoder = save_decoder_checkpoint
-save_pc_hbm_memory = save_memory_checkpoint
-load_pc_hbm_memory = load_memory_checkpoint
-
-
 __all__ = [
     "ARTIFACT_METADATA_KEYS",
     "ARTIFACT_METADATA_VERSION",
+    "CANONICAL_LABELED_SPLIT_COUNT",
+    "CANONICAL_LABELED_SPLIT_FINGERPRINT",
     "TRAINING_DESIGNS",
     "build_artifact_metadata",
     "capture_rng_state",
@@ -599,16 +813,15 @@ __all__ = [
     "extract_non_pc_decoder_state",
     "load_decoder_compatible",
     "load_memory_checkpoint",
-    "load_pc_hbm_memory",
     "load_training_resume",
     "normalize_sample_key",
     "read_artifact_metadata",
     "restore_rng_state",
     "save_decoder_checkpoint",
     "save_memory_checkpoint",
-    "save_pc_hbm_decoder",
-    "save_pc_hbm_memory",
     "save_training_resume",
     "state_dict_fingerprint",
     "validate_artifact_metadata",
+    "validate_canonical_labeled_indices_pt",
+    "validate_canonical_labeled_split_fingerprint",
 ]

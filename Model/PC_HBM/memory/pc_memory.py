@@ -1,18 +1,37 @@
-"""CPU-FP16, labelled-only memory protocol for DINO PC-HBM."""
+"""CPU-FP16, labeled-only Route/Pair memory for PC-HBM-Lite."""
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, Mapping, Sequence
+from typing import Any
 
 import torch
+import torch.nn.functional as F
 
-from ..common.utils import EPS, REGION_TO_ID, entropy_from_probs, normalize
+
+_ARCHITECTURE = "DINO_SCOD_PC_HBM_LITE"
+_REGION_NAMES = ("fg_boundary", "bg_near")
+_REQUIRED_META_KEYS = (
+    "architecture",
+    "schema_version",
+    "input_size",
+    "token_hw",
+    "output_hw",
+    "dino_layer_indices",
+    "encoder_dim",
+    "decoder_dim",
+    "memory_dim",
+    "child_window_size",
+    "region_names",
+    "storage_dtype",
+    "source",
+)
 
 
 @dataclass(frozen=True)
 class CompatibilityResult:
-    """Boolean-compatible result that can also be unpacked as ``ok, reason``."""
+    """Boolean-compatible compatibility result with an explanatory reason."""
 
     compatible: bool
     reason: str | None = None
@@ -26,190 +45,165 @@ class CompatibilityResult:
 
 
 class PCMemory:
-    """Route/parent/child tensor store with no persistent GPU cache.
+    """One-to-one P3/P2 pair store with a separate two-key image route table."""
 
-    All stored floating tensors are detached CPU FP16 tensors.  Only a routed
-    parent subbank (and its selected children) is transferred for a query.
-    """
-
-    FORMAT_VERSION = 1
-    DEFAULT_SCHEMA_VERSION = 1
+    FORMAT_VERSION = 2
+    DEFAULT_SCHEMA_VERSION = 2
 
     def __init__(
         self,
         memory_dim: int = 128,
-        value_dim: int = 8,
-        geometry_dim: int = 6,
         *,
         storage_dtype: torch.dtype | str = torch.float16,
         compat_meta: Mapping[str, Any] | None = None,
         config: Any | None = None,
     ) -> None:
         self.memory_dim = int(memory_dim)
-        self.value_dim = int(value_dim)
-        self.geometry_dim = int(geometry_dim)
+        if self.memory_dim != 128:
+            raise ValueError(f"PC-HBM-Lite memory_dim is fixed to 128, got {self.memory_dim}")
         self.storage_dtype = _parse_storage_dtype(storage_dtype)
-        if self.storage_dtype != torch.float16:
-            raise ValueError("PC-HBM memory storage dtype is fixed to float16")
         self.config = config
-        self._initial_compat_meta = dict(compat_meta or {})
+        initial_meta = _default_compat_meta()
+        if config is not None:
+            if not hasattr(config, "expected_memory_meta"):
+                raise TypeError("config must provide expected_memory_meta()")
+            initial_meta.update(dict(config.expected_memory_meta()))
+        initial_meta.update(dict(compat_meta or {}))
+        self._initial_compat_meta = initial_meta
         self.clear()
 
     def clear(self) -> None:
-        self._route_lists: dict[str, list[torch.Tensor]] = {
-            "x3_global": [],
-            "x3_boundary": [],
-            "x3_uncertain": [],
-            "x3_bg_near": [],
-            "x3_environment": [],
-            "route_embed": [],
-        }
+        self._route_global_list: list[torch.Tensor] = []
+        self._route_environment_list: list[torch.Tensor] = []
         self._route_img_ids: list[str] = []
-        self._parent_key_list: list[torch.Tensor] = []
-        self._parent_value_list: list[torch.Tensor] = []
-        self._parent_geometry_list: list[torch.Tensor] = []
-        self._parent_child_ptr_list: list[torch.Tensor] = []
-        self._parent_meta_list: list[dict[str, Any]] = []
-        self._child_key_list: list[torch.Tensor] = []
-        self._child_geometry_list: list[torch.Tensor] = []
-        self._child_meta_list: list[dict[str, Any]] = []
+        self._pair_p3_list: list[torch.Tensor] = []
+        self._pair_p2_list: list[torch.Tensor] = []
+        self._pair_region_list: list[torch.Tensor] = []
+        self._pair_meta_list: list[dict[str, Any]] = []
         self.route: dict[str, Any] = {}
-        self.parent: dict[str, Any] = {}
-        self.child: dict[str, Any] = {}
+        self.pairs: dict[str, Any] = {}
         self.compat_meta: dict[str, Any] = dict(self._initial_compat_meta)
-        self.parent_img_to_indices: dict[str, torch.Tensor] = {}
         self.route_img_to_index: dict[str, int] = {}
+        self.pair_img_to_indices: dict[str, torch.Tensor] = {}
         self._finalized = False
 
-    def append(self, entries: Mapping[str, Any] | Sequence[Mapping[str, Any]]) -> None:
-        """Append one builder output or a sequence of builder outputs."""
+    def append(
+        self,
+        entries: Mapping[str, Any] | Sequence[Mapping[str, Any]],
+    ) -> None:
+        """Append one builder result or a sequence of labeled builder results."""
 
+        self._ensure_mutable()
         if isinstance(entries, Sequence) and not isinstance(entries, (str, bytes, Mapping)):
             for item in entries:
                 self.append(item)
             return
         if not isinstance(entries, Mapping):
             raise TypeError("memory entries must be a mapping or sequence of mappings")
-        source = str(entries.get("source", "labeled_only"))
-        if source != "labeled_only":
-            raise ValueError(f"PC-HBM accepts labeled_only entries, got {source!r}")
-        if "compat_meta" in entries:
-            self.compat_meta.update(dict(entries["compat_meta"] or {}))
+        if str(entries.get("source", "labeled_only")) != "labeled_only":
+            raise ValueError("PC-HBM-Lite memory accepts labeled data only")
+        unknown = set(entries).difference({"source", "route", "pairs", "compat_meta"})
+        if unknown:
+            raise ValueError(f"Unknown memory entry groups: {sorted(unknown)}")
 
         route = entries.get("route")
-        if route:
+        if route is not None:
+            if not isinstance(route, Mapping):
+                raise TypeError("route entries must be a mapping")
+            expected_route_keys = {
+                "global_keys",
+                "environment_keys",
+                "img_ids",
+            }
+            if set(route) != expected_route_keys:
+                raise ValueError(
+                    "Route entries must contain exactly "
+                    f"{sorted(expected_route_keys)}, got {sorted(route)}"
+                )
+        pairs = entries.get("pairs")
+        if pairs is not None:
+            if not isinstance(pairs, Mapping):
+                raise TypeError("pair entries must be a mapping")
+            expected_pair_keys = {
+                "p3_keys",
+                "p2_keys",
+                "region_ids",
+                "pair_meta",
+            }
+            if set(pairs) != expected_pair_keys:
+                raise ValueError(
+                    "Pair entries must contain exactly "
+                    f"{sorted(expected_pair_keys)}, got {sorted(pairs)}"
+                )
+
+        if "compat_meta" in entries:
+            self.compat_meta.update(dict(entries["compat_meta"] or {}))
+        if route is not None:
             self.append_route(
-                x3_global=route["x3_global"],
-                x3_boundary=route["x3_boundary"],
-                x3_uncertain=route["x3_uncertain"],
-                x3_bg_near=route["x3_bg_near"],
-                x3_environment=route["x3_environment"],
-                route_embed=route["route_embed"],
+                global_keys=route["global_keys"],
+                environment_keys=route["environment_keys"],
                 img_ids=route["img_ids"],
             )
-
-        child = entries.get("child")
-        child_offset = self.num_children_pending()
-        if child:
-            self.append_child(
-                child["p2_child_keys"],
-                child["p2_child_geo"],
-                child.get("child_meta", [{} for _ in range(child["p2_child_keys"].size(0))]),
-            )
-
-        parent = entries.get("parent")
-        if parent:
-            pointers = parent["child_ptr"].detach().long().clone()
-            if not bool(parent.get("child_ptr_is_global", False)):
-                pointers = torch.where(pointers >= 0, pointers + child_offset, pointers)
-            self.append_parent(
-                parent["p3_keys"],
-                parent["p3_values"],
-                parent["p3_geometry"],
-                pointers,
-                parent.get("parent_meta", [{} for _ in range(parent["p3_keys"].size(0))]),
+        if pairs is not None:
+            self.append_pairs(
+                p3_keys=pairs["p3_keys"],
+                p2_keys=pairs["p2_keys"],
+                region_ids=pairs["region_ids"],
+                pair_meta=pairs["pair_meta"],
             )
 
     def append_route(
         self,
         *,
-        x3_global: torch.Tensor,
-        x3_boundary: torch.Tensor,
-        x3_uncertain: torch.Tensor,
-        x3_bg_near: torch.Tensor,
-        x3_environment: torch.Tensor,
-        route_embed: torch.Tensor,
+        global_keys: torch.Tensor,
+        environment_keys: torch.Tensor,
         img_ids: Sequence[object],
     ) -> None:
-        tensors = {
-            "x3_global": x3_global,
-            "x3_boundary": x3_boundary,
-            "x3_uncertain": x3_uncertain,
-            "x3_bg_near": x3_bg_near,
-            "x3_environment": x3_environment,
-            "route_embed": route_embed,
-        }
-        count: int | None = None
-        for name, tensor in tensors.items():
-            self._check_matrix(tensor, self.memory_dim, name)
-            count = tensor.size(0) if count is None else count
-            if tensor.size(0) != count:
-                raise ValueError("All route descriptors must have the same image count")
-        if count != len(img_ids):
-            raise ValueError("Route descriptor count must match img_ids")
-        normalized_ids = [str(image_id) for image_id in img_ids]
-        if len(set(normalized_ids)) != len(normalized_ids):
-            raise ValueError("Duplicate image IDs within one route append are not allowed")
-        existing = set(self._route_img_ids)
-        duplicates = existing.intersection(normalized_ids)
+        self._ensure_mutable()
+        self._check_matrix(global_keys, "global_keys")
+        self._check_matrix(environment_keys, "environment_keys")
+        if global_keys.shape != environment_keys.shape:
+            raise ValueError("global_keys and environment_keys must have identical shapes")
+        normalized_ids = _normalize_image_ids(img_ids)
+        if len(normalized_ids) != global_keys.size(0):
+            raise ValueError("Route key count must match img_ids")
+        duplicates = set(self._route_img_ids).intersection(normalized_ids)
         if duplicates:
-            raise ValueError(f"Duplicate image IDs in labelled memory: {sorted(duplicates)}")
-        for name, tensor in tensors.items():
-            self._route_lists[name].append(self._store_float(tensor))
+            raise ValueError(f"Duplicate image IDs in labeled memory: {sorted(duplicates)}")
+        self._route_global_list.append(self._store_float(global_keys))
+        self._route_environment_list.append(self._store_float(environment_keys))
         self._route_img_ids.extend(normalized_ids)
-        self._finalized = False
 
-    def append_parent(
+    def append_pairs(
         self,
-        keys: torch.Tensor,
-        values: torch.Tensor,
-        geometry: torch.Tensor,
-        child_ptr: torch.Tensor,
-        meta: Sequence[Mapping[str, Any]],
+        *,
+        p3_keys: torch.Tensor,
+        p2_keys: torch.Tensor,
+        region_ids: torch.Tensor,
+        pair_meta: Sequence[Mapping[str, Any]],
     ) -> None:
-        self._check_matrix(keys, self.memory_dim, "parent keys")
-        self._check_matrix(values, self.value_dim, "parent values")
-        self._check_matrix(geometry, self.geometry_dim, "parent geometry")
-        count = keys.size(0)
-        if values.size(0) != count or geometry.size(0) != count:
-            raise ValueError("parent keys, values and geometry must have the same length")
-        if child_ptr.numel() != count or len(meta) != count:
-            raise ValueError("child_ptr and parent metadata must match parent count")
-        normalized_meta = [_validate_labeled_meta(item, "parent") for item in meta]
-        self._parent_key_list.append(self._store_float(keys))
-        self._parent_value_list.append(self._store_float(values))
-        self._parent_geometry_list.append(self._store_float(geometry))
-        self._parent_child_ptr_list.append(child_ptr.detach().to(device="cpu", dtype=torch.long).view(-1))
-        self._parent_meta_list.extend(normalized_meta)
-        self._finalized = False
-
-    def append_child(
-        self,
-        keys: torch.Tensor,
-        geometry: torch.Tensor,
-        meta: Sequence[Mapping[str, Any]],
-    ) -> torch.Tensor:
-        self._check_matrix(keys, self.memory_dim, "child keys")
-        self._check_matrix(geometry, self.geometry_dim, "child geometry")
-        count = keys.size(0)
-        if geometry.size(0) != count or len(meta) != count:
-            raise ValueError("child keys, geometry and metadata must have the same length")
-        start = self.num_children_pending()
-        self._child_key_list.append(self._store_float(keys))
-        self._child_geometry_list.append(self._store_float(geometry))
-        self._child_meta_list.extend(_validate_labeled_meta(item, "child") for item in meta)
-        self._finalized = False
-        return torch.arange(start, start + count, dtype=torch.long)
+        self._ensure_mutable()
+        self._check_matrix(p3_keys, "p3_keys")
+        self._check_matrix(p2_keys, "p2_keys")
+        if p3_keys.shape != p2_keys.shape:
+            raise ValueError("P3 and P2 pair keys must be one-to-one")
+        regions = torch.as_tensor(region_ids).detach().to(
+            device="cpu",
+            dtype=torch.long,
+        ).view(-1).contiguous()
+        count = int(p3_keys.size(0))
+        if regions.numel() != count or len(pair_meta) != count:
+            raise ValueError("Pair keys, region IDs, and metadata lengths must match")
+        if regions.numel() and not bool(((regions == 0) | (regions == 1)).all()):
+            raise ValueError("Pair region IDs must be 0 or 1")
+        normalized_meta = [
+            _normalize_pair_meta(metadata, int(region_id))
+            for metadata, region_id in zip(pair_meta, regions.tolist())
+        ]
+        self._pair_p3_list.append(self._store_float(p3_keys))
+        self._pair_p2_list.append(self._store_float(p2_keys))
+        self._pair_region_list.append(regions)
+        self._pair_meta_list.extend(normalized_meta)
 
     def finalize(
         self,
@@ -220,43 +214,56 @@ class PCMemory:
     ) -> None:
         device = torch.device(device)
         if device.type != "cpu" or dtype != torch.float16:
-            raise ValueError("PC-HBM memory must be finalized as CPU float16")
-        self.route = {
-            name: _cat_or_empty(items, self.memory_dim, self.storage_dtype)
-            for name, items in self._route_lists.items()
+            raise ValueError("PC-HBM-Lite memory must be finalized as CPU float16")
+        route = {
+            "global_keys": _cat_float(
+                self._route_global_list,
+                self.memory_dim,
+                self.storage_dtype,
+            ),
+            "environment_keys": _cat_float(
+                self._route_environment_list,
+                self.memory_dim,
+                self.storage_dtype,
+            ),
+            "img_ids": list(self._route_img_ids),
         }
-        self.route["img_ids"] = list(self._route_img_ids)
-        self.parent = {
-            "p3_keys": _cat_or_empty(self._parent_key_list, self.memory_dim, self.storage_dtype),
-            "p3_values": _cat_or_empty(self._parent_value_list, self.value_dim, self.storage_dtype),
-            "p3_geometry": _cat_or_empty(self._parent_geometry_list, self.geometry_dim, self.storage_dtype),
-            "child_ptr": _cat_long_or_empty(self._parent_child_ptr_list),
-            "parent_meta": [dict(item) for item in self._parent_meta_list],
+        pairs = {
+            "p3_keys": _cat_float(
+                self._pair_p3_list,
+                self.memory_dim,
+                self.storage_dtype,
+            ),
+            "p2_keys": _cat_float(
+                self._pair_p2_list,
+                self.memory_dim,
+                self.storage_dtype,
+            ),
+            "region_ids": _cat_long(self._pair_region_list),
+            "pair_meta": [dict(item) for item in self._pair_meta_list],
         }
-        self.child = {
-            "p2_child_keys": _cat_or_empty(self._child_key_list, self.memory_dim, self.storage_dtype),
-            "p2_child_geo": _cat_or_empty(self._child_geometry_list, self.geometry_dim, self.storage_dtype),
-            "child_meta": [dict(item) for item in self._child_meta_list],
-        }
-        if compat_meta is not None:
-            self.compat_meta.update(dict(compat_meta))
-        self.compat_meta.setdefault("schema_version", self.DEFAULT_SCHEMA_VERSION)
-        self.compat_meta.setdefault("source", "labeled_only")
-        self.compat_meta.setdefault("storage_dtype", "float16")
-        self.compat_meta.setdefault("memory_dim", self.memory_dim)
-        self.compat_meta.setdefault("value_dim", self.value_dim)
-        self.compat_meta.setdefault("geometry_dim", self.geometry_dim)
+        meta = dict(self.compat_meta)
+        meta.update(dict(compat_meta or {}))
+        _validate_meta(meta, _default_compat_meta())
+        _validate_tables(route, pairs, self.memory_dim)
+
+        self.route = route
+        self.pairs = pairs
+        self.compat_meta = meta
         self._finalized = True
         self._build_indices()
-        self._validate_finalized_storage()
+        self._validate_storage()
 
     def is_ready(self) -> bool:
         if not self._finalized:
             return False
-        return (
-            self.route.get("route_embed", torch.empty(0, self.memory_dim)).size(0) > 0
-            and self.parent.get("p3_keys", torch.empty(0, self.memory_dim)).size(0) > 0
-            and self.child.get("p2_child_keys", torch.empty(0, self.memory_dim)).size(0) > 0
+        route_count = int(self.route.get("global_keys", torch.empty(0, self.memory_dim)).size(0))
+        region_ids = self.pairs.get("region_ids", torch.empty(0, dtype=torch.long))
+        return bool(
+            route_count > 0
+            and region_ids.numel() > 0
+            and (region_ids == 0).any()
+            and (region_ids == 1).any()
         )
 
     def validate_compat(
@@ -265,470 +272,686 @@ class PCMemory:
         *,
         require_producer_match: bool = False,
     ) -> CompatibilityResult:
-        """Validate architecture/schema/dimensions and, optionally, producer."""
+        if not self._finalized:
+            return CompatibilityResult(False, "memory_not_finalized")
+        try:
+            _validate_meta(self.compat_meta, _default_compat_meta())
+        except (TypeError, ValueError) as exc:
+            return CompatibilityResult(False, str(exc))
 
-        if not self.is_ready():
-            return CompatibilityResult(False, "memory_not_ready")
         if expected is None:
-            return CompatibilityResult(True, None)
-        if not isinstance(expected, Mapping):
-            builder = getattr(expected, "expected_memory_meta", None)
-            if callable(builder):
-                expected = builder()
-            else:
-                raise TypeError("expected compatibility data must be a mapping or PC config")
-        keys = (
-            "architecture",
-            "schema_version",
-            "input_size",
-            "token_hw",
-            "output_hw",
-            "dino_layer_indices",
-            "encoder_dim",
-            "decoder_dim",
-            "memory_dim",
-            "value_dim",
-            "geometry_dim",
-            "storage_dtype",
-            "source",
-        )
-        if require_producer_match:
-            keys = (*keys, "producer_fingerprint")
-        for key in keys:
-            if key not in expected:
+            expected_meta = _default_compat_meta()
+        elif isinstance(expected, Mapping):
+            expected_meta = dict(expected)
+        elif hasattr(expected, "expected_memory_meta"):
+            expected_meta = dict(expected.expected_memory_meta())
+        else:
+            return CompatibilityResult(False, "invalid_expected_compatibility")
+
+        for key, expected_value in expected_meta.items():
+            if key == "producer_fingerprint" and not require_producer_match:
                 continue
             if key not in self.compat_meta:
-                return CompatibilityResult(False, f"missing_compat_key:{key}")
-            if _canonical_meta(self.compat_meta[key]) != _canonical_meta(expected[key]):
                 return CompatibilityResult(False, f"compat_mismatch:{key}")
+            if _canonical(self.compat_meta[key]) != _canonical(expected_value):
+                return CompatibilityResult(False, f"compat_mismatch:{key}")
+        if require_producer_match:
+            fingerprint = expected_meta.get("producer_fingerprint")
+            if fingerprint is None or self.compat_meta.get("producer_fingerprint") != fingerprint:
+                return CompatibilityResult(False, "compat_mismatch:producer_fingerprint")
         return CompatibilityResult(True, None)
 
     def route_query(
         self,
-        q_route: torch.Tensor,
+        q_global: torch.Tensor,
+        q_environment: torch.Tensor,
         top_img_k: int,
         *,
         query_image_ids: Sequence[object] | None = None,
         exclude_self_match: bool = True,
-    ) -> Dict[str, Any]:
-        """Route each query independently and optionally exclude its own image."""
+    ) -> dict[str, Any]:
+        """Rank labeled images by separate global/environment cosine scores."""
 
-        if q_route.ndim != 2 or q_route.size(1) != self.memory_dim:
-            raise ValueError(f"q_route must be [B,{self.memory_dim}], got {tuple(q_route.shape)}")
-        batch_size = q_route.size(0)
-        k = max(0, int(top_img_k))
-        if query_image_ids is not None and len(query_image_ids) != batch_size:
-            raise ValueError("query_image_ids length must match route query batch")
-        output = self._empty_route_result(q_route, k)
-        if not self.is_ready() or k == 0:
-            return output
+        self._check_query_pair(q_global, q_environment)
+        k = int(top_img_k)
+        if k <= 0:
+            raise ValueError("top_img_k must be positive")
+        if query_image_ids is not None and len(query_image_ids) != q_global.size(0):
+            raise ValueError("query_image_ids length must match query batch size")
+        if not self.is_ready():
+            return self._empty_route_result(q_global, k)
 
-        keys = self.route["route_embed"].to(
-            device=q_route.device,
-            dtype=q_route.dtype,
-            non_blocking=True,
+        query_global = F.normalize(
+            torch.nan_to_num(q_global.float()),
+            dim=-1,
+            eps=1.0e-6,
         )
-        similarities = normalize(q_route, dim=-1) @ normalize(keys, dim=-1).transpose(0, 1)
-        image_ids = list(self.route["img_ids"])
-        score_rows: list[torch.Tensor] = []
-        valid_rows: list[torch.Tensor] = []
-        index_rows: list[torch.Tensor] = []
-        top_ids: list[list[str]] = []
-        for batch_index in range(batch_size):
-            valid_candidates = torch.ones(len(image_ids), device=q_route.device, dtype=torch.bool)
-            if exclude_self_match and query_image_ids is not None:
-                own_id = str(query_image_ids[batch_index])
-                if own_id in self.route_img_to_index:
-                    valid_candidates[self.route_img_to_index[own_id]] = False
-            candidate_indices = torch.nonzero(valid_candidates, as_tuple=False).flatten()
-            count = min(k, int(candidate_indices.numel()))
-            scores = q_route.new_full((k,), -1.0e4)
-            valid = torch.zeros(k, device=q_route.device, dtype=torch.bool)
-            indices = torch.full((k,), -1, device=q_route.device, dtype=torch.long)
-            ids: list[str] = []
-            if count > 0:
-                candidate_scores = similarities[batch_index].index_select(0, candidate_indices)
-                selected_scores, local_indices = torch.topk(candidate_scores, k=count)
-                selected_indices = candidate_indices.index_select(0, local_indices)
-                scores[:count] = selected_scores
-                valid[:count] = True
-                indices[:count] = selected_indices
-                ids = [image_ids[index] for index in selected_indices.detach().cpu().tolist()]
-            score_rows.append(scores)
-            valid_rows.append(valid)
-            index_rows.append(indices)
-            top_ids.append(ids)
-        top_scores = torch.stack(score_rows)
-        top_valid = torch.stack(valid_rows)
-        route_attention = _masked_route_softmax(top_scores, top_valid)
-        route_entropy_norm = entropy_from_probs(route_attention, dim=1)
-        valid_count = top_valid.sum(dim=1)
-        route_entropy = torch.where(
-            valid_count > 1,
-            route_entropy_norm * valid_count.clamp_min(1).to(q_route.dtype).log(),
-            torch.zeros_like(route_entropy_norm),
+        query_environment = F.normalize(
+            torch.nan_to_num(q_environment.float()),
+            dim=-1,
+            eps=1.0e-6,
         )
+        memory_global = F.normalize(
+            self.route["global_keys"].to(
+                device=q_global.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            ),
+            dim=-1,
+            eps=1.0e-6,
+        )
+        memory_environment = F.normalize(
+            self.route["environment_keys"].to(
+                device=q_global.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            ),
+            dim=-1,
+            eps=1.0e-6,
+        )
+        global_scores = query_global @ memory_global.transpose(0, 1)
+        environment_scores = query_environment @ memory_environment.transpose(0, 1)
+        global_weight = float(getattr(self.config, "route_global_weight", 0.5))
+        environment_weight = float(getattr(self.config, "route_environment_weight", 0.5))
+        if global_weight != 0.5 or environment_weight != 0.5:
+            raise ValueError("PC-HBM-Lite route weights are fixed to 0.5/0.5")
+        combined = global_weight * global_scores + environment_weight * environment_scores
+        valid = torch.ones_like(combined, dtype=torch.bool)
+
+        if exclude_self_match and query_image_ids is not None:
+            for batch_index, raw_image_id in enumerate(query_image_ids):
+                route_index = self.route_img_to_index.get(str(raw_image_id))
+                if route_index is not None:
+                    valid[batch_index, route_index] = False
+        ranked = torch.argsort(
+            combined.masked_fill(~valid, -1.0e4),
+            dim=1,
+            descending=True,
+            stable=True,
+        )
+        real_k = min(k, combined.size(1))
+        selected = ranked[:, :real_k]
+        selected_valid = valid.gather(1, selected)
+        selected_scores = combined.gather(1, selected).masked_fill(~selected_valid, -1.0e4)
+
+        batch_size = q_global.size(0)
+        top_scores = torch.full(
+            (batch_size, k),
+            -1.0e4,
+            device=q_global.device,
+            dtype=torch.float32,
+        )
+        top_valid = torch.zeros((batch_size, k), device=q_global.device, dtype=torch.bool)
+        top_indices = torch.full(
+            (batch_size, k),
+            -1,
+            device=q_global.device,
+            dtype=torch.long,
+        )
+        if real_k:
+            top_scores[:, :real_k] = selected_scores
+            top_valid[:, :real_k] = selected_valid
+            top_indices[:, :real_k] = selected.masked_fill(~selected_valid, -1)
+
+        top_img_ids: list[list[str]] = []
+        route_ids = self.route["img_ids"]
+        for row_indices, row_valid in zip(top_indices.tolist(), top_valid.tolist()):
+            top_img_ids.append(
+                [
+                    route_ids[index]
+                    for index, item_valid in zip(row_indices, row_valid)
+                    if item_valid
+                ]
+            )
+        route_entropy_norm = _normalized_masked_entropy(top_scores, top_valid)
         return {
-            "top_img_ids": top_ids,
+            "top_img_ids": top_img_ids,
             "top_img_scores": top_scores,
             "top_img_valid": top_valid,
-            "top_img_indices": torch.stack(index_rows),
-            "route_entropy": route_entropy,
+            "top_img_indices": top_indices,
             "route_entropy_norm": route_entropy_norm,
         }
 
-    def get_parent_subbank(
+    def get_pair_subbank(
         self,
         top_img_ids: Iterable[object] | None,
         *,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
         exclude_image_id: object | None = None,
-    ) -> Dict[str, Any]:
-        """Transfer only parents belonging to one query's routed images."""
-
-        target_device = torch.device("cpu") if device is None else torch.device(device)
+    ) -> dict[str, Any]:
+        target_device = torch.device("cpu" if device is None else device)
         target_dtype = self.storage_dtype if dtype is None else dtype
-        selected_ids = _flatten_image_ids(top_img_ids)
-        if exclude_image_id is not None:
-            selected_ids = [item for item in selected_ids if item != str(exclude_image_id)]
-        if not self.is_ready() or not selected_ids:
-            return self._empty_parent_subbank(target_device, target_dtype)
-        chunks = [self.parent_img_to_indices[item] for item in selected_ids if item in self.parent_img_to_indices]
-        if not chunks:
-            return self._empty_parent_subbank(target_device, target_dtype)
-        indices = torch.unique(torch.cat(chunks), sorted=True)
-        metadata_indices = indices.tolist()
+        if not torch.empty((), dtype=target_dtype).is_floating_point():
+            raise TypeError("Pair key dtype must be floating point")
+        if not self._finalized:
+            return self._empty_pair_subbank(target_device, target_dtype)
+
+        requested = (
+            list(self.route.get("img_ids", []))
+            if top_img_ids is None
+            else _flatten_image_ids(top_img_ids)
+        )
+        excluded = None if exclude_image_id is None else str(exclude_image_id)
+        selected_parts = [
+            self.pair_img_to_indices[image_id]
+            for image_id in requested
+            if image_id != excluded and image_id in self.pair_img_to_indices
+        ]
+        if not selected_parts:
+            return self._empty_pair_subbank(target_device, target_dtype)
+        pair_indices_cpu = torch.cat(selected_parts).unique(sorted=True)
+        metadata = [
+            dict(self.pairs["pair_meta"][index])
+            for index in pair_indices_cpu.tolist()
+        ]
         return {
-            "p3_keys": self.parent["p3_keys"].index_select(0, indices).to(
-                device=target_device, dtype=target_dtype, non_blocking=True
+            "p3_keys": self.pairs["p3_keys"].index_select(0, pair_indices_cpu).to(
+                device=target_device,
+                dtype=target_dtype,
+                non_blocking=True,
             ),
-            "p3_values": self.parent["p3_values"].index_select(0, indices).to(
-                device=target_device, dtype=target_dtype, non_blocking=True
+            "p2_keys": self.pairs["p2_keys"].index_select(0, pair_indices_cpu).to(
+                device=target_device,
+                dtype=target_dtype,
+                non_blocking=True,
             ),
-            "p3_geometry": self.parent["p3_geometry"].index_select(0, indices).to(
-                device=target_device, dtype=target_dtype, non_blocking=True
+            "region_ids": self.pairs["region_ids"].index_select(0, pair_indices_cpu).to(
+                device=target_device,
+                dtype=torch.long,
+                non_blocking=True,
             ),
-            "child_ptr": self.parent["child_ptr"].index_select(0, indices).to(
-                device=target_device, non_blocking=True
+            "pair_indices": pair_indices_cpu.to(
+                device=target_device,
+                dtype=torch.long,
+                non_blocking=True,
             ),
-            "parent_indices": indices.to(device=target_device, non_blocking=True),
-            "parent_meta": [self.parent["parent_meta"][index] for index in metadata_indices],
+            "pair_meta": metadata,
         }
 
-    def get_child_by_ptr(
-        self,
-        top_child_ptrs: torch.Tensor,
-        *,
-        device: torch.device | str | None = None,
-        dtype: torch.dtype | None = None,
-        valid_mask: torch.Tensor | None = None,
-    ) -> Dict[str, torch.Tensor]:
-        """Gather children without ever clamping an invalid ``-1`` pointer."""
-
-        target_device = top_child_ptrs.device if device is None else torch.device(device)
-        target_dtype = self.storage_dtype if dtype is None else dtype
-        output_shape = tuple(top_child_ptrs.shape)
-        keys = torch.zeros((*output_shape, self.memory_dim), device=target_device, dtype=target_dtype)
-        geometry = torch.zeros((*output_shape, self.geometry_dim), device=target_device, dtype=target_dtype)
-        child_count = int(self.child.get("p2_child_keys", torch.empty(0)).size(0))
-        valid = (top_child_ptrs >= 0) & (top_child_ptrs < child_count)
-        if valid_mask is not None:
-            if valid_mask.shape != top_child_ptrs.shape:
-                raise ValueError("valid_mask shape must match top_child_ptrs")
-            valid = valid & valid_mask.to(device=valid.device, dtype=torch.bool)
-        if child_count == 0 or not bool(valid.any()):
-            return {"p2_child_keys": keys, "p2_child_geo": geometry, "child_valid": valid.to(target_device)}
-        positions = torch.nonzero(valid.reshape(-1), as_tuple=False).flatten()
-        pointers = top_child_ptrs.reshape(-1).index_select(0, positions).to(device="cpu", dtype=torch.long)
-        selected_keys = self.child["p2_child_keys"].index_select(0, pointers).to(
-            device=target_device, dtype=target_dtype, non_blocking=True
-        )
-        selected_geometry = self.child["p2_child_geo"].index_select(0, pointers).to(
-            device=target_device, dtype=target_dtype, non_blocking=True
-        )
-        target_positions = positions.to(device=target_device)
-        keys.view(-1, self.memory_dim).index_copy_(0, target_positions, selected_keys)
-        geometry.view(-1, self.geometry_dim).index_copy_(0, target_positions, selected_geometry)
-        return {
-            "p2_child_keys": keys,
-            "p2_child_geo": geometry,
-            "child_valid": valid.to(device=target_device, non_blocking=True),
-        }
-
-    def state_dict(self) -> Dict[str, Any]:
+    def state_dict(self) -> dict[str, Any]:
+        if not self._finalized:
+            raise RuntimeError("Cannot export a non-finalized PC-HBM-Lite memory")
         return {
             "format_version": self.FORMAT_VERSION,
-            "schema_version": int(self.compat_meta.get("schema_version", self.DEFAULT_SCHEMA_VERSION)),
+            "schema_version": self.DEFAULT_SCHEMA_VERSION,
             "compat_meta": dict(self.compat_meta),
             "memory_dim": self.memory_dim,
-            "value_dim": self.value_dim,
-            "geometry_dim": self.geometry_dim,
             "storage_dtype": "float16",
-            "route": _cpu_state_copy(self.route),
-            "parent": _cpu_state_copy(self.parent),
-            "child": _cpu_state_copy(self.child),
-            "finalized": bool(self._finalized),
+            "route": _cpu_group_copy(self.route),
+            "pairs": _cpu_group_copy(self.pairs),
+            "finalized": True,
         }
 
     def load_state_dict(
         self,
-        state: Mapping[str, Any] | None,
+        state: Mapping[str, Any],
         *,
         device: torch.device | str | None = None,
         dtype: torch.dtype | None = None,
     ) -> None:
-        """Load a raw memory state or a nested ``{'memory': state}`` checkpoint."""
+        """Atomically validate and load only a finalized Schema V2 state."""
 
-        self.clear()
-        if not state:
-            return
-        outer = state
-        if "memory" in state and isinstance(state["memory"], Mapping):
-            state = state["memory"]
+        if not isinstance(state, Mapping):
+            raise TypeError("PC-HBM-Lite state must be a mapping")
+        raw = state.get("memory", state)
+        if not isinstance(raw, Mapping):
+            raise TypeError("Nested PC-HBM-Lite state must be a mapping")
         if device is not None and torch.device(device).type != "cpu":
-            raise ValueError("Loaded PC-HBM memory must remain on CPU")
+            raise ValueError("Loaded PC-HBM-Lite memory must remain on CPU")
         if dtype is not None and dtype != torch.float16:
-            raise ValueError("Loaded PC-HBM memory must remain float16")
-        for key, expected in (
-            ("memory_dim", self.memory_dim),
-            ("value_dim", self.value_dim),
-            ("geometry_dim", self.geometry_dim),
-        ):
-            actual = int(state.get(key, expected))
-            if actual != expected:
-                raise ValueError(f"Memory {key}={actual} is incompatible with expected {expected}")
+            raise ValueError("Loaded PC-HBM-Lite memory must remain float16")
 
-        outer_meta = dict(outer.get("compat_meta", {}) or {})
-        inner_meta = dict(state.get("compat_meta", {}) or {})
-        self.compat_meta.update(outer_meta)
-        self.compat_meta.update(inner_meta)
-        raw_route = state.get("route", {}) or {}
-        raw_parent = state.get("parent", {}) or {}
-        raw_child = state.get("child", {}) or {}
-        self.route = {
-            name: _state_float(raw_route.get(name), self.memory_dim)
-            for name in (
-                "x3_global",
-                "x3_boundary",
-                "x3_uncertain",
-                "x3_bg_near",
-                "x3_environment",
-                "route_embed",
+        required = {
+            "format_version",
+            "schema_version",
+            "compat_meta",
+            "memory_dim",
+            "storage_dtype",
+            "route",
+            "pairs",
+            "finalized",
+        }
+        if int(raw.get("format_version", -1)) != self.FORMAT_VERSION:
+            raise ValueError("Incompatible PC-HBM memory: compat_mismatch:schema_version")
+        if int(raw.get("schema_version", -1)) != self.DEFAULT_SCHEMA_VERSION:
+            raise ValueError("Incompatible PC-HBM memory: compat_mismatch:schema_version")
+        missing = required.difference(raw)
+        unknown = set(raw).difference(required)
+        if missing or unknown:
+            raise ValueError(
+                "Incompatible PC-HBM memory: invalid_structure:"
+                f"missing={sorted(missing)},unknown={sorted(unknown)}"
             )
-        }
-        self.route["img_ids"] = [str(item) for item in raw_route.get("img_ids", [])]
-        self.parent = {
-            "p3_keys": _state_float(raw_parent.get("p3_keys"), self.memory_dim),
-            "p3_values": _state_float(raw_parent.get("p3_values"), self.value_dim),
-            "p3_geometry": _state_float(raw_parent.get("p3_geometry"), self.geometry_dim),
-            "child_ptr": _state_long(raw_parent.get("child_ptr")),
-            "parent_meta": [dict(item) for item in raw_parent.get("parent_meta", [])],
-        }
-        self.child = {
-            "p2_child_keys": _state_float(raw_child.get("p2_child_keys"), self.memory_dim),
-            "p2_child_geo": _state_float(raw_child.get("p2_child_geo"), self.geometry_dim),
-            "child_meta": [dict(item) for item in raw_child.get("child_meta", [])],
-        }
-        self._finalized = bool(state.get("finalized", True))
+        if not bool(raw["finalized"]):
+            raise ValueError("Incompatible PC-HBM memory: memory_not_finalized")
+        if int(raw["memory_dim"]) != self.memory_dim:
+            raise ValueError("Incompatible PC-HBM memory: compat_mismatch:memory_dim")
+        if raw["storage_dtype"] != "float16":
+            raise ValueError(
+                "Incompatible PC-HBM memory: compat_mismatch:storage_dtype"
+            )
+
+        meta = dict(raw["compat_meta"])
+        _validate_meta(meta, _default_compat_meta())
+        if self.config is not None:
+            _validate_meta(meta, dict(self.config.expected_memory_meta()))
+        route = _load_route_table(raw["route"], self.memory_dim)
+        pairs = _load_pair_table(raw["pairs"], self.memory_dim)
+        _validate_tables(route, pairs, self.memory_dim)
+
+        # Commit only after the entire incoming state has passed preflight.
+        self._route_global_list = []
+        self._route_environment_list = []
+        self._route_img_ids = []
+        self._pair_p3_list = []
+        self._pair_p2_list = []
+        self._pair_region_list = []
+        self._pair_meta_list = []
+        self.route = route
+        self.pairs = pairs
+        self.compat_meta = meta
+        self._finalized = True
         self._build_indices()
-        self._validate_finalized_storage()
+        self._validate_storage()
 
     def diagnostic_string(self) -> str:
-        image_count = int(self.route.get("route_embed", torch.empty(0, self.memory_dim)).size(0))
-        parent_count = int(self.parent.get("p3_keys", torch.empty(0, self.memory_dim)).size(0))
-        child_count = int(self.child.get("p2_child_keys", torch.empty(0, self.memory_dim)).size(0))
-        return f"[PC-HBM] images={image_count}, parents={parent_count}, children={child_count}, ready={self.is_ready()}"
+        image_count = int(self.route.get("global_keys", torch.empty(0, self.memory_dim)).size(0))
+        pair_count = int(self.pairs.get("p3_keys", torch.empty(0, self.memory_dim)).size(0))
+        return (
+            f"[PC-HBM-Lite] images={image_count}, pairs={pair_count}, "
+            f"ready={self.is_ready()}"
+        )
 
-    def num_children_pending(self) -> int:
-        return sum(int(item.size(0)) for item in self._child_key_list)
-
-    def clear_gpu_cache(self) -> None:
-        """Compatibility no-op: this implementation never retains a GPU cache."""
+    def _ensure_mutable(self) -> None:
+        if self._finalized:
+            raise RuntimeError("Clear finalized PC-HBM-Lite memory before appending")
 
     def _store_float(self, tensor: torch.Tensor) -> torch.Tensor:
-        return tensor.detach().to(device="cpu", dtype=self.storage_dtype).contiguous()
+        return tensor.detach().to(
+            device="cpu",
+            dtype=self.storage_dtype,
+        ).contiguous()
 
-    @staticmethod
-    def _check_matrix(tensor: torch.Tensor, width: int, name: str) -> None:
-        if tensor.ndim != 2 or tensor.size(1) != int(width):
-            raise ValueError(f"{name} must be [N,{width}], got {tuple(tensor.shape)}")
-        if not tensor.is_floating_point():
+    def _check_matrix(self, tensor: torch.Tensor, name: str) -> None:
+        if not isinstance(tensor, torch.Tensor) or not tensor.is_floating_point():
             raise TypeError(f"{name} must be a floating tensor")
+        if tensor.ndim != 2 or tensor.size(1) != self.memory_dim:
+            raise ValueError(
+                f"{name} must be [N,{self.memory_dim}], got {tuple(tensor.shape)}"
+            )
+        if not bool(torch.isfinite(tensor).all()):
+            raise ValueError(f"{name} contains NaN/Inf")
+        if tensor.numel() and bool(
+            (tensor.detach().float().abs() > torch.finfo(torch.float16).max).any()
+        ):
+            raise ValueError(f"{name} exceeds the finite float16 range")
+
+    def _check_query_pair(
+        self,
+        q_global: torch.Tensor,
+        q_environment: torch.Tensor,
+    ) -> None:
+        self._check_matrix(q_global, "q_global")
+        self._check_matrix(q_environment, "q_environment")
+        if q_global.shape != q_environment.shape:
+            raise ValueError("Route query contexts must have identical shapes")
+        if q_global.device != q_environment.device:
+            raise ValueError("Route query contexts must share a device")
 
     def _build_indices(self) -> None:
-        mapping: dict[str, list[int]] = {}
-        for index, metadata in enumerate(self.parent.get("parent_meta", [])):
-            image_id = str(metadata.get("image_id", ""))
-            if image_id:
-                mapping.setdefault(image_id, []).append(index)
-        self.parent_img_to_indices = {
-            image_id: torch.tensor(indices, dtype=torch.long)
-            for image_id, indices in mapping.items()
-        }
         self.route_img_to_index = {
-            str(image_id): index for index, image_id in enumerate(self.route.get("img_ids", []))
+            str(image_id): index
+            for index, image_id in enumerate(self.route.get("img_ids", []))
+        }
+        by_image: dict[str, list[int]] = {}
+        for index, metadata in enumerate(self.pairs.get("pair_meta", [])):
+            image_id = str(metadata["image_id"])
+            by_image.setdefault(image_id, []).append(index)
+        self.pair_img_to_indices = {
+            key: torch.tensor(value, dtype=torch.long)
+            for key, value in by_image.items()
         }
 
-    def _validate_finalized_storage(self) -> None:
-        if not self._finalized:
-            return
-        for group_name, group in (("route", self.route), ("parent", self.parent), ("child", self.child)):
+    def _validate_storage(self) -> None:
+        for group_name, group in (("route", self.route), ("pairs", self.pairs)):
             for name, value in group.items():
                 if not isinstance(value, torch.Tensor) or not value.is_floating_point():
                     continue
-                if value.device.type != "cpu" or value.dtype != torch.float16:
-                    raise ValueError(f"{group_name}.{name} must be a CPU float16 tensor")
-        if self.compat_meta.get("source", "labeled_only") != "labeled_only":
-            raise ValueError("Loaded memory source is not labeled_only")
-        route_count = int(self.route.get("route_embed", torch.empty(0, self.memory_dim)).size(0))
-        if route_count != len(self.route.get("img_ids", [])):
-            raise ValueError("route embedding/image ID lengths do not match")
-        parent_count = int(self.parent.get("p3_keys", torch.empty(0, self.memory_dim)).size(0))
-        if parent_count != len(self.parent.get("parent_meta", [])):
-            raise ValueError("parent tensor/metadata lengths do not match")
-        child_count = int(self.child.get("p2_child_keys", torch.empty(0, self.memory_dim)).size(0))
-        if child_count != len(self.child.get("child_meta", [])):
-            raise ValueError("child tensor/metadata lengths do not match")
+                if (
+                    value.device.type != "cpu"
+                    or value.dtype != torch.float16
+                    or not value.is_contiguous()
+                ):
+                    raise ValueError(f"{group_name}.{name} must be contiguous CPU float16")
+                if not bool(torch.isfinite(value).all()):
+                    raise ValueError(f"{group_name}.{name} contains NaN/Inf")
 
-    def _empty_route_result(self, query: torch.Tensor, k: int) -> Dict[str, Any]:
+    def _empty_route_result(self, query: torch.Tensor, k: int) -> dict[str, Any]:
         batch_size = query.size(0)
         return {
             "top_img_ids": [[] for _ in range(batch_size)],
-            "top_img_scores": query.new_full((batch_size, k), -1.0e4),
-            "top_img_valid": torch.zeros((batch_size, k), device=query.device, dtype=torch.bool),
-            "top_img_indices": torch.full((batch_size, k), -1, device=query.device, dtype=torch.long),
-            "route_entropy": query.new_zeros(batch_size),
-            "route_entropy_norm": query.new_zeros(batch_size),
+            "top_img_scores": torch.full(
+                (batch_size, k),
+                -1.0e4,
+                device=query.device,
+                dtype=torch.float32,
+            ),
+            "top_img_valid": torch.zeros(
+                (batch_size, k),
+                device=query.device,
+                dtype=torch.bool,
+            ),
+            "top_img_indices": torch.full(
+                (batch_size, k),
+                -1,
+                device=query.device,
+                dtype=torch.long,
+            ),
+            "route_entropy_norm": torch.zeros(
+                batch_size,
+                device=query.device,
+                dtype=torch.float32,
+            ),
         }
 
-    def _empty_parent_subbank(self, device: torch.device, dtype: torch.dtype) -> Dict[str, Any]:
+    def _empty_pair_subbank(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> dict[str, Any]:
         return {
             "p3_keys": torch.empty((0, self.memory_dim), device=device, dtype=dtype),
-            "p3_values": torch.empty((0, self.value_dim), device=device, dtype=dtype),
-            "p3_geometry": torch.empty((0, self.geometry_dim), device=device, dtype=dtype),
-            "child_ptr": torch.empty(0, device=device, dtype=torch.long),
-            "parent_indices": torch.empty(0, device=device, dtype=torch.long),
-            "parent_meta": [],
+            "p2_keys": torch.empty((0, self.memory_dim), device=device, dtype=dtype),
+            "region_ids": torch.empty(0, device=device, dtype=torch.long),
+            "pair_indices": torch.empty(0, device=device, dtype=torch.long),
+            "pair_meta": [],
         }
 
 
-PCHBMMemory = PCMemory
-
-
-def parent_values_from_region(
-    region: str,
-    sdf: torch.Tensor,
-    reliability: torch.Tensor,
-) -> torch.Tensor:
-    """Build the fixed eight-value parent target for one labelled region."""
-
-    if region not in REGION_TO_ID:
-        raise KeyError(f"Unknown PC-HBM region: {region}")
-    sdf = sdf.reshape(-1)
-    reliability = reliability.reshape(-1)
-    if sdf.shape != reliability.shape:
-        raise ValueError("sdf and reliability lengths must match")
-    values = sdf.new_zeros((sdf.numel(), 8))
-    values[:, REGION_TO_ID[region]] = 1.0
-    is_foreground = region in {"fg_core", "fg_boundary"}
-    values[:, 4] = float(is_foreground)
-    values[:, 5] = float(not is_foreground)
-    values[:, 6] = sdf
-    values[:, 7] = reliability
-    return values
+def _default_compat_meta() -> dict[str, Any]:
+    return {
+        "architecture": _ARCHITECTURE,
+        "schema_version": 2,
+        "input_size": 392,
+        "token_hw": (28, 28),
+        "output_hw": (98, 98),
+        "dino_layer_indices": (2, 5, 8, 11),
+        "encoder_dim": 768,
+        "decoder_dim": 128,
+        "memory_dim": 128,
+        "child_window_size": 3,
+        "region_names": _REGION_NAMES,
+        "storage_dtype": "float16",
+        "source": "labeled_only",
+    }
 
 
 def _parse_storage_dtype(dtype: torch.dtype | str) -> torch.dtype:
     if dtype in (torch.float16, "float16", "fp16", "torch.float16"):
         return torch.float16
-    raise ValueError(f"Unsupported PC-HBM storage dtype: {dtype}")
+    raise ValueError(f"Unsupported PC-HBM-Lite storage dtype: {dtype}")
 
 
-def _validate_labeled_meta(metadata: Mapping[str, Any], kind: str) -> dict[str, Any]:
+def _normalize_image_ids(values: Sequence[object]) -> list[str]:
+    normalized = [str(value) for value in values]
+    if any(not value for value in normalized):
+        raise ValueError("Memory image IDs must be non-empty")
+    if len(set(normalized)) != len(normalized):
+        raise ValueError("Duplicate image IDs within one route append are not allowed")
+    return normalized
+
+
+def _normalize_pair_meta(metadata: Mapping[str, Any], region_id: int) -> dict[str, Any]:
+    if not isinstance(metadata, Mapping):
+        raise TypeError("Each pair metadata item must be a mapping")
     result = dict(metadata)
-    source = str(result.get("source", "labeled_only"))
-    if source != "labeled_only" or result.get("is_labeled", True) is False:
-        raise ValueError(f"{kind} metadata is not labelled-only")
-    if "image_id" not in result:
-        raise ValueError(f"{kind} metadata must contain image_id")
-    result["image_id"] = str(result["image_id"])
-    result["source"] = "labeled_only"
-    result["is_labeled"] = True
+    if "image_id" not in result or not str(result["image_id"]):
+        raise ValueError("Pair metadata must contain a non-empty image_id")
+    if str(result.get("source", "labeled_only")) != "labeled_only":
+        raise ValueError("Pair metadata must come from labeled data")
+    if result.get("is_labeled", True) is False:
+        raise ValueError("Pair metadata must come from labeled data")
+    expected_name = _REGION_NAMES[int(region_id)]
+    if "region_id" in result and int(result["region_id"]) != int(region_id):
+        raise ValueError("Pair metadata region ID does not match its tensor")
+    if "region" in result and str(result["region"]) != expected_name:
+        raise ValueError("Pair metadata region name does not match its tensor")
+    result.update(
+        {
+            "image_id": str(result["image_id"]),
+            "region_id": int(region_id),
+            "region": expected_name,
+            "source": "labeled_only",
+            "is_labeled": True,
+        }
+    )
     return result
 
 
-def _cat_or_empty(items: Sequence[torch.Tensor], width: int, dtype: torch.dtype) -> torch.Tensor:
+def _cat_float(
+    items: Sequence[torch.Tensor],
+    width: int,
+    dtype: torch.dtype,
+) -> torch.Tensor:
     if not items:
         return torch.empty((0, width), dtype=dtype)
-    return torch.cat(list(items), dim=0).to(device="cpu", dtype=dtype).contiguous()
+    return torch.cat(list(items), dim=0).to(
+        device="cpu",
+        dtype=dtype,
+    ).contiguous()
 
 
-def _cat_long_or_empty(items: Sequence[torch.Tensor]) -> torch.Tensor:
+def _cat_long(items: Sequence[torch.Tensor]) -> torch.Tensor:
     if not items:
         return torch.empty(0, dtype=torch.long)
-    return torch.cat(list(items), dim=0).to(device="cpu", dtype=torch.long).contiguous()
+    return torch.cat(list(items), dim=0).to(
+        device="cpu",
+        dtype=torch.long,
+    ).contiguous()
 
 
-def _flatten_image_ids(values: Iterable[object] | None) -> list[str]:
-    if values is None:
-        return []
+def _validate_meta(actual: Mapping[str, Any], expected: Mapping[str, Any]) -> None:
+    if not isinstance(actual, Mapping):
+        raise TypeError("Incompatible PC-HBM memory: compat_meta_not_mapping")
+    allowed = set(_REQUIRED_META_KEYS) | {"producer_fingerprint"}
+    unknown = set(actual).difference(allowed)
+    if unknown:
+        raise ValueError(
+            "Incompatible PC-HBM memory: invalid_compat_meta:"
+            f"unknown={sorted(unknown)}"
+        )
+    for key in _REQUIRED_META_KEYS:
+        if key not in actual:
+            raise ValueError(f"Incompatible PC-HBM memory: compat_mismatch:{key}")
+    fingerprint = actual.get("producer_fingerprint")
+    if fingerprint is not None and (
+        not isinstance(fingerprint, str)
+        or len(fingerprint) != 64
+        or any(character not in "0123456789abcdef" for character in fingerprint)
+    ):
+        raise ValueError(
+            "Incompatible PC-HBM memory: compat_mismatch:producer_fingerprint"
+        )
+    for key, expected_value in expected.items():
+        if key == "producer_fingerprint":
+            continue
+        if key not in actual or _canonical(actual[key]) != _canonical(expected_value):
+            raise ValueError(f"Incompatible PC-HBM memory: compat_mismatch:{key}")
+
+
+def _validate_tables(
+    route: Mapping[str, Any],
+    pairs: Mapping[str, Any],
+    memory_dim: int,
+) -> None:
+    route_keys = {"global_keys", "environment_keys", "img_ids"}
+    pair_keys = {"p3_keys", "p2_keys", "region_ids", "pair_meta"}
+    if set(route) != route_keys or set(pairs) != pair_keys:
+        raise ValueError("Incompatible PC-HBM memory: invalid_table_structure")
+    global_keys = route["global_keys"]
+    environment_keys = route["environment_keys"]
+    if (
+        global_keys.ndim != 2
+        or global_keys.size(1) != memory_dim
+        or global_keys.shape != environment_keys.shape
+        or global_keys.size(0) != len(route["img_ids"])
+    ):
+        raise ValueError("Incompatible PC-HBM memory: invalid_route_shape")
+    route_ids = _normalize_image_ids(route["img_ids"])
+    if route_ids != list(route["img_ids"]):
+        raise ValueError("Incompatible PC-HBM memory: noncanonical_image_ids")
+
+    p3_keys = pairs["p3_keys"]
+    p2_keys = pairs["p2_keys"]
+    region_ids = pairs["region_ids"]
+    pair_meta = pairs["pair_meta"]
+    if (
+        p3_keys.ndim != 2
+        or p3_keys.size(1) != memory_dim
+        or p3_keys.shape != p2_keys.shape
+        or p3_keys.size(0) != region_ids.numel()
+        or p3_keys.size(0) != len(pair_meta)
+    ):
+        raise ValueError("Incompatible PC-HBM memory: invalid_pair_shape")
+    if region_ids.numel() and not bool(((region_ids == 0) | (region_ids == 1)).all()):
+        raise ValueError("Incompatible PC-HBM memory: invalid_region_ids")
+    route_id_set = set(route_ids)
+    for metadata, region_id in zip(pair_meta, region_ids.tolist()):
+        normalized = _normalize_pair_meta(metadata, int(region_id))
+        if normalized["image_id"] not in route_id_set:
+            raise ValueError("Pair image IDs must be present in the route table")
+
+
+def _load_route_table(raw: Any, memory_dim: int) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise TypeError("Incompatible PC-HBM memory: route_not_mapping")
+    if set(raw) != {"global_keys", "environment_keys", "img_ids"}:
+        raise ValueError("Incompatible PC-HBM memory: invalid_route_structure")
+    raw_img_ids = raw["img_ids"]
+    if not isinstance(raw_img_ids, list):
+        raise TypeError("Incompatible PC-HBM memory: img_ids must be list[str]")
+    return {
+        "global_keys": _load_float_matrix(raw["global_keys"], memory_dim),
+        "environment_keys": _load_float_matrix(raw["environment_keys"], memory_dim),
+        "img_ids": _normalize_image_ids(raw_img_ids),
+    }
+
+
+def _load_pair_table(raw: Any, memory_dim: int) -> dict[str, Any]:
+    if not isinstance(raw, Mapping):
+        raise TypeError("Incompatible PC-HBM memory: pairs_not_mapping")
+    if set(raw) != {"p3_keys", "p2_keys", "region_ids", "pair_meta"}:
+        raise ValueError("Incompatible PC-HBM memory: invalid_pair_structure")
+    p3_keys = _load_float_matrix(raw["p3_keys"], memory_dim)
+    p2_keys = _load_float_matrix(raw["p2_keys"], memory_dim)
+    raw_region_ids = torch.as_tensor(raw["region_ids"])
+    if raw_region_ids.ndim != 1 or raw_region_ids.dtype != torch.long:
+        raise ValueError(
+            "Incompatible PC-HBM memory: region_ids must be a LongTensor[N]"
+        )
+    region_ids = raw_region_ids.detach().cpu().contiguous()
+    raw_meta = raw["pair_meta"]
+    if not isinstance(raw_meta, list):
+        raise TypeError("Incompatible PC-HBM memory: pair_meta must be list[dict]")
+    if len(raw_meta) != region_ids.numel():
+        raise ValueError("Incompatible PC-HBM memory: invalid_pair_shape")
+    pair_meta = [
+        _normalize_pair_meta(metadata, int(region_id))
+        for metadata, region_id in zip(raw_meta, region_ids.tolist())
+    ]
+    return {
+        "p3_keys": p3_keys,
+        "p2_keys": p2_keys,
+        "region_ids": region_ids,
+        "pair_meta": pair_meta,
+    }
+
+
+def _load_float_matrix(value: Any, width: int) -> torch.Tensor:
+    tensor = torch.as_tensor(value)
+    if not tensor.is_floating_point():
+        raise TypeError(
+            "Incompatible PC-HBM memory: pair/route keys must be floating"
+        )
+    if tensor.ndim != 2 or tensor.size(1) != width:
+        raise ValueError(
+            f"Incompatible PC-HBM memory: expected [N,{width}], got {tuple(tensor.shape)}"
+        )
+    if (
+        tensor.device.type != "cpu"
+        or tensor.dtype != torch.float16
+        or not tensor.is_contiguous()
+    ):
+        raise ValueError(
+            "Incompatible PC-HBM memory: pair/route keys must be contiguous CPU float16"
+        )
+    work = tensor.detach().float()
+    if not bool(torch.isfinite(work).all()):
+        raise ValueError(
+            "Incompatible PC-HBM memory: pair/route keys contain NaN/Inf"
+        )
+    if work.numel() and bool(
+        (work.abs() > torch.finfo(torch.float16).max).any()
+    ):
+        raise ValueError(
+            "Incompatible PC-HBM memory: pair/route keys overflow float16"
+        )
+    return tensor.detach().clone()
+
+
+def _flatten_image_ids(values: Iterable[object]) -> list[str]:
     output: list[str] = []
     for value in values:
         if isinstance(value, (list, tuple, set)):
             output.extend(str(item) for item in value)
         elif value is not None:
             output.append(str(value))
-    # Preserve route order while removing accidental duplicates.
     return list(dict.fromkeys(output))
 
 
-def _masked_route_softmax(scores: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-    probability = torch.softmax(scores.masked_fill(~valid, -1.0e4), dim=1)
-    probability = probability * valid.to(dtype=scores.dtype)
-    denominator = probability.sum(dim=1, keepdim=True)
-    return torch.where(denominator > 0, probability / denominator.clamp_min(EPS), torch.zeros_like(probability))
+def _normalized_masked_entropy(
+    scores: torch.Tensor,
+    valid: torch.Tensor,
+) -> torch.Tensor:
+    masked = scores.masked_fill(~valid, -1.0e4)
+    probability = torch.softmax(masked.float(), dim=1)
+    probability = probability * valid.float()
+    probability = torch.where(
+        probability.sum(dim=1, keepdim=True) > 0,
+        probability / probability.sum(dim=1, keepdim=True).clamp_min(1.0e-8),
+        torch.zeros_like(probability),
+    )
+    entropy = -(probability * probability.clamp_min(1.0e-8).log()).sum(dim=1)
+    count = valid.sum(dim=1)
+    denominator = count.clamp_min(2).float().log()
+    normalized = torch.where(count > 1, entropy / denominator, torch.zeros_like(entropy))
+    return torch.nan_to_num(normalized).clamp(0.0, 1.0)
 
 
-def _cpu_state_copy(group: Mapping[str, Any]) -> dict[str, Any]:
+def _cpu_group_copy(group: Mapping[str, Any]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in group.items():
         if isinstance(value, torch.Tensor):
             result[key] = value.detach().cpu().clone()
         elif isinstance(value, list):
-            result[key] = [dict(item) if isinstance(item, Mapping) else item for item in value]
+            result[key] = [
+                dict(item) if isinstance(item, Mapping) else item
+                for item in value
+            ]
         else:
             result[key] = value
     return result
 
 
-def _state_float(value: Any, width: int) -> torch.Tensor:
-    if value is None:
-        return torch.empty((0, width), dtype=torch.float16)
-    tensor = torch.as_tensor(value).detach().to(device="cpu", dtype=torch.float16).contiguous()
-    if tensor.ndim != 2 or tensor.size(1) != width:
-        raise ValueError(f"Stored tensor must be [N,{width}], got {tuple(tensor.shape)}")
-    return tensor
-
-
-def _state_long(value: Any) -> torch.Tensor:
-    if value is None:
-        return torch.empty(0, dtype=torch.long)
-    return torch.as_tensor(value).detach().to(device="cpu", dtype=torch.long).view(-1).contiguous()
-
-
-def _canonical_meta(value: Any) -> Any:
+def _canonical(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
-        return tuple(_canonical_meta(item) for item in value)
+        return tuple(_canonical(item) for item in value)
     if isinstance(value, Mapping):
-        return tuple(sorted((str(key), _canonical_meta(item)) for key, item in value.items()))
+        return tuple(
+            sorted((str(key), _canonical(item)) for key, item in value.items())
+        )
     return value
 
 
-__all__ = [
-    "CompatibilityResult",
-    "PCMemory",
-    "PCHBMMemory",
-    "parent_values_from_region",
-]
-
+__all__ = ["CompatibilityResult", "PCMemory"]
