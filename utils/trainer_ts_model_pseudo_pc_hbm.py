@@ -1,16 +1,10 @@
-"""Online pseudo-label trainer for the DINO PC-HBM teacher/student model.
-
-This module is deliberately separate from the legacy pseudo and SAM trainers.
-It keeps the two Student passes visible to DDP, rebuilds labeled-only memory
-from the frozen EMA Teacher at every epoch boundary, and never writes pseudo
-labels back into memory.
-"""
+"""Teacher-only pseudo-label trainer for PC-HBM-Lite."""
 
 from __future__ import annotations
 
-from dataclasses import asdict, is_dataclass
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 import torch
 import torch.optim as optim
@@ -20,21 +14,23 @@ from tqdm import tqdm
 
 from Model.PC_HBM.memory import PCMemory
 from Model.PC_HBM.training import (
-    pc_hbm_labeled_loss,
+    DIAGNOSTIC_NAMES,
+    base_structure_loss,
+    collect_pc_diagnostics,
     pc_unlabeled_loss,
     prepare_pseudo_targets,
-    update_ema_module,
 )
-from Model.PC_HBM.training.losses import base_structure_loss
 from utils.checkpoint_pc_hbm import (
     build_artifact_metadata,
+    CANONICAL_LABELED_SPLIT_COUNT,
     compute_labeled_split_fingerprint,
     load_training_resume,
     read_artifact_metadata,
     save_decoder_checkpoint,
-    save_memory_checkpoint,
     save_training_resume,
     state_dict_fingerprint,
+    validate_canonical_labeled_indices_pt,
+    validate_canonical_labeled_split_fingerprint,
     validate_artifact_metadata,
 )
 from utils.dataloader import (
@@ -49,24 +45,26 @@ from utils.distributed import (
     unwrap_model,
 )
 from utils.logging_utils import current_time
-from utils.pc_memory_runner import build_memory_compat_meta, module_fingerprint, rebuild_memory
-
-
-def _current_local_timestamp() -> str:
-    """Return the local timestamp used by the epoch logs."""
-
-    return current_time()
+from utils.pc_memory_runner import (
+    build_memory_compat_meta,
+    module_fingerprint,
+    rebuild_memory,
+)
 
 
 def validate_teacher_enhancer_checkpoint(
-    source, labeled_split_fingerprint: str
+    source,
+    labeled_split_fingerprint: str,
 ) -> dict[str, Any]:
-    """Accept both Base warm-up variants without weakening Teacher identity."""
+    """Validate the frozen Lite Teacher identity before model construction."""
 
+    validate_canonical_labeled_split_fingerprint(
+        labeled_split_fingerprint
+    )
     return validate_artifact_metadata(
         source,
         {
-            "training_design": ("teacher_only", "two_stage"),
+            "training_design": ("two_stage", "teacher_only"),
             "artifact_role": "teacher_enhancer",
             "labeled_split_fingerprint": str(labeled_split_fingerprint),
             "pc_frozen": True,
@@ -75,7 +73,7 @@ def validate_teacher_enhancer_checkpoint(
 
 
 class PCHBMPseudoTrainer:
-    """Train the PC-HBM Student with labeled and online-pseudo batches."""
+    """Train a raw Student while a frozen Lite enhancer produces soft targets."""
 
     def __init__(
         self,
@@ -90,31 +88,34 @@ class PCHBMPseudoTrainer:
         self.model = model
         self.cfg = cfg
         self.pc_cfg = pc_cfg
-        self.training_design = str(getattr(cfg, "pc_training_design", "teacher_only"))
-        if self.training_design not in {"teacher_only", "joint"}:
-            raise ValueError(f"Unsupported PC-HBM training design: {self.training_design}")
-        self.distributed = bool(getattr(cfg, "distributed", False))
+        self.training_design = str(
+            getattr(cfg, "pc_training_design", "teacher_only")
+        )
+        if self.training_design != "teacher_only":
+            raise ValueError("PC-HBM-Lite TS supports only teacher_only")
+        configure = getattr(pc_cfg, "configure_training_design", None)
+        if not callable(configure):
+            raise RuntimeError("pc_cfg.configure_training_design() is required")
+        configure("teacher_only")
+
         self.device = torch.device(cfg.device)
+        self.distributed = bool(getattr(cfg, "distributed", False))
         self.core_model = unwrap_model(model)
         self._validate_model_contract()
-        # Captured after any resume state has been restored. Until then the
-        # constructor's Teacher is not necessarily the epoch being resumed.
-        self._teacher_pc_fingerprint = None
-
-        # The published TS protocol fixes both physical batches at 32.  DDP
-        # partitions data across ranks but does not change the per-rank batch.
         if int(cfg.l_batch_size) != 32 or int(cfg.u_batch_size) != 32:
-            raise ValueError("PC-HBM TS requires physical labeled/unlabeled batches of 32")
+            raise ValueError(
+                "PC-HBM-Lite TS requires labeled and unlabeled batches of 32"
+            )
 
-        student_parameters = [
+        parameters = [
             parameter
             for parameter in self.core_model.student.parameters()
             if parameter.requires_grad
         ]
-        if not student_parameters:
-            raise RuntimeError("PC-HBM Student has no trainable parameters")
+        if not parameters:
+            raise RuntimeError("Raw Student has no trainable parameters")
         self.optimizer = optim.Adam(
-            student_parameters,
+            parameters,
             lr=float(cfg.learning_rate),
             weight_decay=float(cfg.weight_decay),
         )
@@ -126,14 +127,21 @@ class PCHBMPseudoTrainer:
         self.amp_enabled = bool(
             getattr(pc_cfg, "use_amp", True) and self.device.type == "cuda"
         )
-        self.scaler = torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
+        self.scaler = torch.amp.GradScaler(
+            "cuda", enabled=self.amp_enabled
+        )
 
+        indices_path = getattr(cfg, "train_labeled_indices_pt", None)
+        if not indices_path:
+            raise ValueError(
+                "teacher_only TS requires train_labeled_indices_pt"
+            )
         self.labeled_train_set = PCLabeledTrainDataset(
             l_image_root=cfg.train_imgs,
             l_gt_root=cfg.train_masks,
             l_txt_root=cfg.train_sample_txt,
             l_train_size=cfg.l_train_size,
-            labeled_indices_pt=cfg.train_labeled_indices_pt,
+            labeled_indices_pt=indices_path,
             rVFlip=True,
             rCrop=True,
             rRotate=False,
@@ -144,15 +152,19 @@ class PCHBMPseudoTrainer:
             u_image_root=cfg.train_imgs,
             sampled_txt=cfg.train_sample_txt,
             u_train_size=cfg.u_train_size,
-            labeled_indices_pt=cfg.train_labeled_indices_pt,
+            labeled_indices_pt=indices_path,
         )
-        if len(self.labeled_train_set) < int(cfg.l_batch_size):
-            raise ValueError("Labeled set is smaller than the fixed PC-HBM batch of 32")
-        if len(self.unlabeled_train_set) < int(cfg.u_batch_size):
-            raise ValueError("Unlabeled set is smaller than the fixed PC-HBM batch of 32")
+        if len(self.labeled_train_set) < 32:
+            raise ValueError("Labeled split is smaller than batch size 32")
+        if len(self.unlabeled_train_set) < 32:
+            raise ValueError("Unlabeled split is smaller than batch size 32")
 
-        self.labeled_sampler = self._distributed_sampler(self.labeled_train_set)
-        self.unlabeled_sampler = self._distributed_sampler(self.unlabeled_train_set)
+        self.labeled_sampler = self._distributed_sampler(
+            self.labeled_train_set
+        )
+        self.unlabeled_sampler = self._distributed_sampler(
+            self.unlabeled_train_set
+        )
         loader_kwargs = {
             "num_workers": int(cfg.num_workers),
             "pin_memory": bool(cfg.CUDA),
@@ -173,151 +185,121 @@ class PCHBMPseudoTrainer:
             sampler=self.unlabeled_sampler,
             **loader_kwargs,
         )
-        if len(self.labeled_train_dl) == 0 or len(self.unlabeled_train_dl) == 0:
-            raise RuntimeError("PC-HBM TS loaders must each contain at least one full batch")
-
         self.memory_loader = build_labeled_memory_loader(
             l_image_root=cfg.train_imgs,
             l_gt_root=cfg.train_masks,
             l_txt_root=cfg.train_sample_txt,
             l_train_size=cfg.l_train_size,
-            labeled_indices_pt=cfg.train_labeled_indices_pt,
+            labeled_indices_pt=indices_path,
             batch_size=int(getattr(cfg, "memory_batch_size", 16)),
-            num_workers=int(getattr(cfg, "memory_num_workers", cfg.num_workers)),
+            num_workers=int(
+                getattr(cfg, "memory_num_workers", cfg.num_workers)
+            ),
             pin_memory=bool(cfg.CUDA),
         )
-        self.memory = memory or PCMemory(
-            memory_dim=int(pc_cfg.memory_dim),
-            value_dim=int(pc_cfg.value_dim),
-            geometry_dim=int(pc_cfg.geometry_dim),
-            storage_dtype=torch.float16,
-            config=pc_cfg,
-        )
+        self.memory = memory or PCMemory(config=pc_cfg)
 
         split_fingerprint = compute_labeled_split_fingerprint(
             self.labeled_train_set.sample_keys
         )
-        self.cfg.labeled_split_fingerprint = split_fingerprint
-        teacher_checkpoint = getattr(self.cfg, "teacher_pc_checkpoint", None)
-        if self.training_design == "teacher_only" and teacher_checkpoint:
-            # The TS protocol stays teacher-only.  Its frozen Teacher enhancer
-            # may come from either supported Base warm-up protocol.
-            teacher_metadata = validate_teacher_enhancer_checkpoint(
-                teacher_checkpoint, split_fingerprint
+        indices_fingerprint = validate_canonical_labeled_indices_pt(
+            indices_path
+        )
+        if len(self.labeled_train_set.sample_keys) != (
+            CANONICAL_LABELED_SPLIT_COUNT
+        ):
+            raise RuntimeError(
+                "TS labeled loader must contain exactly "
+                f"{CANONICAL_LABELED_SPLIT_COUNT} samples"
             )
-        else:
-            teacher_metadata = read_artifact_metadata(teacher_checkpoint) if teacher_checkpoint else None
-        if teacher_metadata is not None:
-            self.cfg.baseline_fingerprint = teacher_metadata["baseline_fingerprint"]
-        else:
-            self.cfg.baseline_fingerprint = state_dict_fingerprint(
-                {
-                    name: value
-                    for name, value in self.core_model.teacher.state_dict().items()
-                    if not name.startswith("pc_hbm.")
-                }
+        if split_fingerprint != indices_fingerprint:
+            raise RuntimeError(
+                "Labeled dataset and indices file fingerprints differ"
             )
-        student_checkpoint = getattr(self.cfg, "student_checkpoint", None)
-        if self.training_design == "teacher_only" and student_checkpoint:
+        validate_canonical_labeled_split_fingerprint(split_fingerprint)
+        prevalidated_split = getattr(
+            cfg, "labeled_split_fingerprint", split_fingerprint
+        )
+        if str(prevalidated_split) != split_fingerprint:
+            raise RuntimeError(
+                "CLI-prevalidated and dataset labeled split fingerprints differ"
+            )
+        cfg.labeled_split_fingerprint = split_fingerprint
+
+        teacher_checkpoint = getattr(cfg, "teacher_pc_checkpoint", None)
+        if not teacher_checkpoint:
+            raise ValueError("teacher_pc_checkpoint is required")
+        teacher_metadata = validate_teacher_enhancer_checkpoint(
+            teacher_checkpoint,
+            split_fingerprint,
+        )
+        cfg.baseline_fingerprint = teacher_metadata[
+            "baseline_fingerprint"
+        ]
+        teacher_legacy_state = {
+            name: value
+            for name, value in self.core_model.teacher.state_dict().items()
+            if not name.startswith("pc_hbm.")
+        }
+        if state_dict_fingerprint(teacher_legacy_state) != str(
+            cfg.baseline_fingerprint
+        ):
+            raise RuntimeError(
+                "Teacher artifact metadata does not match its legacy Decoder state"
+            )
+        student_checkpoint = getattr(cfg, "student_checkpoint", None)
+        if student_checkpoint:
             validate_artifact_metadata(
                 student_checkpoint,
                 {
                     "training_design": "teacher_only",
                     "artifact_role": "student_raw",
                     "labeled_split_fingerprint": split_fingerprint,
-                    "baseline_fingerprint": self.cfg.baseline_fingerprint,
+                    "baseline_fingerprint": cfg.baseline_fingerprint,
                     "pc_frozen": True,
                 },
             )
+        raw_state = {
+            name: value
+            for name, value in self.core_model.student.state_dict().items()
+            if not name.startswith("pc_hbm.")
+        }
+        if state_dict_fingerprint(raw_state) != str(
+            cfg.baseline_fingerprint
+        ):
+            raise RuntimeError(
+                "Raw Student baseline does not match the Teacher artifact"
+            )
 
-        self.current_epoch = 1
         self.save_dir = Path(cfg.save_dir)
         if is_main_process():
             self.save_dir.mkdir(parents=True, exist_ok=True)
         synchronize()
-        if resume_path:
-            checkpoint = load_training_resume(
-                resume_path,
-                model=self.core_model.student,
-                optimizer=self.optimizer,
-                scheduler=self.scheduler,
-                scaler=self.scaler,
-                ema_model=self.core_model.teacher,
-                restore_rng=True,
-                expected_artifact_meta=self._artifact_metadata("resume"),
-            )
-            self._validate_resume_config(checkpoint.get("pc_cfg"))
-            self.current_epoch = int(checkpoint["epoch"]) + 1
+        self.current_epoch = 1
+        if resume_path is not None:
+            self._resume(resume_path)
         self._freeze_teacher()
-        self._capture_teacher_pc_fingerprint()
+        self._teacher_pc_fingerprint = module_fingerprint(
+            self.core_model.teacher.pc_hbm
+        )
 
     def _validate_model_contract(self):
-        if getattr(self.core_model, "pc_cfg", None) is None:
-            raise ValueError("TSModel must be constructed with DinoPCHBMConfig")
-        if getattr(self.core_model.teacher, "pc_hbm", None) is None:
-            raise ValueError("Teacher Decoder has no PC-HBM engine")
-        student_keys = tuple(dict(self.core_model.student.named_parameters()))
-        teacher_keys = tuple(dict(self.core_model.teacher.named_parameters()))
-        if self.training_design == "joint":
-            if getattr(self.core_model.student, "pc_hbm", None) is None:
-                raise ValueError("Joint Student Decoder has no PC-HBM engine")
-            if student_keys != teacher_keys:
-                raise RuntimeError("Teacher and Student parameter names/order do not match")
-        else:
-            if getattr(self.core_model.student, "pc_hbm", None) is not None:
-                raise ValueError("teacher_only Student must not instantiate PC-HBM")
-            teacher_shared = tuple(key for key in teacher_keys if not key.startswith("pc_hbm."))
-            if student_keys != teacher_shared:
-                raise RuntimeError("Raw Student keys do not match the Teacher legacy keys")
-        self._freeze_teacher()
-
-    def _validate_resume_config(self, saved_config):
-        """Reject resumes produced with a different PC-HBM contract."""
-
-        if saved_config is None:
-            raise RuntimeError("PC-HBM TS resume checkpoint has no pc_cfg")
-        current = (
-            asdict(self.pc_cfg)
-            if is_dataclass(self.pc_cfg)
-            else dict(vars(self.pc_cfg))
-        )
-        saved = dict(saved_config)
-        if saved != current:
-            differing = sorted(
-                key
-                for key in set(saved) | set(current)
-                if saved.get(key) != current.get(key)
-            )
-            raise RuntimeError(
-                f"TS resume PC-HBM config differs for keys: {differing}"
-            )
+        if getattr(self.core_model, "training_design", None) != "teacher_only":
+            raise RuntimeError("TSModel must use teacher_only")
+        teacher_pc = getattr(self.core_model.teacher, "pc_hbm", None)
+        if teacher_pc is None:
+            raise RuntimeError("Teacher must contain PC-HBM-Lite")
+        if getattr(self.core_model.student, "pc_hbm", None) is not None:
+            raise RuntimeError("Student must be the raw legacy Decoder")
 
     def _freeze_teacher(self):
-        self.core_model.teacher.eval()
-        self.core_model.teacher.requires_grad_(False)
-
-    def _capture_teacher_pc_fingerprint(self):
-        """Capture the post-resume PC baseline required by teacher-only TS."""
-
-        # Teacher-only keeps the enhancer immutable and updates only shared
-        # legacy weights by EMA. Joint deliberately EMA-updates the complete
-        # Teacher, including ``pc_hbm.*``, so it has no fixed PC fingerprint.
-        self._teacher_pc_fingerprint = (
-            module_fingerprint(self.core_model.teacher.pc_hbm)
-            if self.training_design == "teacher_only"
-            else None
-        )
+        self.core_model.teacher.requires_grad_(False).eval()
 
     def _validate_teacher_pc_contract(self):
-        """Enforce PC immutability only for the teacher-only protocol."""
-
-        if self.training_design != "teacher_only":
-            return
-        if self._teacher_pc_fingerprint is None:
-            raise RuntimeError("Teacher-only PC-HBM fingerprint was not initialized")
-        if module_fingerprint(self.core_model.teacher.pc_hbm) != self._teacher_pc_fingerprint:
+        current = module_fingerprint(self.core_model.teacher.pc_hbm)
+        if current != self._teacher_pc_fingerprint:
             raise RuntimeError(
-                "Frozen Teacher PC-HBM parameters or buffers changed during teacher-only TS"
+                "Teacher PC-HBM-Lite parameters changed during TS training"
             )
 
     def _distributed_sampler(self, dataset):
@@ -325,10 +307,7 @@ class PCHBMPseudoTrainer:
             return None
         return DistributedSampler(
             dataset,
-            num_replicas=int(self.cfg.world_size),
-            rank=int(self.cfg.rank),
             shuffle=True,
-            seed=int(self.cfg.seed),
             drop_last=True,
         )
 
@@ -337,12 +316,6 @@ class PCHBMPseudoTrainer:
         while True:
             yield from loader
 
-    def _decoder_epoch(self, ts_epoch: int) -> int:
-        """Continue after Base epoch 30 so mixture uses its terminal schedule."""
-
-        base_end = int(getattr(self.pc_cfg, "mixture_schedule_end_epoch", 30))
-        return base_end + int(ts_epoch)
-
     def _autocast(self):
         return torch.autocast(
             device_type=self.device.type,
@@ -350,15 +323,14 @@ class PCHBMPseudoTrainer:
             enabled=self.amp_enabled,
         )
 
-    def _rebuild_memory(self, producer, *, producer_source: str):
+    def _rebuild_memory(self):
         compat_meta = build_memory_compat_meta(
             self.pc_cfg,
-            producer,
-            producer_source=producer_source,
+            self.core_model.teacher,
         )
         rebuild_memory(
             model=self.core_model,
-            memory_decoder=producer,
+            memory_decoder=self.core_model.teacher,
             memory_loader=self.memory_loader,
             memory=self.memory,
             device=self.device,
@@ -367,282 +339,207 @@ class PCHBMPseudoTrainer:
             use_amp=self.amp_enabled,
         )
         if not self.memory.is_ready():
-            raise RuntimeError("PC-HBM training cannot continue with unready memory")
+            raise RuntimeError("Teacher memory rebuild produced an unready memory")
+        compatibility = self.memory.validate_compat(
+            compat_meta,
+            require_producer_match=True,
+        )
+        compatible = (
+            bool(compatibility[0])
+            if isinstance(compatibility, tuple)
+            else bool(compatibility)
+        )
+        if not compatible:
+            raise RuntimeError("Teacher memory is incompatible after rebuild")
         synchronize()
-        return compat_meta
 
     @staticmethod
     def _clone_teacher_target_aux(
         aux: Mapping[str, Any],
-        *,
-        training_design: str = "teacher_only",
     ) -> dict[str, Any]:
-        """Keep required pseudo targets and clone them outside inference mode."""
-
-        if training_design not in {"teacher_only", "joint"}:
-            raise ValueError(f"Unsupported PC-HBM training design: {training_design}")
-
-        pc = aux.get("pc_hbm", {}) or {}
-        mixture = aux.get("mixture", {}) or {}
-        distill_features = aux.get("distill_features", {}) or {}
-
-        def clone_tensor(value, name):
-            if not torch.is_tensor(value):
-                raise KeyError(f"Teacher pseudo aux is missing {name}")
-            cloned = value.detach().clone()
-            if cloned.is_inference():
-                raise RuntimeError(f"Teacher target {name} remained an inference tensor")
-            return cloned
-
-        cloned_distill_features = {
-            "p3_corr": clone_tensor(
-                distill_features.get("p3_corr"), "distill_features.p3_corr"
-            ),
-            "p2_refined": clone_tensor(
-                distill_features.get("p2_refined"), "distill_features.p2_refined"
-            ),
+        pc = aux.get("pc_hbm")
+        distill = aux.get("distill_features")
+        if not isinstance(pc, Mapping) or not isinstance(distill, Mapping):
+            raise KeyError("Teacher Lite aux mappings are incomplete")
+        required = {
+            "p_final": aux.get("p_final"),
+            "query_mask_map": pc.get("query_mask_map"),
+            "memory_confidence_map": pc.get("memory_confidence_map"),
+            "p3_corr": distill.get("p3_corr"),
         }
-        if training_design == "joint":
-            p1 = aux.get("p1_pra", {}) or {}
-            cloned_distill_features["p1"] = {
-                name: clone_tensor(p1.get(name), f"p1_pra.{name}")
-                for name in (
-                    "B1",
-                    "G1_raw_map",
-                    "R1_map",
-                    "O1_map",
-                    "R_sup_map",
-                    "valid1_map",
-                )
-            }
-
+        missing = [
+            name for name, value in required.items() if not torch.is_tensor(value)
+        ]
+        if missing:
+            raise KeyError(f"Teacher targets are missing tensors: {missing}")
         return {
-            "p_final": clone_tensor(aux.get("p_final"), "p_final"),
-            "z_main": clone_tensor(aux.get("z_main"), "z_main"),
+            "p_final": required["p_final"].detach().clone(),
+            "pc_active": True,
+            "fallback_reason": None,
+            "forward_mode": "teacher_pseudo",
             "pc_hbm": {
-                "C23_map": clone_tensor(pc.get("C23_map"), "pc_hbm.C23_map"),
-                "route_entropy_norm": clone_tensor(
-                    pc.get("route_entropy_norm"), "pc_hbm.route_entropy_norm"
-                ),
+                "query_mask_map": required["query_mask_map"].detach().clone(),
+                "memory_confidence_map": required[
+                    "memory_confidence_map"
+                ].detach().clone(),
             },
-            "mixture": {"pi": clone_tensor(mixture.get("pi"), "mixture.pi")},
-            "distill_features": cloned_distill_features,
+            "distill_features": {
+                "p3_corr": required["p3_corr"].detach().clone(),
+            },
         }
 
     def train_epoch(self):
         epoch = int(self.current_epoch)
-        decoder_epoch = self._decoder_epoch(epoch)
         self.model.train()
         self._freeze_teacher()
         if self.labeled_sampler is not None:
             self.labeled_sampler.set_epoch(epoch)
         if self.unlabeled_sampler is not None:
             self.unlabeled_sampler.set_epoch(epoch)
+        self._rebuild_memory()
 
-        # Every rank independently traverses the complete deterministic labeled
-        # loader.  The resulting CPU-FP16 memory remains read-only this epoch.
-        self._rebuild_memory(self.core_model.teacher, producer_source="ema_teacher")
         labeled_iter = self._cycle_loader(self.labeled_train_dl)
-        totals = {
+        totals: dict[str, float] = {
             "loss": 0.0,
             "labeled": 0.0,
             "unlabeled": 0.0,
-            "L_u_hard": 0.0,
-            "L_u_hard_weighted": 0.0,
-            "hard_valid_ratio": 0.0,
-            "hard_ramp": 0.0,
             "confidence": 0.0,
-            "confidence_max": 0.0,
-            "confidence_positive_fraction": 0.0,
-            "confidence_positive_count": 0.0,
-            "L_u_feat_p1_B1": 0.0,
-            "L_u_feat_p1_G1": 0.0,
-            "L_u_feat_p1_R1": 0.0,
-            "L_u_feat_p1_O1": 0.0,
-            "L_u_feat_p1_R_sup": 0.0,
-            "L_u_feat_p1": 0.0,
+            "coverage": 0.0,
+            "p3_distill": 0.0,
         }
+        totals.update({name: 0.0 for name in DIAGNOSTIC_NAMES})
         steps = 0
-
         progress = tqdm(
             self.unlabeled_train_dl,
             disable=not is_main_process(),
-            desc=f"TS PC-HBM epoch {epoch}",
+            desc=f"TS PC-HBM-Lite epoch {epoch}",
         )
-        for u_imgs in progress:
-            _, l_imgs, l_gt, l_image_ids = next(labeled_iter)
-            l_imgs = l_imgs.to(self.device, non_blocking=bool(self.cfg.CUDA))
-            l_gt = l_gt.to(self.device, non_blocking=bool(self.cfg.CUDA))
-            u_imgs = u_imgs.to(self.device, non_blocking=bool(self.cfg.CUDA))
+        for unlabeled_images in progress:
+            _, labeled_images, labeled_gt, _ = next(labeled_iter)
+            labeled_images = labeled_images.to(
+                self.device, non_blocking=bool(self.cfg.CUDA)
+            )
+            labeled_gt = labeled_gt.to(
+                self.device, non_blocking=bool(self.cfg.CUDA)
+            )
+            unlabeled_images = unlabeled_images.to(
+                self.device, non_blocking=bool(self.cfg.CUDA)
+            )
             self.optimizer.zero_grad(set_to_none=True)
 
-            # 1) Labeled Student uses the untouched raw/off path in teacher-only mode.
             with self._autocast():
-                l_features = self.core_model.extract_features(l_imgs)
-                l_outputs, l_aux = self.model(
+                labeled_features = self.core_model.extract_features(
+                    labeled_images
+                )
+                labeled_outputs, _ = self.model(
                     branch="student_labeled",
-                    features=l_features,
-                    memory=self.memory,
-                    epoch=decoder_epoch,
-                    query_image_ids=list(l_image_ids),
+                    features=labeled_features,
                 )
-                if self.training_design == "teacher_only":
-                    l_loss = base_structure_loss(l_outputs, l_gt)
-                    l_log = {"L_base": l_loss.detach()}
-                else:
-                    l_loss, l_log = pc_hbm_labeled_loss(
-                        l_outputs,
-                        l_aux,
-                        l_gt,
-                        decoder_epoch,
-                        self.pc_cfg,
-                        pc_mode="full",
-                        strict=True,
-                    )
-            self.scaler.scale(l_loss).backward()
-            l_loss_value = float(l_loss.detach())
-            del l_features, l_outputs, l_aux, l_gt, l_imgs, l_image_ids, l_loss, l_log
+                labeled_loss = base_structure_loss(
+                    labeled_outputs, labeled_gt
+                )
 
-            # 2) Unlabeled DINO features, read-only Teacher full inference, and
-            # cloning to ordinary tensors only after leaving inference_mode.
-            with self._autocast():
-                u_features = self.core_model.extract_features(u_imgs)
-            with torch.inference_mode():
-                with self._autocast():
-                    teacher_aux = self.core_model.teacher_pseudo(
-                        u_features,
-                        self.memory,
-                        decoder_epoch,
-                    )
-            teacher_target_aux = self._clone_teacher_target_aux(
-                teacher_aux,
-                training_design=self.training_design,
-            )
-            del teacher_aux
+                unlabeled_features = self.core_model.extract_features(
+                    unlabeled_images
+                )
+            with torch.inference_mode(), self._autocast():
+                teacher_aux = self.core_model.teacher_pseudo(
+                    unlabeled_features,
+                    self.memory,
+                    epoch,
+                )
+            cloned_aux = self._clone_teacher_target_aux(teacher_aux)
             pseudo = prepare_pseudo_targets(
-                teacher_target_aux,
-                self.pc_cfg,
-                strict=True,
+                cloned_aux,
             )
-            del teacher_target_aux
-
-            # 3) Joint Student core executes P1-PRA for distillation but still
-            # skips mixture.  This second backward is synchronized normally;
-            # no DDP no_sync is used.
+            diagnostics = collect_pc_diagnostics(
+                teacher_aux,
+                pseudo_confidence=pseudo["confidence"],
+            )
             with self._autocast():
-                u_outputs, u_aux = self.model(
+                student_outputs, student_aux = self.model(
                     branch="student_unlabeled",
-                    features=u_features,
-                    memory=self.memory,
-                    epoch=decoder_epoch,
+                    features=unlabeled_features,
                 )
-                u_loss, u_log = pc_unlabeled_loss(
-                    u_outputs,
-                    u_aux,
+                unlabeled_loss, unlabeled_log = pc_unlabeled_loss(
+                    student_outputs,
+                    student_aux,
                     pseudo["p_soft"],
                     pseudo["confidence"],
-                    epoch,
                     self.pc_cfg,
-                    teacher_features=pseudo.get("distill_features"),
+                    teacher_features={"p3_corr": pseudo["p3_corr"]},
                 )
-            self.scaler.scale(u_loss).backward()
-
-            # 4) Exactly one optimizer step, followed by exact-name EMA and
-            # buffer copy. The Teacher is gradient-frozen; joint updates its
-            # complete state by EMA, while teacher-only leaves PC-HBM intact.
+                total_loss = labeled_loss + unlabeled_loss
+            if not bool(torch.isfinite(total_loss.detach())):
+                raise FloatingPointError(
+                    f"Non-finite TS loss at epoch={epoch}, step={steps + 1}"
+                )
+            self.scaler.scale(total_loss).backward()
             self.scaler.unscale_(self.optimizer)
             clip_grad_norm_(
                 self.core_model.student.parameters(),
-                max_norm=float(getattr(self.pc_cfg, "grad_clip_norm", 5.0)),
+                float(getattr(self.pc_cfg, "grad_clip_norm", 5.0)),
             )
             self.scaler.step(self.optimizer)
             self.scaler.update()
             with torch.no_grad():
-                update_ema_module(
-                    self.core_model.student,
-                    self.core_model.teacher,
-                    momentum=float(getattr(self.pc_cfg, "ema_momentum", 0.995)),
-                    shared_only=self.training_design == "teacher_only",
-                    exclude_prefixes=("pc_hbm.",) if self.training_design == "teacher_only" else (),
+                self.core_model.update_teacher(
+                    momentum=float(
+                        getattr(self.pc_cfg, "ema_momentum", 0.995)
+                    ),
                 )
+            self._validate_teacher_pc_contract()
 
-            u_loss_value = float(u_loss.detach())
-            confidence_value = float(u_log["pseudo_conf_mean"])
-            total_value = l_loss_value + u_loss_value
-            totals["loss"] += total_value
-            totals["labeled"] += l_loss_value
-            totals["unlabeled"] += u_loss_value
-            totals["L_u_hard"] += float(u_log["L_u_hard"])
-            totals["L_u_hard_weighted"] += float(u_log["L_u_hard_weighted"])
-            totals["hard_valid_ratio"] += float(u_log["hard_valid_ratio"])
-            totals["hard_ramp"] += float(u_log["hard_ramp"])
-            totals["confidence"] += confidence_value
-            totals["confidence_max"] += float(u_log.get("pseudo_conf_max", 0.0))
-            totals["confidence_positive_fraction"] += float(
-                u_log.get("pseudo_conf_positive_fraction", 0.0)
+            totals["loss"] += float(total_loss.detach())
+            totals["labeled"] += float(labeled_loss.detach())
+            totals["unlabeled"] += float(unlabeled_loss.detach())
+            totals["confidence"] += float(
+                unlabeled_log["pseudo_conf_mean"]
             )
-            totals["confidence_positive_count"] += float(
-                u_log.get("pseudo_conf_positive_count", 0.0)
+            totals["coverage"] += float(
+                unlabeled_log["pseudo_coverage"]
             )
-            for name in (
-                "L_u_feat_p1_B1",
-                "L_u_feat_p1_G1",
-                "L_u_feat_p1_R1",
-                "L_u_feat_p1_O1",
-                "L_u_feat_p1_R_sup",
-                "L_u_feat_p1",
-            ):
-                totals[name] += float(u_log.get(name, 0.0))
+            totals["p3_distill"] += float(
+                unlabeled_log["L_u_feat_p3"]
+            )
+            for name in DIAGNOSTIC_NAMES:
+                totals[name] += float(diagnostics[name])
             steps += 1
-            progress.set_postfix(
-                loss=f"{total_value:.4f}",
-                conf=f"{confidence_value:.3e}",
-                hard=f"{float(u_log['L_u_hard']):.3e}",
-                p1=f"{float(u_log.get('L_u_feat_p1', 0.0)):.3e}",
-            )
-            del u_features, u_outputs, u_aux, pseudo, u_imgs, u_loss, u_log
 
         if steps == 0:
-            raise RuntimeError("PC-HBM TS epoch completed without optimizer steps")
-        self._validate_teacher_pc_contract()
-        means = {
+            raise RuntimeError("Unlabeled loader produced no full batches")
+        metrics = {
             name: reduce_mean(value / steps, self.device)
             for name, value in totals.items()
         }
-        return means
+        self.scheduler.step()
+        self.current_epoch += 1
+        return metrics
 
     def _artifact_metadata(self, artifact_role: str) -> dict[str, Any]:
         return build_artifact_metadata(
-            training_design=self.training_design,
-            artifact_role=str(artifact_role),
-            labeled_split_fingerprint=str(self.cfg.labeled_split_fingerprint),
+            training_design="teacher_only",
+            artifact_role=artifact_role,
+            labeled_split_fingerprint=str(
+                self.cfg.labeled_split_fingerprint
+            ),
             baseline_fingerprint=str(self.cfg.baseline_fingerprint),
-            pc_frozen=self.training_design == "teacher_only",
+            pc_frozen=True,
         )
 
     def _save_epoch(self, epoch: int, metrics: Mapping[str, float]):
         if not is_main_process():
             return
         save_decoder_checkpoint(
-            self.save_dir
-            / (
-                f"student_raw_epoch_{epoch}.pth"
-                if self.training_design == "teacher_only"
-                else f"ts_pc_hbm_student_epoch_{epoch}.pth"
-            ),
+            self.save_dir / f"student_raw_epoch_{epoch}.pth",
             self.core_model.student,
             self.pc_cfg,
             epoch,
-            artifact_meta=self._artifact_metadata(
-                "student_raw" if self.training_design == "teacher_only" else "student_joint"
-            ),
-            extra={
-                "metrics": dict(metrics),
-                "producer": "student_raw" if self.training_design == "teacher_only" else "student",
-            },
+            artifact_meta=self._artifact_metadata("student_raw"),
+            extra={"metrics": dict(metrics), "producer": "student_raw"},
         )
         save_training_resume(
-            self.save_dir / "ts_pc_hbm_resume_latest.pth",
+            self.save_dir / "ts_pc_hbm_lite_resume_latest.pth",
             epoch=epoch,
             model=self.core_model.student,
             optimizer=self.optimizer,
@@ -651,89 +548,79 @@ class PCHBMPseudoTrainer:
             ema_model=self.core_model.teacher,
             pc_cfg=self.pc_cfg,
             artifact_meta=self._artifact_metadata("resume"),
-            extra={
-                "metrics": dict(metrics),
+            extra={"metrics": dict(metrics)},
+        )
+
+    def _resume(self, path):
+        checkpoint = torch.load(
+            path, map_location="cpu", weights_only=False
+        )
+        if not isinstance(checkpoint, Mapping):
+            raise TypeError("TS resume checkpoint must be a mapping")
+        saved_config = checkpoint.get("pc_cfg")
+        current_config = vars(self.pc_cfg)
+        if not isinstance(saved_config, Mapping) or dict(saved_config) != dict(
+            current_config
+        ):
+            raise RuntimeError("TS resume PC-HBM-Lite config mismatch")
+        validate_artifact_metadata(
+            checkpoint,
+            {
+                "training_design": "teacher_only",
+                "artifact_role": "resume",
+                "labeled_split_fingerprint": self.cfg.labeled_split_fingerprint,
+                "baseline_fingerprint": self.cfg.baseline_fingerprint,
+                "pc_frozen": True,
             },
         )
-
-    def _export_final_memory(self):
-        if self.training_design == "teacher_only":
-            if is_main_process():
-                save_decoder_checkpoint(
-                    self.save_dir / "student_raw.pth",
-                    self.core_model.student,
-                    self.pc_cfg,
-                    int(self.cfg.epochs),
-                    artifact_meta=self._artifact_metadata("student_raw"),
-                    extra={
-                        "producer": "student_raw_final",
-                    },
-                )
-            return
-        # Final inference artifacts must have a memory produced by the final
-        # Student, not the preceding epoch's EMA Teacher snapshot.
-        compat_meta = self._rebuild_memory(
-            self.core_model.student,
-            producer_source="student_final",
+        completed = int(checkpoint.get("epoch", 0))
+        if completed < 1 or completed > int(self.cfg.epochs):
+            raise RuntimeError(f"Invalid TS resume epoch: {completed}")
+        load_training_resume(
+            checkpoint,
+            model=self.core_model.student,
+            optimizer=self.optimizer,
+            scheduler=self.scheduler,
+            scaler=self.scaler,
+            ema_model=self.core_model.teacher,
+            restore_rng=True,
         )
-        if is_main_process():
-            save_decoder_checkpoint(
-                self.save_dir / "ts_pc_hbm_student_final.pth",
-                self.core_model.student,
-                self.pc_cfg,
-                int(self.cfg.epochs),
-                artifact_meta=self._artifact_metadata("student_joint"),
-                extra={"producer": "student_final"},
-            )
-            save_memory_checkpoint(
-                self.save_dir / "ts_pc_hbm_memory_final.pth",
-                self.memory,
-                compat_meta=compat_meta,
-                artifact_meta=self._artifact_metadata("student_memory"),
-            )
+        self.current_epoch = completed + 1
+
+    def _export_final_student(self):
+        if not is_main_process():
+            return
+        save_decoder_checkpoint(
+            self.save_dir / "student_raw.pth",
+            self.core_model.student,
+            self.pc_cfg,
+            int(self.cfg.epochs),
+            artifact_meta=self._artifact_metadata("student_raw"),
+            extra={"producer": "student_raw_final"},
+        )
 
     def train(self):
-        if self.current_epoch > int(self.cfg.epochs):
-            raise ValueError(
-                f"Resume epoch {self.current_epoch} exceeds configured epochs {self.cfg.epochs}"
-            )
-        for epoch in range(self.current_epoch, int(self.cfg.epochs) + 1):
-            self.current_epoch = epoch
-            if is_main_process():
-                print(
-                    f">>> TS PC-HBM epoch {epoch}/{self.cfg.epochs}: "
-                    f"start_time={_current_local_timestamp()}",
-                    flush=True,
-                )
+        if is_main_process():
+            print(f"{current_time()} >>> TS PC-HBM-Lite training starts")
+        while self.current_epoch <= int(self.cfg.epochs):
+            epoch = self.current_epoch
             metrics = self.train_epoch()
-            self.scheduler.step()
             self._save_epoch(epoch, metrics)
             if is_main_process():
-                lr = self.optimizer.param_groups[0]["lr"]
                 print(
-                    f">>> TS PC-HBM epoch {epoch}/{self.cfg.epochs}: "
-                    f"loss={metrics['loss']:.6f}, confidence={metrics['confidence']:.3e}, "
-                    f"L_u_hard={metrics.get('L_u_hard', 0.0):.6f}, "
-                    f"L_u_feat_p1={metrics.get('L_u_feat_p1', 0.0):.6f}, "
-                    f"P1_B1={metrics.get('L_u_feat_p1_B1', 0.0):.3e}, "
-                    f"P1_G1={metrics.get('L_u_feat_p1_G1', 0.0):.3e}, "
-                    f"P1_R1={metrics.get('L_u_feat_p1_R1', 0.0):.3e}, "
-                    f"P1_O1={metrics.get('L_u_feat_p1_O1', 0.0):.3e}, "
-                    f"P1_R_sup={metrics.get('L_u_feat_p1_R_sup', 0.0):.3e}, "
-                    f"hard_valid={metrics.get('hard_valid_ratio', 0.0):.3%}, "
-                    f"hard_ramp={metrics.get('hard_ramp', 0.0):.3f}, "
-                    f"confidence_max={metrics['confidence_max']:.3e}, "
-                    f"confidence_positive={metrics['confidence_positive_fraction']:.3%}, "
-                    f"lr={lr:.3e}, end_time={_current_local_timestamp()}",
-                    flush=True,
+                    f"{current_time()} [TS PC-HBM-Lite] epoch={epoch} "
+                    + " ".join(
+                        f"{name}={value:.6f}"
+                        for name, value in sorted(metrics.items())
+                    )
                 )
             synchronize()
-        self._export_final_memory()
-        synchronize()
+        self._export_final_student()
+        if is_main_process():
+            print(f"{current_time()} <<< TS PC-HBM-Lite training finished")
 
 
-# Concise compatibility name for callers that follow the existing trainer API.
-Trainer = PCHBMPseudoTrainer
-
-
-__all__ = ["PCHBMPseudoTrainer", "Trainer"]
+__all__ = [
+    "PCHBMPseudoTrainer",
+    "validate_teacher_enhancer_checkpoint",
+]

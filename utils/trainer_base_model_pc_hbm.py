@@ -35,20 +35,21 @@ from Model.PC_HBM.training.losses import pc_hbm_pc_only_labeled_loss
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from utils.checkpoint_pc_hbm import (
     build_artifact_metadata,
+    CANONICAL_LABELED_SPLIT_COUNT,
     compute_labeled_split_fingerprint,
-    compute_labeled_split_fingerprint_from_indices_pt,
     load_training_resume,
     read_artifact_metadata,
     save_decoder_checkpoint,
     save_memory_checkpoint,
     save_training_resume,
     state_dict_fingerprint,
+    validate_canonical_labeled_indices_pt,
+    validate_canonical_labeled_split_fingerprint,
 )
-from utils.dataloader import PCLabeledTrainDataset
+from utils.dataloader import PCLabeledTrainDataset, build_labeled_memory_loader
 from utils.distributed import is_main_process, reduce_mean, synchronize, unwrap_model
 from utils.logging_utils import current_time
 from utils.pc_memory_runner import (
-    build_labeled_memory_loader,
     build_memory_compat_meta,
     rebuild_memory,
 )
@@ -123,18 +124,17 @@ class BasePCHBMTrainer:
         self.cfg = cfg
         self.pc_cfg = pc_cfg or getattr(cfg, "pc_hbm", None) or DinoPCHBMConfig()
         self.training_design = str(
-            training_design or getattr(cfg, "training_design", "joint")
+            training_design or getattr(cfg, "training_design", "two_stage")
         )
-        if self.training_design not in {"two_stage", "teacher_only", "joint"}:
+        if self.training_design not in {"two_stage", "teacher_only"}:
             raise ValueError(f"Unsupported Base PC-HBM training design: {self.training_design!r}")
-        if self.training_design in {"two_stage", "teacher_only"}:
-            configure = getattr(self.pc_cfg, "configure_training_design", None)
-            if not callable(configure):
-                raise RuntimeError(
-                    f"{self.training_design} training requires "
-                    "pc_cfg.configure_training_design()"
-                )
-            configure(self.training_design)
+        configure = getattr(self.pc_cfg, "configure_training_design", None)
+        if not callable(configure):
+            raise RuntimeError(
+                f"{self.training_design} training requires "
+                "pc_cfg.configure_training_design()"
+            )
+        configure(self.training_design)
         if self.training_design == "teacher_only":
             configure_teacher_only_trainability(model)
         elif self.training_design == "two_stage":
@@ -181,24 +181,36 @@ class BasePCHBMTrainer:
         if len(self.labeled_train_dl) == 0:
             raise ValueError("PC-HBM labeled training loader is empty")
 
-        dataset = self.labeled_train_set or getattr(self.labeled_train_dl, "dataset", None)
+        dataset = self.labeled_train_set or getattr(
+            self.labeled_train_dl, "dataset", None
+        )
         sample_keys = getattr(dataset, "sample_keys", None)
-        if sample_keys:
-            cfg.labeled_split_fingerprint = compute_labeled_split_fingerprint(sample_keys)
-        elif self.training_design in {"teacher_only", "two_stage"} and getattr(
-            cfg, "train_labeled_indices_pt", None
-        ):
-            cfg.labeled_split_fingerprint = compute_labeled_split_fingerprint_from_indices_pt(
-                cfg.train_labeled_indices_pt
+        if sample_keys is None:
+            raise ValueError(
+                "Base labeled loader dataset must expose stable sample_keys"
             )
-        elif not getattr(cfg, "labeled_split_fingerprint", None):
-            fallback_dataset = getattr(self.labeled_train_dl, "dataset", None)
-            fallback_size = len(fallback_dataset) if fallback_dataset is not None else len(
-                self.labeled_train_dl
+        sample_keys = list(sample_keys)
+        if len(sample_keys) != CANONICAL_LABELED_SPLIT_COUNT:
+            raise RuntimeError(
+                "Base labeled loader must contain exactly "
+                f"{CANONICAL_LABELED_SPLIT_COUNT} samples"
             )
-            cfg.labeled_split_fingerprint = compute_labeled_split_fingerprint(
-                [f"@loader/{index}" for index in range(fallback_size)]
+        loader_fingerprint = validate_canonical_labeled_split_fingerprint(
+            compute_labeled_split_fingerprint(sample_keys)
+        )
+        indices_path = getattr(cfg, "train_labeled_indices_pt", None)
+        if not indices_path:
+            raise ValueError(
+                f"{self.training_design} requires train_labeled_indices_pt"
             )
+        indices_fingerprint = validate_canonical_labeled_indices_pt(
+            indices_path
+        )
+        if indices_fingerprint != loader_fingerprint:
+            raise RuntimeError(
+                "Labeled loader and indices file fingerprints differ"
+            )
+        cfg.labeled_split_fingerprint = loader_fingerprint
         if not getattr(cfg, "baseline_fingerprint", None):
             cfg.baseline_fingerprint = state_dict_fingerprint(
                 {
@@ -224,6 +236,9 @@ class BasePCHBMTrainer:
                 "training_design": self.training_design,
                 "pc_frozen": False,
             }
+        )
+        self.resume_baseline_fingerprint = str(
+            self.checkpoint_metadata["baseline_fingerprint"]
         )
         self.save_dir = Path(cfg.save_dir)
         if is_main_process():
@@ -322,8 +337,9 @@ class BasePCHBMTrainer:
             raise RuntimeError("Decoder and memory_decoder buffer keys differ")
 
     def _rebuild_epoch_memory(self, epoch: int) -> None:
-        if int(epoch) < int(self.pc_cfg.parent_start_epoch):
-            return
+        compat_meta = build_memory_compat_meta(
+            self.pc_cfg, self.memory_decoder
+        )
         self.memory_rebuild_fn(
             model=self.model,
             memory_decoder=self.memory_decoder,
@@ -331,21 +347,31 @@ class BasePCHBMTrainer:
             memory=self.memory,
             device=self.device,
             config=self.pc_cfg,
+            compat_meta=compat_meta,
             use_amp=self.amp_enabled,
         )
-        self._assert_memory_ready(epoch)
+        self._assert_memory_ready(epoch, self.memory_decoder)
         synchronize()
 
-    def _assert_memory_ready(self, epoch: int) -> None:
+    def _assert_memory_ready(self, epoch: int, producer: nn.Module) -> None:
         if not hasattr(self.memory, "is_ready") or not bool(self.memory.is_ready()):
             raise RuntimeError(
                 f"Epoch {epoch} mode={pc_mode_for_epoch(epoch, self.pc_cfg)!r} "
                 "requires a finalized compatible labeled PC-HBM memory"
             )
         if hasattr(self.memory, "validate_compat"):
-            compatibility = self.memory.validate_compat(self.pc_cfg.expected_memory_meta())
-            if not bool(compatibility):
-                reason = getattr(compatibility, "reason", "compatibility validation failed")
+            compatibility = self.memory.validate_compat(
+                build_memory_compat_meta(self.pc_cfg, producer),
+                require_producer_match=True,
+            )
+            if isinstance(compatibility, tuple):
+                compatible, reason = compatibility
+            else:
+                compatible = bool(compatibility)
+                reason = getattr(
+                    compatibility, "reason", "compatibility validation failed"
+                )
+            if not compatible:
                 raise RuntimeError(f"Epoch {epoch} PC-HBM memory is incompatible: {reason}")
 
     def train_epoch(self, epoch: int | None = None) -> dict[str, float]:
@@ -357,8 +383,6 @@ class BasePCHBMTrainer:
         mode = pc_mode_for_epoch(epoch, self.pc_cfg)
         self._set_diagnostic_mode(mode)
         self._rebuild_epoch_memory(epoch)
-        if mode != "off":
-            self._assert_memory_ready(epoch)
 
         self._set_model_train_mode()
         self.memory_decoder.eval()
@@ -400,7 +424,6 @@ class BasePCHBMTrainer:
                     epoch,
                     self.pc_cfg,
                     pc_mode=mode,
-                    strict=True,
                 )
             if not bool(torch.isfinite(loss.detach())):
                 raise FloatingPointError(
@@ -487,8 +510,34 @@ class BasePCHBMTrainer:
             print(f"{current_time()} <<< Base PC-HBM training finished")
 
     def resume(self, path: str | os.PathLike, *, restore_rng: bool = True) -> dict[str, Any]:
+        checkpoint = (
+            torch.load(path, map_location="cpu", weights_only=False)
+            if not isinstance(path, Mapping)
+            else dict(path)
+        )
+        if not isinstance(checkpoint, Mapping):
+            raise TypeError("Training resume checkpoint must be a mapping")
+        self._validate_resume_config(checkpoint.get("pc_cfg"))
+        self._validate_resume_design(checkpoint)
+        completed_epoch = int(checkpoint.get("epoch", 0))
+        if completed_epoch < 1 or completed_epoch > int(self.cfg.epochs):
+            raise RuntimeError(f"Invalid resume epoch: {completed_epoch}")
+        completed_mode = pc_mode_for_epoch(completed_epoch, self.pc_cfg)
+        extra = checkpoint.get("extra") or {}
+        if not isinstance(extra, Mapping):
+            raise TypeError("Resume extra must be a mapping")
+        history = extra.get("diagnostic_history", {})
+        if not isinstance(history, Mapping):
+            raise TypeError("Resume diagnostic_history must be a mapping")
+        parsed_history: dict[str, list[float]] = {}
+        for name, values in history.items():
+            if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+                raise TypeError(
+                    f"Diagnostic history {name!r} must be a numeric sequence"
+                )
+            parsed_history[str(name)] = [float(value) for value in values]
         checkpoint = load_training_resume(
-            path,
+            checkpoint,
             model=self.model,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
@@ -496,19 +545,10 @@ class BasePCHBMTrainer:
             ema_model=self.memory_decoder,
             restore_rng=restore_rng,
         )
-        self._validate_resume_config(checkpoint.get("pc_cfg"))
-        self._validate_resume_design(checkpoint)
-        completed_epoch = int(checkpoint.get("epoch", 0))
-        if completed_epoch < 0 or completed_epoch > int(self.cfg.epochs):
-            raise RuntimeError(f"Invalid resume epoch: {completed_epoch}")
         self.current_epoch = completed_epoch + 1
         self.warning_tracker.history.clear()
-        history = (checkpoint.get("extra") or {}).get("diagnostic_history", {})
-        if isinstance(history, Mapping):
-            for name, values in history.items():
-                if isinstance(values, Sequence) and not isinstance(values, (str, bytes)):
-                    self.warning_tracker.history[str(name)].extend(float(value) for value in values)
-        completed_mode = pc_mode_for_epoch(completed_epoch, self.pc_cfg)
+        for name, values in parsed_history.items():
+            self.warning_tracker.history[name].extend(values)
         self._diagnostic_mode = completed_mode
         if completed_mode != "full":
             self.warning_tracker.history.clear()
@@ -518,7 +558,7 @@ class BasePCHBMTrainer:
         """Track schedule transitions and start full-mode diagnostics from a clean window."""
 
         mode = str(mode)
-        if mode not in {"off", "parent_only", "full"}:
+        if mode not in {"off", "verify_only", "full"}:
             raise ValueError(f"Unsupported PC-HBM diagnostic mode: {mode!r}")
         if mode == "full" and self._diagnostic_mode != "full":
             self.warning_tracker.history.clear()
@@ -531,7 +571,7 @@ class BasePCHBMTrainer:
         *,
         emit: bool,
     ) -> list[str]:
-        """Update collapse warnings only when every PC-HBM branch is active."""
+        """Update invalid-query warnings only when residual injection is active."""
 
         if mode != "full":
             return []
@@ -569,12 +609,6 @@ class BasePCHBMTrainer:
             epoch,
             artifact_meta=self._artifact_metadata("teacher_enhancer"),
         )
-        if hasattr(self.memory, "is_ready") and bool(self.memory.is_ready()):
-            save_memory_checkpoint(
-                self.save_dir / f"base_pc_hbm_memory_epoch_{epoch}.pth",
-                self.memory,
-                artifact_meta=self._artifact_metadata("teacher_memory"),
-            )
 
     def _set_model_train_mode(self) -> None:
         self.model.train()
@@ -611,7 +645,6 @@ class BasePCHBMTrainer:
         compat_meta = build_memory_compat_meta(
             self.pc_cfg,
             self.decoder,
-            producer_source="decoder",
         )
         self.memory_rebuild_fn(
             model=self.model,
@@ -623,7 +656,7 @@ class BasePCHBMTrainer:
             compat_meta=compat_meta,
             use_amp=self.amp_enabled,
         )
-        self._assert_memory_ready(final_epoch)
+        self._assert_memory_ready(final_epoch, self.decoder)
         synchronize()
         if not is_main_process():
             return
@@ -642,26 +675,35 @@ class BasePCHBMTrainer:
         )
 
     def _artifact_metadata(self, artifact_role: str) -> dict[str, Any]:
+        artifact_role = str(artifact_role)
+        if artifact_role in {"teacher_enhancer", "teacher_memory"}:
+            baseline_fingerprint = self._current_legacy_fingerprint()
+        else:
+            baseline_fingerprint = self.resume_baseline_fingerprint
         return build_artifact_metadata(
             training_design=self.training_design,
-            artifact_role=str(artifact_role),
+            artifact_role=artifact_role,
             labeled_split_fingerprint=str(
                 self.checkpoint_metadata["labeled_split_fingerprint"]
             ),
-            baseline_fingerprint=str(self.checkpoint_metadata["baseline_fingerprint"]),
+            baseline_fingerprint=baseline_fingerprint,
             pc_frozen=artifact_role in {"teacher_enhancer", "teacher_memory"},
         )
 
+    def _current_legacy_fingerprint(self) -> str:
+        return state_dict_fingerprint(
+            {
+                name: value
+                for name, value in self.decoder.state_dict().items()
+                if not name.startswith("pc_hbm.")
+            }
+        )
+
     def _validate_resume_design(self, checkpoint: Mapping[str, Any]) -> None:
-        current_design = str(getattr(self, "training_design", "joint"))
+        current_design = str(getattr(self, "training_design", "two_stage"))
         metadata = read_artifact_metadata(checkpoint)
         if metadata is None:
-            if current_design != "joint":
-                raise RuntimeError(
-                    "Legacy resume checkpoint has no training_design; it is allowed only "
-                    "with --training-design joint"
-                )
-            return
+            raise RuntimeError("Pre-V2 PC-HBM resume checkpoints are not loadable")
         saved_design = metadata["training_design"]
         if str(saved_design) != current_design:
             raise RuntimeError(
@@ -675,7 +717,11 @@ class BasePCHBMTrainer:
         if bool(metadata["pc_frozen"]):
             raise RuntimeError("Base resume artifact cannot mark PC-HBM as frozen")
         for key in ("labeled_split_fingerprint", "baseline_fingerprint"):
-            expected = str(self.checkpoint_metadata[key])
+            expected = (
+                self.resume_baseline_fingerprint
+                if key == "baseline_fingerprint"
+                else str(self.checkpoint_metadata[key])
+            )
             if str(metadata[key]) != expected:
                 raise RuntimeError(
                     f"Resume {key} mismatch: checkpoint={metadata[key]!r}, expected={expected!r}"
@@ -742,12 +788,8 @@ class BasePCHBMTrainer:
 
 
 # Concise import-compatible alias for the dedicated entry point.
-Trainer = BasePCHBMTrainer
-
-
 __all__ = [
     "BasePCHBMTrainer",
-    "Trainer",
     "configure_teacher_only_trainability",
     "configure_two_stage_trainability",
     "current_time",
