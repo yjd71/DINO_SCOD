@@ -1,224 +1,121 @@
-from pathlib import Path
+from __future__ import annotations
+
 from types import SimpleNamespace
 
 import torch
-from torch import nn
+import torch.nn as nn
 
-from configs.pc_hbm_dino_config import DinoPCHBMConfig
-import utils.trainer_base_model_pc_hbm as trainer_module
-from utils.trainer_base_model_pc_hbm import BasePCHBMTrainer
+from Model.ts_model import TSModel
+from utils.checkpoint_pc_hbm import (
+    CANONICAL_LABELED_SPLIT_FINGERPRINT,
+    state_dict_fingerprint,
+)
+from utils.trainer_base_model_pc_hbm import (
+    BasePCHBMTrainer,
+    configure_teacher_only_trainability,
+    configure_two_stage_trainability,
+)
+from utils.trainer_ts_model_pseudo_pc_hbm import (
+    validate_teacher_enhancer_checkpoint,
+)
 
 
-class _FakeDecoder(nn.Module):
+class TinyBase(nn.Module):
     def __init__(self):
         super().__init__()
-        self.weight = nn.Parameter(torch.tensor(0.25))
-        self.register_buffer("seen", torch.tensor(0))
-        self.pc_hbm = True
+        self.dino = nn.Linear(2, 2)
+        self.decoder = nn.Module()
+        self.decoder.legacy = nn.Linear(2, 2)
+        self.decoder.pc_hbm = nn.Linear(2, 2)
 
 
-class _FakeModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.decoder = _FakeDecoder()
-        self.backbone = nn.Parameter(torch.tensor(7.0))
-
-    def forward(
-        self,
-        x,
-        memory=None,
-        pc_mode="off",
-        epoch=None,
-        return_aux=False,
-        query_image_ids=None,
-    ):
-        del memory, epoch, query_image_ids
-        z = self.decoder.weight * torch.ones(x.size(0), 1, 8, 8)
-        outputs = (z, z, z, z, z)
-        aux = {
-            "z_main": z,
-            "z_final": z,
-            "p_final": torch.sigmoid(z),
-            "pc_active": pc_mode != "off",
-            "fallback_reason": None,
-            "forward_mode": pc_mode,
-            "pc_hbm": {"B3": z},
-            "p2_bra": {},
-            "p1_pra": {},
-            "mixture": {},
-        }
-        return (outputs, aux) if return_aux else outputs
-
-
-class _FakeMemory:
-    def __init__(self):
-        self.ready = False
-        self.rebuilds = 0
-
-    def is_ready(self):
-        return self.ready
-
-    def validate_compat(self, expected):
-        del expected
-        return True
-
-    def state_dict(self):
-        return {"compat_meta": {}, "ready": self.ready}
-
-
-def _cfg(tmp_path):
-    return SimpleNamespace(
-        device=torch.device("cpu"),
-        distributed=False,
-        learning_rate=1.0e-2,
-        weight_decay=0.0,
-        min_lr=1.0e-5,
-        epochs=6,
-        batch_size=2,
-        num_workers=0,
-        CUDA=False,
-        save_dir=str(tmp_path),
-        log_interval=100,
-        checkpoint_interval=1,
+def test_teacher_only_trainability_contains_only_pc_parameters():
+    model = TinyBase()
+    names = configure_teacher_only_trainability(model)
+    assert names
+    assert all(name.startswith("pc_hbm.") for name in names)
+    assert not any(
+        parameter.requires_grad
+        for parameter in model.decoder.legacy.parameters()
     )
 
 
-def _diagnostic_trainer(pc_cfg=None):
+def test_two_stage_trains_decoder_but_keeps_dino_frozen():
+    model = TinyBase()
+    names = configure_two_stage_trainability(model)
+    assert any(name.startswith("legacy.") for name in names)
+    assert any(name.startswith("pc_hbm.") for name in names)
+    assert all(
+        parameter.requires_grad for parameter in model.decoder.parameters()
+    )
+    assert not any(
+        parameter.requires_grad for parameter in model.dino.parameters()
+    )
+
+
+def test_memory_rebuild_runs_even_during_off_epochs():
     trainer = BasePCHBMTrainer.__new__(BasePCHBMTrainer)
-    trainer.pc_cfg = pc_cfg or DinoPCHBMConfig(use_amp=False, diagnostic_window_epochs=3)
-    trainer.warning_tracker = trainer_module.DiagnosticWarningTracker(trainer.pc_cfg)
-    trainer._diagnostic_mode = None
-    return trainer
-
-
-def _collapsed_metrics():
-    return {
-        "pi_keep_mean": 1.0,
-        "pi_res_mean": 0.0,
-        "pi_def_mean": 0.0,
-        "pi_sup_mean": 0.0,
-        "gate_pc_mean": 0.0,
-        "child_verify_auc": 0.5,
-    }
-
-
-def test_diagnostic_tracker_ignores_off_and_parent_only_epochs():
-    trainer = _diagnostic_trainer()
-    metrics = _collapsed_metrics()
-
-    for mode in ("off", "parent_only"):
-        trainer._set_diagnostic_mode(mode)
-        assert trainer._update_warning_tracker(mode, metrics, emit=False) == []
-
-    assert trainer._diagnostic_mode == "parent_only"
-    assert dict(trainer.warning_tracker.history) == {}
-
-
-def test_first_full_epoch_resets_history_and_requires_full_window():
-    trainer = _diagnostic_trainer()
-    metrics = _collapsed_metrics()
-    trainer._diagnostic_mode = "parent_only"
-    for name, value in metrics.items():
-        trainer.warning_tracker.history[name].extend([value, value, value])
-
-    trainer._set_diagnostic_mode("full")
-    assert dict(trainer.warning_tracker.history) == {}
-    assert trainer._update_warning_tracker("full", metrics, emit=False) == []
-    assert trainer._update_warning_tracker("full", metrics, emit=False) == []
-    messages = trainer._update_warning_tracker("full", metrics, emit=False)
-
-    assert messages
-    assert any("mixture collapse" in message for message in messages)
-
-
-def test_resume_restores_only_full_mode_diagnostic_history(monkeypatch):
-    checkpoint = {
-        "epoch": 6,
-        "pc_cfg": {},
-        "extra": {"diagnostic_history": {"pi_keep_mean": [1.0, 1.0, 1.0]}},
-    }
-
-    def fake_load_training_resume(*args, **kwargs):
-        del args, kwargs
-        return checkpoint
-
-    monkeypatch.setattr(trainer_module, "load_training_resume", fake_load_training_resume)
-
-    def make_resume_trainer():
-        trainer = _diagnostic_trainer()
-        trainer.model = nn.Identity()
-        trainer.optimizer = None
-        trainer.scheduler = None
-        trainer.scaler = None
-        trainer.memory_decoder = nn.Identity()
-        trainer.cfg = SimpleNamespace(epochs=30)
-        trainer._validate_resume_config = lambda saved_config: None
-        trainer.warning_tracker.history["gate_pc_mean"].extend([0.0, 0.0, 0.0])
-        return trainer
-
-    parent_only = make_resume_trainer()
-    parent_only.resume("unused.pth", restore_rng=False)
-    assert parent_only.current_epoch == 7
-    assert parent_only._diagnostic_mode == "parent_only"
-    assert dict(parent_only.warning_tracker.history) == {}
-
-    checkpoint["epoch"] = 11
-    full = make_resume_trainer()
-    full.resume("unused.pth", restore_rng=False)
-    assert full.current_epoch == 12
-    assert full._diagnostic_mode == "full"
-    assert list(full.warning_tracker.history["pi_keep_mean"]) == [1.0, 1.0, 1.0]
-    assert "gate_pc_mean" not in full.warning_tracker.history
-
-
-def test_parent_only_rebuild_decoder_only_ema_checkpoint_and_resume(tmp_path):
-    cfg = _cfg(tmp_path)
-    pc_cfg = DinoPCHBMConfig(use_amp=False)
-    images = torch.randn(2, 3, 8, 8)
-    gt = torch.randint(0, 2, (2, 1, 8, 8)).float()
-    loader = [(images.clone(), images, gt, ["a", "b"])]
-    memory = _FakeMemory()
-
-    def fake_rebuild(**kwargs):
-        kwargs["memory"].ready = True
-        kwargs["memory"].rebuilds += 1
-        return kwargs["memory"]
-
-    model = _FakeModel()
-    backbone_before = model.backbone.detach().clone()
-    decoder_before = model.decoder.weight.detach().clone()
-    trainer = BasePCHBMTrainer(
-        model,
-        cfg,
-        pc_cfg,
-        memory=memory,
-        labeled_loader=loader,
-        memory_loader=[None],
-        memory_rebuild_fn=fake_rebuild,
+    calls = []
+    trainer.memory_rebuild_fn = lambda **kwargs: calls.append(kwargs)
+    trainer.model = object()
+    trainer.memory_decoder = nn.Linear(2, 2)
+    trainer.memory_loader = object()
+    trainer.memory = object()
+    trainer.device = "cpu"
+    trainer.pc_cfg = SimpleNamespace()
+    trainer.amp_enabled = False
+    trainer._assert_memory_ready = (
+        lambda epoch, producer: calls.append(epoch)
     )
-    trainer.current_epoch = 6
-    metrics = trainer.train_epoch(6)
+    trainer._rebuild_epoch_memory(1)
+    trainer._rebuild_epoch_memory(6)
+    assert calls[1] == 1
+    assert calls[3] == 6
 
-    assert memory.rebuilds == 1 and memory.ready
-    assert torch.equal(model.backbone.detach(), backbone_before)
-    assert not torch.equal(model.decoder.weight.detach(), decoder_before)
-    assert trainer.current_epoch == 7
-    assert torch.isfinite(torch.tensor(metrics["loss"]))
-    for filename in (
-        "training_resume.pth",
-        "base_pc_hbm_decoder_epoch_6.pth",
-        "base_pc_hbm_memory_epoch_6.pth",
-    ):
-        assert Path(tmp_path, filename).is_file()
 
-    resumed = BasePCHBMTrainer(
-        _FakeModel(),
-        cfg,
-        pc_cfg,
-        memory=_FakeMemory(),
-        labeled_loader=loader,
-        memory_loader=[None],
-        memory_rebuild_fn=fake_rebuild,
+def test_two_stage_final_teacher_initializes_matching_ts_student():
+    base = TinyBase()
+    initial_fingerprint = state_dict_fingerprint(
+        {
+            name: value
+            for name, value in base.decoder.state_dict().items()
+            if not name.startswith("pc_hbm.")
+        }
     )
-    resumed.resume(Path(tmp_path, "training_resume.pth"), restore_rng=False)
-    assert resumed.current_epoch == 7
+    trainer = BasePCHBMTrainer.__new__(BasePCHBMTrainer)
+    trainer.training_design = "two_stage"
+    trainer.decoder = base.decoder
+    trainer.checkpoint_metadata = {
+        "labeled_split_fingerprint": (
+            CANONICAL_LABELED_SPLIT_FINGERPRINT
+        ),
+        "baseline_fingerprint": initial_fingerprint,
+    }
+    trainer.resume_baseline_fingerprint = initial_fingerprint
+
+    with torch.no_grad():
+        trainer.decoder.legacy.weight.add_(1.0)
+    final_fingerprint = trainer._current_legacy_fingerprint()
+    assert final_fingerprint != initial_fingerprint
+
+    teacher_metadata = trainer._artifact_metadata("teacher_enhancer")
+    memory_metadata = trainer._artifact_metadata("teacher_memory")
+    resume_metadata = trainer._artifact_metadata("resume")
+    assert teacher_metadata["baseline_fingerprint"] == final_fingerprint
+    assert memory_metadata["baseline_fingerprint"] == final_fingerprint
+    assert resume_metadata["baseline_fingerprint"] == initial_fingerprint
+    validate_teacher_enhancer_checkpoint(
+        {"artifact_meta": teacher_metadata},
+        CANONICAL_LABELED_SPLIT_FINGERPRINT,
+    )
+
+    ts_model = TSModel.__new__(TSModel)
+    nn.Module.__init__(ts_model)
+    ts_model.teacher = trainer.decoder
+    ts_model.student = nn.Module()
+    ts_model.student.legacy = nn.Linear(2, 2)
+    ts_model._initialize_raw_student_from_teacher()
+    assert (
+        state_dict_fingerprint(ts_model.student.state_dict())
+        == teacher_metadata["baseline_fingerprint"]
+    )

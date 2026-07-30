@@ -6,6 +6,7 @@ import pytest
 import torch
 from torch import nn
 
+from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from select_pc_bacs import _canonicalize_split_values, _load_selector_state
 from utils.checkpoint_pc_hbm import (
     build_artifact_metadata,
@@ -45,7 +46,7 @@ def valid_selector_payload(tmp_path, selector_seed_keys):
     payload = save_decoder_checkpoint(
         checkpoint_path,
         decoder,
-        pc_cfg=None,
+        pc_cfg=DinoPCHBMConfig(),
         epoch=5,
         artifact_meta=metadata,
     )
@@ -136,7 +137,7 @@ def test_load_selector_state_rejects_wrong_seed_fingerprint(
 @pytest.mark.parametrize(
     ("field", "value"),
     [
-        ("training_design", "joint"),
+        ("training_design", "teacher_only"),
         ("artifact_role", "epoch_decoder"),
         ("pc_frozen", False),
     ],

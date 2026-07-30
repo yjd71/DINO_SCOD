@@ -1,154 +1,190 @@
+from __future__ import annotations
+
 import torch
 
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from Model.PC_HBM.training.losses import (
-    _quality_loss,
-    base_structure_loss,
+    binary_pair_loss,
     pc_hbm_labeled_loss,
-    pc_injection_strength,
+    pc_hbm_pc_only_labeled_loss,
     pc_mode_for_epoch,
+)
+from Model.PC_HBM.training.diagnostics import (
+    DIAGNOSTIC_NAMES,
+    collect_pc_diagnostics,
 )
 
 
-def _outputs(size=16):
-    return tuple(torch.randn(1, 1, size, size, requires_grad=True) for _ in range(5))
+def _outputs(batch=1):
+    return tuple(
+        torch.randn(batch, 1, 12, 12, requires_grad=True)
+        for _ in range(5)
+    )
 
 
-def _full_aux(outputs, size=16):
-    indices = {
-        "batch_ids": torch.tensor([0, 0]),
-        "flat_indices": torch.tensor([0, 1]),
-    }
-    pc = {
-        "P3_group": torch.softmax(torch.randn(2, 4, requires_grad=True), dim=1),
-        "boundary_indices3": indices,
-        "top_parent_region_ids": torch.tensor([[0, 1], [2, 3]]),
-        "top_parent_valid": torch.ones(2, 2, dtype=torch.bool),
-        "S_child": torch.randn(2, 2, requires_grad=True),
-        "G_attn": torch.randn(2, 6, requires_grad=True),
-        "O_pc_token": torch.randn(2, 2, requires_grad=True),
-        "gate_pc_token": torch.full((2, 1), 0.4, requires_grad=True),
-        "C23_token": torch.full((2, 1), 0.2),
-        "B3": torch.full((1, 1, 28, 28), 0.5, requires_grad=True),
-        "C23_map": torch.full((1, 1, 28, 28), 0.2),
-        "gate_pc_map": torch.full((1, 1, 28, 28), 0.4),
-        "route_entropy_norm": torch.tensor([0.2]),
-    }
-    branches = {
-        name: torch.randn(1, 1, size, size, requires_grad=True)
-        for name in ("z_keep", "z_res", "z_def", "z_sup")
-    }
-    mix_logits = torch.randn(1, 4, size, size, requires_grad=True)
-    mixture = {
-        **branches,
-        "pi": torch.softmax(mix_logits, dim=1),
-        "branch_quality": torch.randn(1, 4, size, size, requires_grad=True),
-        "B_pix": torch.ones(1, 1, size, size),
-        "O_pix": torch.randn(1, 2, size, size, requires_grad=True),
-        "Mask_corr": torch.sigmoid(torch.randn(1, 1, size, size, requires_grad=True)),
-    }
-    mixture["z_final"] = sum(
-        mixture["pi"][:, i : i + 1] * mixture[name]
-        for i, name in enumerate(("z_keep", "z_res", "z_def", "z_sup"))
+def _aux(valid=(True, True)):
+    logits = torch.tensor(
+        [[4.0, -4.0], [-4.0, 4.0]],
+        requires_grad=True,
     )
     return {
         "pc_active": True,
-        "forward_mode": "full",
         "fallback_reason": None,
-        "z_main": outputs[3],
-        "z_final": mixture["z_final"],
-        "pc_hbm": pc,
-        "p2_bra": {
-            "B2": torch.full((1, 1, 28, 28), 0.5, requires_grad=True),
-            "B2_refined_map": torch.full((1, 1, 28, 28), 0.5, requires_grad=True),
-            "valid2_map": torch.ones(1, 28, 28, dtype=torch.bool),
+        "forward_mode": "full",
+        "pc_hbm": {
+            "pair_logits": logits,
+            "query_valid": torch.tensor(valid),
+            "query_batch_ids": torch.tensor([0, 0]),
+            "query_flat_indices": torch.tensor([0, 1]),
+            "query_mask_map": torch.ones(1, 1, 2, 2),
         },
-        "p1_pra": {"B1": torch.full((1, 1, size, size), 0.5, requires_grad=True)},
-        "mixture": mixture,
     }
 
 
-def test_schedule_and_ramp_are_one_based():
+def test_locked_schedules_and_three_epoch_ramp():
     cfg = DinoPCHBMConfig()
-    assert [pc_mode_for_epoch(e, cfg) for e in (1, 5, 6, 10, 11)] == [
+    cfg.configure_training_design("two_stage")
+    assert [pc_mode_for_epoch(epoch, cfg) for epoch in (1, 5, 6, 10, 11)] == [
         "off",
         "off",
-        "parent_only",
-        "parent_only",
+        "verify_only",
+        "verify_only",
         "full",
     ]
-    assert [pc_injection_strength(e, cfg) for e in (10, 11, 12, 13)] == [0.0, 1 / 3, 2 / 3, 1.0]
+    assert [cfg.injection_scale(epoch) for epoch in (11, 12, 13)] == [
+        1 / 3,
+        2 / 3,
+        1.0,
+    ]
+    cfg.configure_training_design("teacher_only")
+    assert [pc_mode_for_epoch(epoch, cfg) for epoch in (1, 5, 6)] == [
+        "verify_only",
+        "verify_only",
+        "full",
+    ]
 
 
-def test_off_and_parent_only_loss_matrix():
-    cfg = DinoPCHBMConfig()
-    gt = (torch.rand(1, 1, 32, 32) > 0.5).float()
-    outputs = _outputs()
-    off, off_log = pc_hbm_labeled_loss(outputs, None, gt, 1, cfg, pc_mode="off")
-    torch.testing.assert_close(off, base_structure_loss(outputs, gt))
-    assert off_log["L_final"] == 0
-
-    aux = _full_aux(outputs)
-    aux["forward_mode"] = "parent_only"
-    parent, log = pc_hbm_labeled_loss(outputs, aux, gt, 6, cfg, pc_mode="parent_only")
-    expected = base_structure_loss(outputs, gt) + 0.2 * log["L_parent"] + 0.1 * log["L_B3"]
-    torch.testing.assert_close(parent.detach(), expected)
-    assert log["L_child"] == 0 and log["L_final"] == 0
-
-
-def test_full_loss_is_finite_and_backpropagates():
-    cfg = DinoPCHBMConfig()
-    gt = (torch.rand(1, 1, 32, 32) > 0.5).float()
-    outputs = _outputs()
-    aux = _full_aux(outputs)
-    loss, log = pc_hbm_labeled_loss(outputs, aux, gt, 11, cfg)
-    assert torch.isfinite(loss)
-    assert abs(log["pc_strength"].item() - 1 / 3) < 1.0e-6
-    loss.backward()
-    assert outputs[3].grad is not None
-    assert aux["pc_hbm"]["S_child"].grad is not None
-
-
-def test_refined_boundary_gradient_is_limited_to_valid2_map():
-    cfg = DinoPCHBMConfig()
-    gt = torch.zeros(1, 1, 32, 32)
-    outputs = _outputs()
-    aux = _full_aux(outputs)
-    refined = aux["p2_bra"]["B2_refined_map"]
-    valid2 = torch.zeros(1, 28, 28, dtype=torch.bool)
-    valid2[:, 0, 0] = True
-    aux["p2_bra"]["valid2_map"] = valid2
-
-    loss, _ = pc_hbm_labeled_loss(outputs, aux, gt, 11, cfg)
-    loss.backward()
-
-    assert refined.grad is not None
-    assert refined.grad[0, 0, 0, 0].abs() > 0
-    assert torch.count_nonzero(refined.grad[0, 0, 1:, :]) == 0
-    assert torch.count_nonzero(refined.grad[0, 0, 0, 1:]) == 0
-
-
-def test_quality_loss_normalizes_across_all_four_branches():
-    reference = torch.zeros(1, 1, 2, 2, requires_grad=True)
-    mixture = {
-        "branch_quality": torch.zeros(1, 4, 2, 2, requires_grad=True),
-        "B_pix": torch.ones(1, 1, 2, 2),
-    }
-    pixel_error = torch.cat(
-        (torch.ones(1, 1, 2, 2), torch.zeros(1, 3, 2, 2)), dim=1
+def test_binary_pair_ce_uses_foreground_and_background_targets():
+    gt = torch.tensor([[[[1.0, 0.0], [0.0, 0.0]]]])
+    aux = _aux()
+    loss, metrics = binary_pair_loss(
+        aux, gt, aux["pc_hbm"]["pair_logits"], DinoPCHBMConfig()
     )
-    loss = _quality_loss(mixture, {"pixel_error": pixel_error}, reference)
-    torch.testing.assert_close(loss, torch.tensor(0.375))
+    assert float(loss.detach()) < 0.01
+    assert float(metrics["pair_accuracy"]) == 1.0
+    loss.backward()
+    assert torch.isfinite(aux["pc_hbm"]["pair_logits"].grad).all()
 
 
-def test_training_fails_fast_on_memory_fallback():
+def test_fully_invalid_pair_loss_is_finite_differentiable_zero():
+    gt = torch.zeros(1, 1, 2, 2)
+    aux = _aux(valid=(False, False))
+    loss, metrics = binary_pair_loss(
+        aux, gt, aux["pc_hbm"]["pair_logits"], DinoPCHBMConfig()
+    )
+    assert float(loss.detach()) == 0.0
+    assert float(metrics["pair_valid_count"]) == 0.0
+    loss.backward()
+    assert torch.equal(
+        aux["pc_hbm"]["pair_logits"].grad,
+        torch.zeros_like(aux["pc_hbm"]["pair_logits"]),
+    )
+
+
+def test_two_stage_and_teacher_only_labeled_objectives():
     cfg = DinoPCHBMConfig()
+    gt = torch.tensor([[[[1.0, 0.0], [0.0, 0.0]]]])
     outputs = _outputs()
-    gt = torch.zeros(1, 1, 16, 16)
-    aux = {"pc_active": False, "fallback_reason": "memory_not_ready"}
-    try:
-        pc_hbm_labeled_loss(outputs, aux, gt, 11, cfg)
-    except RuntimeError as error:
-        assert "fallback" in str(error)
-    else:
-        raise AssertionError("full PC-HBM training must reject baseline fallback")
+    aux = _aux()
+    two_stage, two_log = pc_hbm_labeled_loss(
+        outputs,
+        aux,
+        gt,
+        11,
+        cfg,
+        pc_mode="full",
+        training_design="two_stage",
+    )
+    assert float(two_log["L_base"]) > 0
+    assert float(two_log["L_pair"]) > 0
+    assert torch.isfinite(two_stage)
+
+    verify, verify_log = pc_hbm_pc_only_labeled_loss(
+        outputs,
+        {**aux, "forward_mode": "verify_only"},
+        gt,
+        1,
+        cfg,
+        pc_mode="verify_only",
+    )
+    assert float(verify_log["L_base"]) == 0.0
+    assert float(verify_log["L_main"]) == 0.0
+    assert torch.allclose(
+        verify,
+        cfg.lambda_pair * verify_log["L_pair"],
+    )
+
+    full, full_log = pc_hbm_pc_only_labeled_loss(
+        outputs,
+        aux,
+        gt,
+        6,
+        cfg,
+        pc_mode="full",
+    )
+    assert float(full_log["L_main"]) > 0
+    assert full > verify
+
+
+def test_pair_ce_ignores_queries_outside_both_regions():
+    cfg = DinoPCHBMConfig()
+    logits = torch.randn(1, 2, requires_grad=True)
+    aux = {
+        "pc_hbm": {
+            "pair_logits": logits,
+            "query_valid": torch.tensor([True]),
+            "query_batch_ids": torch.tensor([0]),
+            "query_flat_indices": torch.tensor([5]),
+            "query_mask_map": torch.ones(1, 1, 4, 4),
+        }
+    }
+    loss, metrics = binary_pair_loss(
+        aux,
+        torch.ones(1, 1, 4, 4),
+        logits,
+        cfg,
+    )
+    assert float(loss.detach()) == 0.0
+    assert float(metrics["pair_valid_count"]) == 0.0
+
+
+def test_diagnostics_emit_complete_finite_lite_schema():
+    aux = {
+        "z_main": torch.zeros(1, 1, 4, 4),
+        "pc_hbm": {
+            "query_valid": torch.tensor([True, True]),
+            "query_batch_ids": torch.tensor([0, 0]),
+            "query_flat_indices": torch.tensor([0, 1]),
+            "query_mask_map": torch.ones(1, 1, 2, 2),
+            "pair_logits": torch.tensor([[4.0, -4.0], [-4.0, 4.0]]),
+            "region_prob": torch.tensor([[0.8, 0.2], [0.2, 0.8]]),
+            "retrieval_valid": torch.ones(2, 2, 2, dtype=torch.bool),
+            "parent_cosine": torch.full((2, 2, 2), 0.75),
+            "child_cosine": torch.full((2, 2, 2), 0.5),
+            "candidate_entropy": torch.full((2, 2), 0.25),
+            "memory_confidence": torch.tensor([0.8, 0.7]),
+            "gate": torch.tensor([0.4, 0.6]),
+            "p3_delta": torch.ones(1, 128, 2, 2) * 0.01,
+            "beta": torch.tensor(0.5),
+            "route": {"route_entropy_norm": torch.tensor([0.3])},
+        },
+    }
+    gt = torch.tensor([[[[1.0, 0.0], [0.0, 0.0]]]])
+    metrics = collect_pc_diagnostics(
+        aux,
+        gt,
+        pseudo_confidence=torch.full((1, 1, 4, 4), 0.9),
+    )
+    assert tuple(metrics) == DIAGNOSTIC_NAMES
+    assert all(bool(torch.isfinite(value)) for value in metrics.values())
+    assert float(metrics["pair_cls_acc"]) == 1.0

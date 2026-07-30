@@ -141,22 +141,22 @@ def test_batched_inference_matches_batch_one_and_restores_variable_sizes(
         np.testing.assert_array_equal(batched, single)
 
 
-def test_incompatible_memory_warns_and_falls_back(monkeypatch):
+def test_supplied_incompatible_memory_is_rejected(monkeypatch):
     def reject(*args, **kwargs):
         raise RuntimeError("compat_mismatch:schema_version")
 
     monkeypatch.setattr(inference_module, "load_memory_checkpoint", reject)
-    with pytest.warns(RuntimeWarning, match="z_main"):
-        memory = inference_module.load_inference_memory(
+    with pytest.raises(RuntimeError, match="schema_version"):
+        inference_module.load_inference_memory(
             "incompatible-memory.pth",
             DinoPCHBMConfig(),
+            torch.nn.Linear(1, 1),
         )
-    assert memory is None
 
 
 def test_missing_memory_warns_and_legacy_checkpoint_alias(monkeypatch):
     with pytest.warns(RuntimeWarning, match="z_main"):
-        assert inference_module.load_inference_memory(None, DinoPCHBMConfig()) is None
+        assert inference_module.load_inference_memory(None) is None
     monkeypatch.setattr(
         "sys.argv",
         ["inference.py", "--checkpoint", "legacy.pth", "--datasets", "CAMO"],
@@ -168,6 +168,27 @@ def test_missing_memory_warns_and_legacy_checkpoint_alias(monkeypatch):
     assert args.batch_size == 16
     assert args.num_workers == 4
     assert args.amp is False
+
+
+def test_supplied_memory_always_requires_exact_loaded_producer(monkeypatch):
+    captured = {}
+
+    def load(_path, _memory, *, expected_compat, require_producer_match):
+        captured["expected_compat"] = expected_compat
+        captured["require_producer_match"] = require_producer_match
+
+    monkeypatch.setattr(inference_module, "load_memory_checkpoint", load)
+    cfg = DinoPCHBMConfig()
+    producer = torch.nn.Linear(2, 2)
+    inference_module.load_inference_memory("memory.pth", cfg, producer)
+    assert captured["require_producer_match"] is True
+    assert (
+        captured["expected_compat"]["producer_fingerprint"]
+        == inference_module.module_fingerprint(producer)
+    )
+
+    with pytest.raises(TypeError, match="Decoder"):
+        inference_module.load_inference_memory("memory.pth", cfg)
 
 
 def test_inference_cli_accepts_throughput_options(monkeypatch):

@@ -1,0 +1,65 @@
+{
+  "architecture": "DINO_SCOD_PC_HBM_COMPLEX",
+  "commit": "e35fbfca17ba57ce751dec7351ded27712e17646",
+  "device": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+  "torch": "2.10.0+cu128",
+  "seed": 2025,
+  "amp": true,
+  "labeled_split": "data/cache/labeled_indices/pc_bacs_0202_keys.pt",
+  "labeled_split_count": 202,
+  "labeled_split_fingerprint": "1f7cbfa5cd9f3afcc72910d482a762fb5bdb81b35585285d5626be6d1a2698b0",
+  "warmup_iterations": 10,
+  "timed_iterations": 30,
+  "pc_parameters": 1111566,
+  "memory": {
+    "route_tensor_bytes": 310272,
+    "parent_tensor_bytes": 7459432,
+    "child_tensor_bytes": 6846328,
+    "total_tensor_bytes": 14616032,
+    "raw_state_file_bytes": 18548941,
+    "checkpoint_bytes": 18554789,
+    "route_images": 202,
+    "parent_count": 25546,
+    "child_count": 25546
+  },
+  "base_full_batch16": {
+    "warmup_iterations": 10,
+    "timed_iterations": 30,
+    "mean_ms": 2543.0283033289015,
+    "median_ms": 2546.9329999759793,
+    "p95_ms": 2633.3980000345036,
+    "peak_allocated_bytes": 1594205184,
+    "peak_reserved_bytes": 2151677952
+  },
+  "teacher_pseudo_batch32": {
+    "warmup_iterations": 10,
+    "timed_iterations": 30,
+    "mean_ms": 4651.017299992964,
+    "median_ms": 4614.424149971455,
+    "p95_ms": 4885.151599999517,
+    "peak_allocated_bytes": 2347571200,
+    "peak_reserved_bytes": 3118465024
+  },
+  "ts_step_batch32": {
+    "warmup_iterations": 10,
+    "timed_iterations": 30,
+    "mean_ms": 5161.948920006398,
+    "median_ms": 5146.212099993136,
+    "p95_ms": 5683.111399994232,
+    "peak_allocated_bytes": 5796042240,
+    "peak_reserved_bytes": 6197084160
+  },
+  "cuda_smoke": {
+    "base_full_peak_gib": 2.59,
+    "teacher_pseudo_peak_gib": 1.73,
+    "student_labeled_raw_peak_gib": 3.18,
+    "student_unlabeled_raw_peak_gib": 3.32,
+    "max_peak_gib": 4.82
+  },
+  "notes": [
+    "Forward timings use precomputed DINO token tensors to isolate Decoder and PC-HBM cost.",
+    "Memory was rebuilt from all 202 labeled samples and stored as CPU FP16.",
+    "TS timing includes Teacher pseudo, two raw Student forwards, Adam backward/step, and shared-legacy EMA.",
+    "The candidate-count reduction is not used as an end-to-end speed claim."
+  ]
+}

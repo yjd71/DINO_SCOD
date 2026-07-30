@@ -1,0 +1,125 @@
+{
+  "amp": true,
+  "architecture": "DINO_SCOD_PC_HBM_LITE",
+  "base_full_batch16": {
+    "mean_ms": 62.94930333194012,
+    "median_ms": 62.39899998763576,
+    "p95_ms": 71.68789999559522,
+    "peak_allocated_bytes": 959027712,
+    "peak_reserved_bytes": 1214251008,
+    "timed_iterations": 30,
+    "warmup_iterations": 10
+  },
+  "complex_baseline": {
+    "amp": true,
+    "architecture": "DINO_SCOD_PC_HBM_COMPLEX",
+    "base_full_batch16": {
+      "mean_ms": 2543.0283033289015,
+      "median_ms": 2546.9329999759793,
+      "p95_ms": 2633.3980000345036,
+      "peak_allocated_bytes": 1594205184,
+      "peak_reserved_bytes": 2151677952,
+      "timed_iterations": 30,
+      "warmup_iterations": 10
+    },
+    "commit": "e35fbfca17ba57ce751dec7351ded27712e17646",
+    "cuda_smoke": {
+      "base_full_peak_gib": 2.59,
+      "max_peak_gib": 4.82,
+      "student_labeled_raw_peak_gib": 3.18,
+      "student_unlabeled_raw_peak_gib": 3.32,
+      "teacher_pseudo_peak_gib": 1.73
+    },
+    "device": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+    "labeled_split": "data/cache/labeled_indices/pc_bacs_0202_keys.pt",
+    "labeled_split_count": 202,
+    "labeled_split_fingerprint": "1f7cbfa5cd9f3afcc72910d482a762fb5bdb81b35585285d5626be6d1a2698b0",
+    "memory": {
+      "checkpoint_bytes": 18554789,
+      "child_count": 25546,
+      "child_tensor_bytes": 6846328,
+      "parent_count": 25546,
+      "parent_tensor_bytes": 7459432,
+      "raw_state_file_bytes": 18548941,
+      "route_images": 202,
+      "route_tensor_bytes": 310272,
+      "total_tensor_bytes": 14616032
+    },
+    "notes": [
+      "Forward timings use precomputed DINO token tensors to isolate Decoder and PC-HBM cost.",
+      "Memory was rebuilt from all 202 labeled samples and stored as CPU FP16.",
+      "TS timing includes Teacher pseudo, two raw Student forwards, Adam backward/step, and shared-legacy EMA.",
+      "The candidate-count reduction is not used as an end-to-end speed claim."
+    ],
+    "pc_parameters": 1111566,
+    "seed": 2025,
+    "teacher_pseudo_batch32": {
+      "mean_ms": 4651.017299992964,
+      "median_ms": 4614.424149971455,
+      "p95_ms": 4885.151599999517,
+      "peak_allocated_bytes": 2347571200,
+      "peak_reserved_bytes": 3118465024,
+      "timed_iterations": 30,
+      "warmup_iterations": 10
+    },
+    "timed_iterations": 30,
+    "torch": "2.10.0+cu128",
+    "ts_step_batch32": {
+      "mean_ms": 5161.948920006398,
+      "median_ms": 5146.212099993136,
+      "p95_ms": 5683.111399994232,
+      "peak_allocated_bytes": 5796042240,
+      "peak_reserved_bytes": 6197084160,
+      "timed_iterations": 30,
+      "warmup_iterations": 10
+    },
+    "warmup_iterations": 10
+  },
+  "device": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+  "labeled_split": "data\\cache\\labeled_indices\\pc_bacs_0202_keys.pt",
+  "labeled_split_count": 202,
+  "labeled_split_fingerprint": "1f7cbfa5cd9f3afcc72910d482a762fb5bdb81b35585285d5626be6d1a2698b0",
+  "memory": {
+    "checkpoint_bytes": 8600084,
+    "pair_count": 14580,
+    "pair_tensor_bytes": 7581600,
+    "raw_state_file_bytes": 8599345,
+    "route_images": 202,
+    "route_tensor_bytes": 103424,
+    "total_tensor_bytes": 7685024
+  },
+  "notes": [
+    "Forward timings use precomputed DINO token tensors.",
+    "Memory was rebuilt from all 202 labeled samples as CPU FP16.",
+    "TS timing includes Teacher pseudo, two raw Student forwards, Adam backward/step, and shared-legacy EMA."
+  ],
+  "pc_parameters": 197185,
+  "retrieval": {
+    "candidate_valid_ratio": 1.0,
+    "candidates_per_query": 8.0,
+    "pair_valid_ratio": 1.0,
+    "queries_per_image": 64.0
+  },
+  "seed": 2025,
+  "teacher_pseudo_batch32": {
+    "mean_ms": 111.8976966633151,
+    "median_ms": 111.04214994702488,
+    "p95_ms": 121.8929000897333,
+    "peak_allocated_bytes": 1430601728,
+    "peak_reserved_bytes": 1843396608,
+    "timed_iterations": 30,
+    "warmup_iterations": 10
+  },
+  "timed_iterations": 30,
+  "torch": "2.10.0+cu128",
+  "ts_step_batch32": {
+    "mean_ms": 361.47641334682703,
+    "median_ms": 358.6356000741944,
+    "p95_ms": 386.99050003197044,
+    "peak_allocated_bytes": 5795953152,
+    "peak_reserved_bytes": 6188695552,
+    "timed_iterations": 30,
+    "warmup_iterations": 10
+  },
+  "warmup_iterations": 10
+}

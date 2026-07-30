@@ -31,15 +31,15 @@ def test_base_batch_size_is_explicitly_per_rank(monkeypatch):
     assert args.batch_size == 16
 
 
-def test_two_stage_allows_sampled_images_fallback(monkeypatch):
+def test_two_stage_defaults_to_fixed_labeled_key_file(monkeypatch):
     args = _parse_args(monkeypatch)
 
     assert args.training_design == "two_stage"
-    assert args.labeled_indices_pt is None
+    assert args.labeled_indices_pt.endswith("pc_bacs_0202_keys.pt")
     base_entrypoint.validate_training_args(args)
 
 
-def test_teacher_only_allows_sampled_images_fallback_with_baseline(monkeypatch):
+def test_teacher_only_uses_fixed_labeled_keys_with_baseline(monkeypatch):
     args = _parse_args(
         monkeypatch,
         "--training-design",
@@ -48,7 +48,7 @@ def test_teacher_only_allows_sampled_images_fallback_with_baseline(monkeypatch):
         "baseline_decoder.pth",
     )
 
-    assert args.labeled_indices_pt is None
+    assert args.labeled_indices_pt.endswith("pc_bacs_0202_keys.pt")
     base_entrypoint.validate_training_args(args)
 
 
