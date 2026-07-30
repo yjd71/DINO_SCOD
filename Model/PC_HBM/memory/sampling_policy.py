@@ -1,4 +1,4 @@
-"""Deterministic, availability-aware sampling for labelled memory regions."""
+"""Deterministic uniform sampling for the two labeled pair regions."""
 
 from __future__ import annotations
 
@@ -8,26 +8,10 @@ from typing import Mapping
 import torch
 
 
-MAX_QUOTA = {
-    "fg_core": 32,
-    "fg_boundary": 64,
-    "bg_near": 64,
-    "bg_far": 32,
-}
-
-MIN_QUOTA = {
-    "fg_core": 4,
-    "fg_boundary": 8,
-    "bg_near": 8,
-    "bg_far": 4,
-}
-
-SAMPLING_RATIO = {
-    "fg_core": 0.20,
-    "fg_boundary": 0.50,
-    "bg_near": 0.50,
-    "bg_far": 0.20,
-}
+REGION_NAMES = ("fg_boundary", "bg_near")
+MAX_QUOTA = {"fg_boundary": 48, "bg_near": 48}
+MIN_QUOTA = {"fg_boundary": 8, "bg_near": 8}
+SAMPLING_RATIO = {"fg_boundary": 0.5, "bg_near": 0.5}
 
 
 @dataclass(frozen=True)
@@ -36,65 +20,93 @@ class RegionSamplingRule:
     min_count: int
     ratio: float
 
+    def __post_init__(self) -> None:
+        if int(self.min_count) < 0:
+            raise ValueError("min_count must be non-negative")
+        if int(self.max_count) < int(self.min_count):
+            raise ValueError("max_count must not be smaller than min_count")
+        if not 0.0 <= float(self.ratio) <= 1.0:
+            raise ValueError("ratio must be in [0,1]")
+
 
 DEFAULT_REGION_SAMPLING = {
-    name: RegionSamplingRule(MAX_QUOTA[name], MIN_QUOTA[name], SAMPLING_RATIO[name])
-    for name in MAX_QUOTA
+    name: RegionSamplingRule(
+        max_count=MAX_QUOTA[name],
+        min_count=MIN_QUOTA[name],
+        ratio=SAMPLING_RATIO[name],
+    )
+    for name in REGION_NAMES
 }
 
 
 def rules_from_config(config: object | None) -> dict[str, RegionSamplingRule]:
     if config is None:
         return dict(DEFAULT_REGION_SAMPLING)
-    names = tuple(getattr(config, "region_names", tuple(MAX_QUOTA)))
-    maximum = tuple(getattr(config, "region_max_quota", tuple(MAX_QUOTA[name] for name in names)))
-    minimum = tuple(getattr(config, "region_min_quota", tuple(MIN_QUOTA[name] for name in names)))
-    ratios = tuple(getattr(config, "region_sampling_ratio", tuple(SAMPLING_RATIO[name] for name in names)))
-    if not (len(names) == len(maximum) == len(minimum) == len(ratios)):
-        raise ValueError("Invalid region sampling configuration")
+    names = tuple(getattr(config, "region_names", REGION_NAMES))
+    maximum = tuple(getattr(config, "region_max_quota", (48, 48)))
+    minimum = tuple(getattr(config, "region_min_quota", (8, 8)))
+    ratios = tuple(getattr(config, "region_sampling_ratio", (0.5, 0.5)))
+    if names != REGION_NAMES:
+        raise ValueError(f"PC-HBM-Lite regions are fixed to {REGION_NAMES}")
+    if not (len(names) == len(maximum) == len(minimum) == len(ratios) == 2):
+        raise ValueError("Two-region sampling configuration is incomplete")
     return {
-        str(name): RegionSamplingRule(int(max_count), int(min_count), float(ratio))
-        for name, max_count, min_count, ratio in zip(names, maximum, minimum, ratios)
+        name: RegionSamplingRule(int(max_count), int(min_count), float(ratio))
+        for name, max_count, min_count, ratio in zip(
+            names,
+            maximum,
+            minimum,
+            ratios,
+        )
     }
 
 
 def sample_region_indices(
     mask: torch.Tensor,
-    score: torch.Tensor | None,
     region: str,
     *,
     rules: Mapping[str, RegionSamplingRule] | None = None,
 ) -> torch.Tensor:
-    """Choose existing pixels only; missing regions are never synthesized."""
+    """Uniformly cover ordered valid positions without randomness or repeats."""
 
     if mask.ndim != 2:
         raise ValueError(f"mask must be [H,W], got {tuple(mask.shape)}")
-    available = torch.nonzero(mask.flatten().bool(), as_tuple=False).flatten()
-    if available.numel() == 0:
-        return available
     policy = DEFAULT_REGION_SAMPLING if rules is None else rules
-    if region not in policy:
-        raise KeyError(f"Unknown PC-HBM region: {region}")
-    rule = policy[region]
+    if region not in policy or region not in REGION_NAMES:
+        raise KeyError(f"Unknown PC-HBM-Lite region: {region}")
+    available = torch.nonzero(mask.flatten().bool(), as_tuple=False).flatten()
     count = int(available.numel())
-    desired = max(int(rule.min_count), int(round(count * float(rule.ratio))))
-    desired = min(count, int(rule.max_count), desired)
-    if score is None:
-        return available[:desired]
-    if score.shape != mask.shape:
-        raise ValueError(f"score shape {tuple(score.shape)} does not match mask {tuple(mask.shape)}")
-    reliability = score.flatten().index_select(0, available)
-    order = torch.argsort(reliability, descending=True, stable=True)
-    return available.index_select(0, order[:desired])
+    if count == 0:
+        return available
+
+    rule = policy[region]
+    desired = min(
+        count,
+        max(int(rule.min_count), int(round(count * float(rule.ratio)))),
+        int(rule.max_count),
+    )
+    if desired <= 0:
+        return available[:0]
+    positions = torch.linspace(
+        0,
+        count - 1,
+        steps=desired,
+        device=available.device,
+        dtype=torch.float32,
+    ).round().long()
+    selected = available.index_select(0, positions)
+    if selected.unique().numel() != selected.numel():
+        raise RuntimeError("Deterministic region sampling produced duplicate indices")
+    return selected
 
 
 __all__ = [
     "DEFAULT_REGION_SAMPLING",
     "MAX_QUOTA",
     "MIN_QUOTA",
+    "REGION_NAMES",
     "RegionSamplingRule",
     "SAMPLING_RATIO",
     "rules_from_config",
     "sample_region_indices",
 ]
-
