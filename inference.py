@@ -11,7 +11,7 @@ import warnings
 from contextlib import nullcontext
 
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
-from Model.PC_HBM.memory.pc_memory import PCMemory
+from Model.PC_HBM.memory import PCMemory
 from utils.checkpoint_pc_hbm import load_decoder_compatible, load_memory_checkpoint
 from utils.logging_utils import current_time
 from utils.pc_memory_runner import module_fingerprint
@@ -133,18 +133,13 @@ def parse_args():
     parser.add_argument(
         '--memory-checkpoint',
         default=None,
-        help='Optional finalized PC-HBM memory checkpoint. Incompatible memory falls back to z_main.',
+        help='Optional finalized V2 PC-HBM-Lite memory checkpoint.',
     )
     parser.add_argument(
         '--epoch',
         type=int,
         default=30,
-        help='Mixture schedule epoch (default: terminal Base epoch).',
-    )
-    parser.add_argument(
-        '--require-producer-match',
-        action='store_true',
-        help='Also require the memory producer fingerprint to match the expected fingerprint.',
+        help='Decoder epoch used for the P3 injection schedule.',
     )
     parser.add_argument(
         '--batch-size',
@@ -170,15 +165,10 @@ def parse_args():
 
 def load_inference_memory(
     path,
-    pc_cfg,
-    require_producer_match=False,
-    producer_fingerprint=None,
+    pc_cfg=None,
+    producer=None,
 ):
-    """Load compatible CPU-FP16 memory, or warn and return ``None``.
-
-    PC training is fail-fast, but inference remains usable through z_main when
-    a memory artifact is absent, unready, or incompatible.
-    """
+    """Load compatible CPU-FP16 V2 memory; reject any supplied invalid file."""
 
     if path is None:
         warnings.warn(
@@ -187,31 +177,22 @@ def load_inference_memory(
             stacklevel=2,
         )
         return None
-    memory = PCMemory(
-        pc_cfg.memory_dim,
-        pc_cfg.value_dim,
-        pc_cfg.geometry_dim,
-        storage_dtype=pc_cfg.memory_storage_dtype,
-        config=pc_cfg,
+    if pc_cfg is None:
+        raise ValueError("pc_cfg is required when a memory checkpoint is supplied")
+    if not isinstance(producer, torch.nn.Module):
+        raise TypeError(
+            "The loaded Decoder module is required to verify memory provenance"
+        )
+    producer_fingerprint = module_fingerprint(producer)
+    memory = PCMemory(config=pc_cfg)
+    load_memory_checkpoint(
+        path,
+        memory,
+        expected_compat=pc_cfg.expected_memory_meta(
+            producer_fingerprint=producer_fingerprint
+        ),
+        require_producer_match=True,
     )
-    try:
-        load_memory_checkpoint(
-            path,
-            memory,
-            expected_compat=pc_cfg.expected_memory_meta(
-                producer_fingerprint=(
-                    producer_fingerprint if require_producer_match else None
-                )
-            ),
-            require_producer_match=require_producer_match,
-        )
-    except (OSError, RuntimeError, TypeError, ValueError) as error:
-        warnings.warn(
-            f'PC-HBM memory is unavailable or incompatible ({error}); inference will use z_main logits.',
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        return None
     return memory
 
 
@@ -220,7 +201,7 @@ if __name__ == '__main__':
     from Model.base_model import BaseModel
     args = parse_args()
     cfg = Config()
-    pc_cfg = DinoPCHBMConfig()
+    pc_cfg = DinoPCHBMConfig() if args.memory_checkpoint is not None else None
     model = BaseModel(pc_cfg=pc_cfg)
     load_decoder_compatible(
         model.decoder,
@@ -230,12 +211,7 @@ if __name__ == '__main__':
     memory = load_inference_memory(
         args.memory_checkpoint,
         pc_cfg,
-        require_producer_match=args.require_producer_match,
-        producer_fingerprint=(
-            module_fingerprint(model.decoder)
-            if args.require_producer_match
-            else None
-        ),
+        producer=model.decoder if args.memory_checkpoint is not None else None,
     )
     model.to(cfg.device)
     print(f'{current_time()} >>> Inference started')

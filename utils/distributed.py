@@ -63,10 +63,9 @@ def configure_distributed(cfg, context, seed):
 def wrap_distributed(model, context, *, find_unused_parameters=False):
     """Wrap ``model`` in DDP while preserving the legacy default.
 
-    PC-HBM intentionally skips different parameter groups in ``off``,
-    ``parent_only`` and ``student_core`` modes, so its dedicated entry points
-    opt into unused-parameter discovery.  Existing callers keep the previous
-    ``False`` behaviour.
+    PC-HBM-Lite may skip its residual parameters in ``off`` and
+    ``verify_only`` modes. Existing callers keep the previous ``False``
+    behaviour.
     """
     if not context.distributed:
         return model
