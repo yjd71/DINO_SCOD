@@ -62,6 +62,10 @@ def test_memory_rebuild_runs_even_during_off_epochs():
     trainer.memory_loader = object()
     trainer.memory = object()
     trainer.device = "cpu"
+    trainer.cfg = SimpleNamespace(
+        labeled_split_count=404,
+        labeled_split_fingerprint="0" * 64,
+    )
     trainer.pc_cfg = SimpleNamespace()
     trainer.amp_enabled = False
     trainer._assert_memory_ready = (

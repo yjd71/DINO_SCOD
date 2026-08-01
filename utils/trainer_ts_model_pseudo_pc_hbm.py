@@ -22,15 +22,14 @@ from Model.PC_HBM.training import (
 )
 from utils.checkpoint_pc_hbm import (
     build_artifact_metadata,
-    CANONICAL_LABELED_SPLIT_COUNT,
-    compute_labeled_split_fingerprint,
     load_training_resume,
     read_artifact_metadata,
     save_decoder_checkpoint,
     save_training_resume,
     state_dict_fingerprint,
-    validate_canonical_labeled_indices_pt,
-    validate_canonical_labeled_split_fingerprint,
+    validate_labeled_sample_keys,
+    validate_labeled_split_source,
+    validate_labeled_split_fingerprint,
     validate_artifact_metadata,
 )
 from utils.dataloader import (
@@ -58,9 +57,7 @@ def validate_teacher_enhancer_checkpoint(
 ) -> dict[str, Any]:
     """Validate the frozen Lite Teacher identity before model construction."""
 
-    validate_canonical_labeled_split_fingerprint(
-        labeled_split_fingerprint
-    )
+    validate_labeled_split_fingerprint(labeled_split_fingerprint)
     return validate_artifact_metadata(
         source,
         {
@@ -136,10 +133,6 @@ class PCHBMPseudoTrainer:
         )
 
         indices_path = getattr(cfg, "train_labeled_indices_pt", None)
-        if not indices_path:
-            raise ValueError(
-                "teacher_only TS requires train_labeled_indices_pt"
-            )
         self.labeled_train_set = PCLabeledTrainDataset(
             l_image_root=cfg.train_imgs,
             l_gt_root=cfg.train_masks,
@@ -203,31 +196,32 @@ class PCHBMPseudoTrainer:
         )
         self.memory = memory or PCMemory(config=pc_cfg)
 
-        split_fingerprint = compute_labeled_split_fingerprint(
+        split_identity = validate_labeled_sample_keys(
             self.labeled_train_set.sample_keys
         )
-        indices_fingerprint = validate_canonical_labeled_indices_pt(
-            indices_path
+        source_identity = validate_labeled_split_source(
+            indices_path,
+            getattr(cfg, "train_sample_txt", None),
         )
-        if len(self.labeled_train_set.sample_keys) != (
-            CANONICAL_LABELED_SPLIT_COUNT
-        ):
+        if split_identity != source_identity:
             raise RuntimeError(
-                "TS labeled loader must contain exactly "
-                f"{CANONICAL_LABELED_SPLIT_COUNT} samples"
+                "Labeled dataset and selection source split identities differ"
             )
-        if split_fingerprint != indices_fingerprint:
-            raise RuntimeError(
-                "Labeled dataset and indices file fingerprints differ"
-            )
-        validate_canonical_labeled_split_fingerprint(split_fingerprint)
+        split_fingerprint = split_identity.fingerprint
         prevalidated_split = getattr(
             cfg, "labeled_split_fingerprint", split_fingerprint
         )
-        if str(prevalidated_split) != split_fingerprint:
+        prevalidated_count = getattr(
+            cfg, "labeled_split_count", split_identity.count
+        )
+        if (
+            str(prevalidated_split) != split_fingerprint
+            or int(prevalidated_count) != split_identity.count
+        ):
             raise RuntimeError(
-                "CLI-prevalidated and dataset labeled split fingerprints differ"
+                "CLI-prevalidated and dataset labeled split identities differ"
             )
+        cfg.labeled_split_count = split_identity.count
         cfg.labeled_split_fingerprint = split_fingerprint
 
         teacher_checkpoint = getattr(cfg, "teacher_pc_checkpoint", None)
@@ -341,6 +335,8 @@ class PCHBMPseudoTrainer:
             config=self.pc_cfg,
             compat_meta=compat_meta,
             use_amp=self.amp_enabled,
+            expected_split_count=int(self.cfg.labeled_split_count),
+            expected_split_fingerprint=str(self.cfg.labeled_split_fingerprint),
         )
         if not self.memory.is_ready():
             raise RuntimeError("Teacher memory rebuild produced an unready memory")

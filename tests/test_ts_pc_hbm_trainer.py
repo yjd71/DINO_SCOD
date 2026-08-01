@@ -12,6 +12,7 @@ from Model.ts_model import TSModel
 import train_ts_model_pseudo_pc_hbm as ts_entrypoint
 from utils.checkpoint_pc_hbm import (
     CANONICAL_LABELED_SPLIT_FINGERPRINT,
+    LabeledSplitIdentity,
     build_artifact_metadata,
 )
 from utils.pc_memory_runner import module_fingerprint
@@ -226,8 +227,8 @@ def test_ts_entrypoint_preserves_checkpoint_config(
     )
     monkeypatch.setattr(
         ts_entrypoint,
-        "validate_canonical_labeled_indices_pt",
-        lambda _path: "split",
+        "validate_labeled_split_source",
+        lambda _pt, _txt: LabeledSplitIdentity(count=404, fingerprint="split"),
     )
     monkeypatch.setattr(
         ts_entrypoint,

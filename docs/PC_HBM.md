@@ -53,15 +53,24 @@ relationships are:
 
 Memory is rebuilt from labeled samples at the start of every epoch. It is
 detached, contiguous, and CPU-resident. `memory_storage_dtype` supports
-`float16`, `bfloat16`, and `float32` (default `float16`). The canonical
-labeled-key file is:
+`float16`, `bfloat16`, and `float32` (default `float16`). Formal Base and
+Teacher/Student training accepts any non-empty labeled stable-key file with
+unique normalized keys, including the generated 202-key and 404-key splits:
 
 ```text
 data/cache/labeled_indices/pc_bacs_0202_keys.pt
+data/cache/labeled_indices/pc_bacs_0404_keys.pt
 ```
 
-Every Base run, Teacher/Student run, memory artifact, and profiler run verifies
-the labeled split fingerprint. Pseudo labels never enter memory.
+Every Base run, Teacher/Student run, and memory rebuild verifies both the
+run-specific labeled count and fingerprint. A Teacher checkpoint from one split
+cannot be used with another split. The CUDA smoke and profiler intentionally
+retain the fixed 202-key benchmark protocol. Pseudo labels never enter memory.
+
+For formal training, `--labeled-indices-pt` is optional. When supplied, the PT
+stable-key split overrides `Dataset/COD/sampled_images.txt`. When omitted, Base
+training, TS labeled/unlabeled partitioning, and memory rebuild all use
+`sampled_images.txt` and its fingerprint consistently.
 
 The serialized state has this shape:
 

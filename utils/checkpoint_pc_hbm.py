@@ -9,7 +9,7 @@ import hashlib
 import json
 import unicodedata
 from collections.abc import Mapping
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from numbers import Integral
 from pathlib import Path
 from typing import Any
@@ -36,6 +36,14 @@ ARTIFACT_METADATA_KEYS = (
     "pc_frozen",
 )
 TRAINING_DESIGNS = frozenset({"teacher_only", "two_stage"})
+
+
+@dataclass(frozen=True)
+class LabeledSplitIdentity:
+    """Validated identity of one run's labeled stable-key split."""
+
+    count: int
+    fingerprint: str
 
 
 def load_decoder_compatible(
@@ -446,6 +454,140 @@ def _load_labeled_indices_values(
     return values
 
 
+def validate_labeled_sample_keys(
+    sample_keys,
+    *,
+    expected_count: int | None = None,
+    expected_fingerprint: str | None = None,
+) -> LabeledSplitIdentity:
+    """Validate a non-empty unique stable-key split for a training run."""
+
+    if isinstance(sample_keys, str):
+        raise TypeError("sample_keys must be an iterable of stable-key strings")
+    try:
+        values = list(sample_keys)
+    except TypeError as error:
+        raise TypeError(
+            "sample_keys must be an iterable of stable-key strings"
+        ) from error
+    if not values:
+        raise ValueError("labeled split must contain at least one sample key")
+    if not all(isinstance(value, str) for value in values):
+        raise TypeError("labeled split must store stable sample-key strings")
+
+    normalized = [normalize_sample_key(value) for value in values]
+    if len(set(normalized)) != len(normalized):
+        raise RuntimeError("Labeled sample keys must be unique after normalization")
+    identity = LabeledSplitIdentity(
+        count=len(normalized),
+        fingerprint=compute_labeled_split_fingerprint(normalized),
+    )
+    if expected_count is not None and identity.count != int(expected_count):
+        raise RuntimeError(
+            "Labeled split count differs from the current run contract: "
+            f"expected={int(expected_count)}, got={identity.count}"
+        )
+    if (
+        expected_fingerprint is not None
+        and identity.fingerprint != str(expected_fingerprint)
+    ):
+        raise RuntimeError(
+            "Labeled split fingerprint differs from the current run contract: "
+            f"expected={expected_fingerprint}, got={identity.fingerprint}"
+        )
+    return identity
+
+
+def validate_labeled_indices_pt(
+    indices_pt: str | os.PathLike,
+    *,
+    expected_count: int | None = None,
+    expected_fingerprint: str | None = None,
+) -> LabeledSplitIdentity:
+    """Validate a labeled key file without imposing a fixed dataset size."""
+
+    return validate_labeled_sample_keys(
+        _load_labeled_indices_values(indices_pt),
+        expected_count=expected_count,
+        expected_fingerprint=expected_fingerprint,
+    )
+
+
+def validate_labeled_sample_txt(
+    sample_txt: str | os.PathLike,
+    *,
+    expected_count: int | None = None,
+    expected_fingerprint: str | None = None,
+) -> LabeledSplitIdentity:
+    """Validate stable sample keys stored one per non-empty text line."""
+
+    if sample_txt is None:
+        raise ValueError("sample_txt is required when labeled_indices_pt is not set")
+    sample_txt = Path(sample_txt)
+    try:
+        values = [
+            line.strip()
+            for line in sample_txt.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+    except OSError as error:
+        raise FileNotFoundError(
+            f"Cannot read labeled sample text file: {sample_txt}"
+        ) from error
+    return validate_labeled_sample_keys(
+        values,
+        expected_count=expected_count,
+        expected_fingerprint=expected_fingerprint,
+    )
+
+
+def validate_labeled_split_source(
+    labeled_indices_pt: str | os.PathLike | None,
+    sample_txt: str | os.PathLike | None,
+    *,
+    expected_count: int | None = None,
+    expected_fingerprint: str | None = None,
+) -> LabeledSplitIdentity:
+    """Match Dataset priority: a PT split overrides TXT, otherwise use TXT."""
+
+    if labeled_indices_pt is not None:
+        return validate_labeled_indices_pt(
+            labeled_indices_pt,
+            expected_count=expected_count,
+            expected_fingerprint=expected_fingerprint,
+        )
+    return validate_labeled_sample_txt(
+        sample_txt,
+        expected_count=expected_count,
+        expected_fingerprint=expected_fingerprint,
+    )
+
+
+def validate_labeled_split_fingerprint(
+    fingerprint: str,
+    *,
+    expected_fingerprint: str | None = None,
+) -> str:
+    """Validate a SHA-256 split fingerprint and optionally its run identity."""
+
+    fingerprint = str(fingerprint)
+    if len(fingerprint) != 64 or any(
+        character not in "0123456789abcdef" for character in fingerprint
+    ):
+        raise ValueError(
+            "labeled split fingerprint must be a lowercase SHA-256 hex digest"
+        )
+    if (
+        expected_fingerprint is not None
+        and fingerprint != str(expected_fingerprint)
+    ):
+        raise RuntimeError(
+            "Labeled split fingerprint differs from the current run contract: "
+            f"expected={expected_fingerprint}, got={fingerprint}"
+        )
+    return fingerprint
+
+
 def validate_canonical_labeled_split_fingerprint(
     fingerprint: str,
 ) -> str:
@@ -469,21 +611,14 @@ def validate_canonical_labeled_indices_pt(
     values = _load_labeled_indices_values(indices_pt)
     if len(values) != CANONICAL_LABELED_SPLIT_COUNT:
         raise RuntimeError(
-            "PC-HBM-Lite labeled key file must contain exactly "
+            "PC-HBM-Lite benchmark key file must contain exactly "
             f"{CANONICAL_LABELED_SPLIT_COUNT} entries, got {len(values)}"
         )
-    if not all(isinstance(value, str) for value in values):
-        raise TypeError(
-            "The canonical PC-HBM-Lite split must store stable sample keys"
-        )
-    normalized = [normalize_sample_key(value) for value in values]
-    if len(set(normalized)) != CANONICAL_LABELED_SPLIT_COUNT:
-        raise RuntimeError(
-            "Canonical PC-HBM-Lite labeled sample keys must be unique"
-        )
-    return validate_canonical_labeled_split_fingerprint(
-        compute_labeled_split_fingerprint(normalized)
+    identity = validate_labeled_sample_keys(
+        values,
+        expected_fingerprint=CANONICAL_LABELED_SPLIT_FINGERPRINT,
     )
+    return identity.fingerprint
 
 
 def build_artifact_metadata(
@@ -907,6 +1042,7 @@ __all__ = [
     "ARTIFACT_METADATA_VERSION",
     "CANONICAL_LABELED_SPLIT_COUNT",
     "CANONICAL_LABELED_SPLIT_FINGERPRINT",
+    "LabeledSplitIdentity",
     "TRAINING_DESIGNS",
     "build_artifact_metadata",
     "capture_rng_state",
@@ -929,4 +1065,9 @@ __all__ = [
     "validate_artifact_metadata",
     "validate_canonical_labeled_indices_pt",
     "validate_canonical_labeled_split_fingerprint",
+    "validate_labeled_indices_pt",
+    "validate_labeled_sample_txt",
+    "validate_labeled_sample_keys",
+    "validate_labeled_split_source",
+    "validate_labeled_split_fingerprint",
 ]

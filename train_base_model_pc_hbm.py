@@ -16,7 +16,7 @@ from utils.checkpoint_pc_hbm import (
     load_decoder_compatible,
     read_pc_config,
     state_dict_fingerprint,
-    validate_canonical_labeled_indices_pt,
+    validate_labeled_split_source,
 )
 from utils.distributed import (
     cleanup_distributed,
@@ -28,11 +28,6 @@ from utils.trainer_base_model_pc_hbm import (
     BasePCHBMTrainer,
     configure_teacher_only_trainability,
     configure_two_stage_trainability,
-)
-
-
-DEFAULT_LABELED_KEYS = (
-    "./data/cache/labeled_indices/pc_bacs_0202_keys.pt"
 )
 
 
@@ -91,7 +86,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--deterministic", action="store_true")
     parser.add_argument(
         "--labeled-indices-pt",
-        default=DEFAULT_LABELED_KEYS,
+        default=None,
+        help=(
+            "Optional stable-key PT file. When omitted, "
+            "Dataset/COD/sampled_images.txt is used."
+        ),
     )
     parser.add_argument("--epochs", type=_positive_int, default=30)
     parser.add_argument("--batch-size", type=_positive_int, default=None)
@@ -156,9 +155,12 @@ def main() -> None:
             cfg.learning_rate = float(args.learning_rate)
         configure_distributed(cfg, context, args.seed)
         set_seed(cfg.seed, args.deterministic)
-        cfg.labeled_split_fingerprint = validate_canonical_labeled_indices_pt(
-            args.labeled_indices_pt
+        split_identity = validate_labeled_split_source(
+            args.labeled_indices_pt,
+            getattr(cfg, "train_sample_txt", None),
         )
+        cfg.labeled_split_count = split_identity.count
+        cfg.labeled_split_fingerprint = split_identity.fingerprint
 
         if args.resume:
             pc_cfg = read_pc_config(

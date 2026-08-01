@@ -12,6 +12,7 @@ from Model.PC_HBM.memory import PCMemory
 from tools.export_non_pc_decoder import export_non_pc_decoder
 from utils.checkpoint_pc_hbm import (
     CANONICAL_LABELED_SPLIT_FINGERPRINT,
+    LabeledSplitIdentity,
     build_artifact_metadata,
     extract_non_pc_decoder_state,
     load_decoder_compatible,
@@ -24,8 +25,15 @@ from utils.checkpoint_pc_hbm import (
     save_training_resume,
     validate_canonical_labeled_indices_pt,
     validate_canonical_labeled_split_fingerprint,
+    validate_labeled_indices_pt,
+    validate_labeled_sample_txt,
+    validate_labeled_sample_keys,
+    validate_labeled_split_source,
 )
-from utils.pc_memory_runner import _validate_canonical_memory_split
+from utils.pc_memory_runner import (
+    _validate_canonical_memory_split,
+    _validate_memory_split,
+)
 
 
 class TinyDecoder(nn.Module):
@@ -347,3 +355,51 @@ def test_canonical_labeled_split_is_fail_fast(tmp_path):
     )
     with pytest.raises(RuntimeError, match="exactly 202"):
         _validate_canonical_memory_split(wrong_loader)
+
+
+@pytest.mark.parametrize("count", [202, 404])
+def test_run_labeled_split_accepts_variable_cardinality(tmp_path, count):
+    keys = [f"COD10K/sample_{index:04d}" for index in range(count)]
+    split_path = tmp_path / f"keys_{count}.pt"
+    torch.save(keys, split_path)
+
+    identity = validate_labeled_indices_pt(split_path)
+    assert identity == LabeledSplitIdentity(
+        count=count,
+        fingerprint=identity.fingerprint,
+    )
+
+    loader = SimpleNamespace(dataset=SimpleNamespace(sample_keys=keys))
+    assert _validate_memory_split(
+        loader,
+        expected_count=count,
+        expected_fingerprint=identity.fingerprint,
+    ) == identity
+
+
+def test_run_labeled_split_rejects_duplicates_and_contract_mismatch(tmp_path):
+    with pytest.raises(RuntimeError, match="unique"):
+        validate_labeled_sample_keys(["CAMO/a", "CAMO\\a"])
+
+    split_path = tmp_path / "keys.pt"
+    torch.save(["CAMO/a", "CAMO/b"], split_path)
+    with pytest.raises(RuntimeError, match="count differs"):
+        validate_labeled_indices_pt(split_path, expected_count=3)
+    with pytest.raises(RuntimeError, match="fingerprint differs"):
+        validate_labeled_indices_pt(
+            split_path,
+            expected_fingerprint="0" * 64,
+        )
+
+
+def test_labeled_split_source_falls_back_to_txt_and_pt_overrides(tmp_path):
+    txt_path = tmp_path / "sampled_images.txt"
+    txt_path.write_text("TR-CAMO/a\nTR-COD10K/b\n", encoding="utf-8")
+    txt_identity = validate_labeled_sample_txt(txt_path)
+    assert txt_identity.count == 2
+    assert validate_labeled_split_source(None, txt_path) == txt_identity
+
+    pt_path = tmp_path / "selected.pt"
+    torch.save(["TR-CAMO/c"], pt_path)
+    pt_identity = validate_labeled_indices_pt(pt_path)
+    assert validate_labeled_split_source(pt_path, txt_path) == pt_identity

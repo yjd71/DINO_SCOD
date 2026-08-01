@@ -12,7 +12,7 @@ from configs.ts_model_config import Config
 from Model.ts_model import TSModel
 from utils.checkpoint_pc_hbm import (
     read_pc_config,
-    validate_canonical_labeled_indices_pt,
+    validate_labeled_split_source,
 )
 from utils.distributed import (
     cleanup_distributed,
@@ -23,11 +23,6 @@ from utils.distributed import (
 from utils.trainer_ts_model_pseudo_pc_hbm import (
     PCHBMPseudoTrainer,
     validate_teacher_enhancer_checkpoint,
-)
-
-
-DEFAULT_LABELED_KEYS = (
-    "./data/cache/labeled_indices/pc_bacs_0202_keys.pt"
 )
 
 
@@ -55,7 +50,11 @@ def parse_args():
     parser.add_argument("--resume", default=None)
     parser.add_argument(
         "--labeled-indices-pt",
-        default=DEFAULT_LABELED_KEYS,
+        default=None,
+        help=(
+            "Optional stable-key PT file. When omitted, "
+            "Dataset/COD/sampled_images.txt is used."
+        ),
     )
     parser.add_argument(
         "--output-dir",
@@ -114,14 +113,17 @@ def main():
         # compatibility (and would make a later TS resume inconsistent).
         cfg.l_train_size = int(pc_cfg.input_size)
         cfg.u_train_size = int(pc_cfg.input_size)
-        split_fingerprint = validate_canonical_labeled_indices_pt(
-            args.labeled_indices_pt
+        split_identity = validate_labeled_split_source(
+            args.labeled_indices_pt,
+            getattr(cfg, "train_sample_txt", None),
         )
+        split_fingerprint = split_identity.fingerprint
         teacher_metadata = validate_teacher_enhancer_checkpoint(
             args.teacher_checkpoint,
             split_fingerprint,
         )
         cfg.labeled_split_fingerprint = split_fingerprint
+        cfg.labeled_split_count = split_identity.count
         cfg.baseline_fingerprint = teacher_metadata["baseline_fingerprint"]
         model = TSModel(
             teacher_pth=args.teacher_checkpoint,

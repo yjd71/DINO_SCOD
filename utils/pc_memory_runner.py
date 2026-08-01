@@ -12,8 +12,9 @@ from torch.utils.data import DistributedSampler, RandomSampler
 
 from utils.checkpoint_pc_hbm import (
     CANONICAL_LABELED_SPLIT_COUNT,
-    compute_labeled_split_fingerprint,
-    validate_canonical_labeled_split_fingerprint,
+    CANONICAL_LABELED_SPLIT_FINGERPRINT,
+    LabeledSplitIdentity,
+    validate_labeled_sample_keys,
 )
 
 
@@ -147,12 +148,18 @@ def rebuild_memory(
     compat_meta: Mapping[str, Any] | None = None,
     entry_builder: Callable[..., Mapping[str, Any]] | None = None,
     use_amp: bool = True,
+    expected_split_count: int | None = None,
+    expected_split_fingerprint: str | None = None,
 ):
     """Rebuild one rank's CPU-resident memory from labeled data only."""
 
     device = torch.device(device)
     _validate_memory_loader(memory_loader)
-    _validate_canonical_memory_split(memory_loader)
+    _validate_memory_split(
+        memory_loader,
+        expected_count=expected_split_count,
+        expected_fingerprint=expected_split_fingerprint,
+    )
     feature_model = _unwrap_module(model)
     if not hasattr(feature_model, "extract_features"):
         raise AttributeError("Memory rebuild model must provide extract_features(images)")
@@ -218,22 +225,40 @@ def _validate_memory_loader(memory_loader) -> None:
         raise ValueError("Memory loader must use shuffle=False")
 
 
-def _validate_canonical_memory_split(memory_loader) -> None:
+def _validate_memory_split(
+    memory_loader,
+    *,
+    expected_count: int | None = None,
+    expected_fingerprint: str | None = None,
+) -> LabeledSplitIdentity:
     dataset = getattr(memory_loader, "dataset", None)
     sample_keys = getattr(dataset, "sample_keys", None)
     if sample_keys is None:
         raise ValueError(
-            "Memory loader dataset must expose stable canonical sample_keys"
+            "Memory loader dataset must expose stable sample_keys"
         )
-    sample_keys = list(sample_keys)
-    if len(sample_keys) != CANONICAL_LABELED_SPLIT_COUNT:
+    return validate_labeled_sample_keys(
+        sample_keys,
+        expected_count=expected_count,
+        expected_fingerprint=expected_fingerprint,
+    )
+
+
+def _validate_canonical_memory_split(memory_loader) -> None:
+    """Retain the fixed 202-key check for reproducible benchmark tools."""
+
+    dataset = getattr(memory_loader, "dataset", None)
+    sample_keys = getattr(dataset, "sample_keys", None)
+    if sample_keys is not None and len(sample_keys) != CANONICAL_LABELED_SPLIT_COUNT:
         raise RuntimeError(
-            "Memory rebuild requires exactly "
+            "Benchmark memory rebuild requires exactly "
             f"{CANONICAL_LABELED_SPLIT_COUNT} labeled samples, "
             f"got {len(sample_keys)}"
         )
-    validate_canonical_labeled_split_fingerprint(
-        compute_labeled_split_fingerprint(sample_keys)
+    _validate_memory_split(
+        memory_loader,
+        expected_count=CANONICAL_LABELED_SPLIT_COUNT,
+        expected_fingerprint=CANONICAL_LABELED_SPLIT_FINGERPRINT,
     )
 
 
@@ -246,4 +271,6 @@ __all__ = [
     "module_fingerprint",
     "rebuild_memory",
     "unpack_memory_batch",
+    "_validate_canonical_memory_split",
+    "_validate_memory_split",
 ]

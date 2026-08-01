@@ -35,16 +35,14 @@ from Model.PC_HBM.training.losses import pc_hbm_pc_only_labeled_loss
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from utils.checkpoint_pc_hbm import (
     build_artifact_metadata,
-    CANONICAL_LABELED_SPLIT_COUNT,
-    compute_labeled_split_fingerprint,
     load_training_resume,
     read_artifact_metadata,
     save_decoder_checkpoint,
     save_memory_checkpoint,
     save_training_resume,
     state_dict_fingerprint,
-    validate_canonical_labeled_indices_pt,
-    validate_canonical_labeled_split_fingerprint,
+    validate_labeled_sample_keys,
+    validate_labeled_split_source,
 )
 from utils.dataloader import PCLabeledTrainDataset, build_labeled_memory_loader
 from utils.distributed import is_main_process, reduce_mean, synchronize, unwrap_model
@@ -191,28 +189,28 @@ class BasePCHBMTrainer:
             raise ValueError(
                 "Base labeled loader dataset must expose stable sample_keys"
             )
-        sample_keys = list(sample_keys)
-        if len(sample_keys) != CANONICAL_LABELED_SPLIT_COUNT:
-            raise RuntimeError(
-                "Base labeled loader must contain exactly "
-                f"{CANONICAL_LABELED_SPLIT_COUNT} samples"
-            )
-        loader_fingerprint = validate_canonical_labeled_split_fingerprint(
-            compute_labeled_split_fingerprint(sample_keys)
+        loader_identity = validate_labeled_sample_keys(sample_keys)
+        source_identity = validate_labeled_split_source(
+            getattr(cfg, "train_labeled_indices_pt", None),
+            getattr(cfg, "train_sample_txt", None),
         )
-        indices_path = getattr(cfg, "train_labeled_indices_pt", None)
-        if not indices_path:
-            raise ValueError(
-                f"{self.training_design} requires train_labeled_indices_pt"
-            )
-        indices_fingerprint = validate_canonical_labeled_indices_pt(
-            indices_path
-        )
-        if indices_fingerprint != loader_fingerprint:
+        if source_identity != loader_identity:
             raise RuntimeError(
-                "Labeled loader and indices file fingerprints differ"
+                "Labeled loader and selection source split identities differ"
             )
-        cfg.labeled_split_fingerprint = loader_fingerprint
+        prevalidated_count = getattr(cfg, "labeled_split_count", loader_identity.count)
+        prevalidated_fingerprint = getattr(
+            cfg, "labeled_split_fingerprint", loader_identity.fingerprint
+        )
+        if (
+            int(prevalidated_count) != loader_identity.count
+            or str(prevalidated_fingerprint) != loader_identity.fingerprint
+        ):
+            raise RuntimeError(
+                "CLI-prevalidated and Base loader labeled split identities differ"
+            )
+        cfg.labeled_split_count = loader_identity.count
+        cfg.labeled_split_fingerprint = loader_identity.fingerprint
         if not getattr(cfg, "baseline_fingerprint", None):
             cfg.baseline_fingerprint = state_dict_fingerprint(
                 {
@@ -351,6 +349,8 @@ class BasePCHBMTrainer:
             config=self.pc_cfg,
             compat_meta=compat_meta,
             use_amp=self.amp_enabled,
+            expected_split_count=int(self.cfg.labeled_split_count),
+            expected_split_fingerprint=str(self.cfg.labeled_split_fingerprint),
         )
         self._assert_memory_ready(epoch, self.memory_decoder)
         synchronize()
