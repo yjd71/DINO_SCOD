@@ -130,7 +130,7 @@ class DinoPCHBMConfig:
     tau_parent: float = 0.07
     tau_child: float = 0.10
     child_mix_init_logit: float = 0.0
-    child_verification_mode: str = "weighted_sum"
+    child_verification_mode: str = "parent_conditioned"
     verification_temperature: float = 0.10
     verification_strength_init: float = 0.25
     verification_abs_weight_init: float = 0.05

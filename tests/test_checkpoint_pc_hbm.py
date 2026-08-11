@@ -95,7 +95,7 @@ def test_decoder_v2_round_trip_and_baseline_only_loading(tmp_path):
         artifact_meta=_metadata("decoder"),
     )
     assert payload["child_verifier_version"] == 2
-    assert payload["child_verification_mode"] == "weighted_sum"
+    assert payload["child_verification_mode"] == "parent_conditioned"
     assert payload["pc_cfg"]["verification_temperature"] == pytest.approx(0.1)
     target = TinyDecoder()
     load_decoder_compatible(

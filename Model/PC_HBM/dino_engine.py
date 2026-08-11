@@ -65,6 +65,13 @@ class DinoPCHBMEngine(nn.Module):
             tau_child=cfg.tau_child,
             child_mix_init_logit=cfg.child_mix_init_logit,
             child_verification_mode=cfg.child_verification_mode,
+            verification_temperature=cfg.verification_temperature,
+            verification_strength_init=cfg.verification_strength_init,
+            verification_abs_weight_init=cfg.verification_abs_weight_init,
+            verification_rel_weight_init=cfg.verification_rel_weight_init,
+            verification_bias_init=cfg.verification_bias_init,
+            verification_logit_clip=cfg.verification_logit_clip,
+            relation_norm_eps=cfg.relation_norm_eps,
         )
         self.p3_residual = P3GatedResidual(
             dim=cfg.memory_dim,
