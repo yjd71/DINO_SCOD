@@ -196,7 +196,7 @@ def test_decoder_memory_features_are_lite_builder_inputs(
         assert memory_features[key].shape == (1, 128, 28, 28)
 
 
-def test_pair_loss_backward_reaches_child_mix_and_encoder(
+def test_pair_loss_backward_reaches_verifier_and_child_encoder(
     decoder_inputs,
 ) -> None:
     model, features, memory = decoder_inputs
@@ -212,7 +212,10 @@ def test_pair_loss_backward_reaches_child_mix_and_encoder(
     logits = aux["pc_hbm"]["pair_logits"]
     loss = (logits[:, 0] - logits[:, 1]).mean()
     loss.backward()
-    assert model.pc_hbm.pair_verifier.raw_child_mix.grad is not None
+    assert all(
+        parameter.grad is not None and torch.isfinite(parameter.grad).all()
+        for parameter in model.pc_hbm.pair_verifier.parameters()
+    )
     assert any(
         parameter.grad is not None
         for parameter in model.pc_hbm.child_query.parameters()

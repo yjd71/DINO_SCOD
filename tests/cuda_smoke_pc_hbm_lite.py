@@ -29,9 +29,10 @@ from Model.base_model import BaseModel
 from Model.decoder import Decoder
 from utils.checkpoint_pc_hbm import (
     build_artifact_metadata,
+    load_decoder_compatible,
     save_decoder_checkpoint,
     state_dict_fingerprint,
-    validate_canonical_labeled_indices_pt,
+    validate_labeled_indices_pt,
 )
 from utils.dataloader import build_labeled_memory_loader
 from utils.pc_memory_runner import module_fingerprint, rebuild_memory
@@ -61,6 +62,23 @@ def assert_finite_gradients(module) -> None:
         raise AssertionError("No gradients were produced")
     if not all(bool(torch.isfinite(value).all()) for value in gradients):
         raise FloatingPointError("Non-finite gradient in CUDA smoke")
+
+
+def assert_all_finite_gradients(module) -> None:
+    missing = [
+        name
+        for name, parameter in module.named_parameters()
+        if parameter.requires_grad and parameter.grad is None
+    ]
+    if missing:
+        raise AssertionError(f"Unused trainable parameters: {missing}")
+    nonfinite = [
+        name
+        for name, parameter in module.named_parameters()
+        if not bool(torch.isfinite(parameter.grad).all())
+    ]
+    if nonfinite:
+        raise FloatingPointError(f"Non-finite gradients: {nonfinite}")
 
 
 def assert_finite_loss(loss: torch.Tensor, name: str) -> None:
@@ -97,12 +115,27 @@ def main() -> None:
     device = torch.device("cuda")
     cfg = Config()
     cfg.train_labeled_indices_pt = str(args.labeled_indices_pt)
-    split_fingerprint = validate_canonical_labeled_indices_pt(
+    split_identity = validate_labeled_indices_pt(
         args.labeled_indices_pt
     )
+    if split_identity.count != 202:
+        raise RuntimeError(
+            f"CUDA smoke requires 202 labeled samples, got {split_identity.count}"
+        )
+    split_fingerprint = split_identity.fingerprint
     pc_cfg = DinoPCHBMConfig()
     cfg.train_size = int(pc_cfg.input_size)
     model = BaseModel(pc_cfg=pc_cfg).to(device).train()
+    verifier_parameter_count = sum(
+        parameter.numel()
+        for parameter in model.decoder.pc_hbm.pair_verifier.parameters()
+    )
+    if pc_cfg.child_verification_mode != "parent_conditioned":
+        raise AssertionError("CUDA smoke must exercise parent_conditioned mode")
+    if verifier_parameter_count != 16_388:
+        raise AssertionError(
+            f"Expected 16,388 verifier parameters, got {verifier_parameter_count}"
+        )
     loader = build_labeled_memory_loader(
         l_image_root=cfg.train_imgs,
         l_gt_root=cfg.train_masks,
@@ -129,6 +162,23 @@ def main() -> None:
     )
     if not memory.is_ready():
         raise RuntimeError("Real labeled-only memory rebuild failed")
+    with tempfile.TemporaryDirectory(prefix="pcv-cuda-roundtrip-") as temporary:
+        checkpoint_path = Path(temporary) / "decoder.pth"
+        save_decoder_checkpoint(checkpoint_path, model.decoder, pc_cfg, epoch=0)
+        roundtrip = Decoder(
+            in_dim=pc_cfg.encoder_dim,
+            out_dim=pc_cfg.decoder_dim,
+            pc_cfg=pc_cfg,
+        )
+        load_decoder_compatible(
+            roundtrip,
+            checkpoint_path,
+            require_pc_complete=True,
+            expected_pc_cfg=pc_cfg,
+        )
+        for name, value in model.decoder.state_dict().items():
+            if not torch.equal(value.detach().cpu(), roundtrip.state_dict()[name]):
+                raise AssertionError(f"Checkpoint round-trip mismatch: {name}")
     # rebuild_memory intentionally evaluates the producer; restore training mode.
     model.train()
     assert_dino_frozen(model)
@@ -179,6 +229,7 @@ def main() -> None:
         assert_finite_loss(base_loss, "Base loss")
         base_loss.backward()
         assert_finite_gradients(model.decoder)
+        assert_all_finite_gradients(model.decoder.pc_hbm.pair_verifier)
         assert_dino_frozen(model)
         base_optimizer.step()
     base_peak = peak_memory()
