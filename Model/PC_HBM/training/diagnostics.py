@@ -31,6 +31,23 @@ DIAGNOSTIC_NAMES = (
     "gate_on_correct",
     "p3_delta_l1",
     "child_mix_beta",
+    "parent_only_accuracy",
+    "verified_accuracy",
+    "verification_repair_rate",
+    "verification_harm_rate",
+    "verification_net_gain",
+    "margin_gain_parent_wrong",
+    "margin_gain_parent_tied",
+    "margin_gain_parent_correct",
+    "candidate_auroc",
+    "relation_valid_ratio",
+    "verification_strength",
+    "verification_abs_weight",
+    "verification_rel_weight",
+    "verification_bias",
+    "verify_logit_mean",
+    "verify_logit_std",
+    "verification_update_parent_ratio",
     "z_main_loss",
     "pseudo_conf_mean",
     "pseudo_conf_boundary_mean",
@@ -128,6 +145,49 @@ def collect_pc_diagnostics(
     metrics["gate_mean"] = _masked_query_mean(gate, valid, zero)
     metrics["p3_delta_l1"] = _mean_abs(pc.get("p3_delta"), zero)
     metrics["child_mix_beta"] = _mean_tensor(pc.get("beta"), zero)
+    metrics["verification_strength"] = _mean_tensor(
+        pc.get("verification_strength"), zero
+    )
+    metrics["verification_abs_weight"] = _mean_tensor(
+        pc.get("verification_abs_weight"), zero
+    )
+    metrics["verification_rel_weight"] = _mean_tensor(
+        pc.get("verification_rel_weight"), zero
+    )
+    metrics["verification_bias"] = _mean_tensor(
+        pc.get("verification_bias"), zero
+    )
+    verify_logits = pc.get("child_verify_logits")
+    if torch.is_tensor(verify_logits) and candidate_valid is not None:
+        if verify_logits.shape != candidate_valid.shape:
+            raise ValueError("child_verify_logits must match retrieval_valid")
+        verify_values = verify_logits.detach().float()[candidate_valid]
+        if verify_values.numel():
+            metrics["verify_logit_mean"] = verify_values.mean()
+            metrics["verify_logit_std"] = verify_values.std(unbiased=False)
+        relation_valid = pc.get("relation_valid")
+        if torch.is_tensor(relation_valid):
+            if relation_valid.shape != candidate_valid.shape:
+                raise ValueError("relation_valid must match retrieval_valid")
+            denominator = candidate_valid.sum().clamp_min(1).float()
+            metrics["relation_valid_ratio"] = (
+                relation_valid.detach().bool() & candidate_valid
+            ).sum().float() / denominator
+        candidate_parent_scores = pc.get("parent_scores")
+        strength = pc.get("verification_strength")
+        if (
+            torch.is_tensor(candidate_parent_scores)
+            and candidate_parent_scores.shape == candidate_valid.shape
+            and torch.is_tensor(strength)
+            and strength.numel() == 1
+        ):
+            update = strength.detach().float().reshape(()) * verify_logits.detach().float()
+            ratio = update.abs() / (
+                candidate_parent_scores.detach().float().abs() + 1.0e-6
+            )
+            ratio_values = ratio[candidate_valid]
+            if ratio_values.numel():
+                metrics["verification_update_parent_ratio"] = ratio_values.mean()
 
     query_map = pc.get("query_mask_map")
     if pseudo_confidence is not None and torch.is_tensor(query_map):
@@ -156,6 +216,61 @@ def collect_pc_diagnostics(
                 logits.detach()[supervised].argmax(dim=1)
                 == labels[supervised]
             ).float().mean()
+            metrics["verified_accuracy"] = metrics["pair_cls_acc"]
+            parent_logits = pc.get("parent_region_logits")
+            if torch.is_tensor(parent_logits):
+                if parent_logits.shape != (count, 2):
+                    raise ValueError("parent_region_logits must be [M,2]")
+                selected_labels = labels[supervised]
+                selected_parent = parent_logits.detach().float()[supervised]
+                selected_verified = logits.detach().float()[supervised]
+                parent_correct = selected_parent.argmax(dim=1) == selected_labels
+                verified_correct = selected_verified.argmax(dim=1) == selected_labels
+                metrics["parent_only_accuracy"] = parent_correct.float().mean()
+                repair = (~parent_correct) & verified_correct
+                harm = parent_correct & (~verified_correct)
+                metrics["verification_repair_rate"] = repair.float().mean()
+                metrics["verification_harm_rate"] = harm.float().mean()
+                metrics["verification_net_gain"] = (
+                    metrics["verification_repair_rate"]
+                    - metrics["verification_harm_rate"]
+                )
+                target_index = selected_labels[:, None]
+                other_index = (1 - selected_labels)[:, None]
+                parent_margin = (
+                    selected_parent.gather(1, target_index)
+                    - selected_parent.gather(1, other_index)
+                ).squeeze(1)
+                verified_margin = (
+                    selected_verified.gather(1, target_index)
+                    - selected_verified.gather(1, other_index)
+                ).squeeze(1)
+                margin_gain = verified_margin - parent_margin
+                metrics["margin_gain_parent_wrong"] = _masked_query_mean(
+                    margin_gain, parent_margin < 0.0, zero
+                )
+                metrics["margin_gain_parent_tied"] = _masked_query_mean(
+                    margin_gain, parent_margin == 0.0, zero
+                )
+                metrics["margin_gain_parent_correct"] = _masked_query_mean(
+                    margin_gain, parent_margin > 0.0, zero
+                )
+            if (
+                torch.is_tensor(verify_logits)
+                and candidate_valid is not None
+                and verify_logits.shape == candidate_valid.shape
+            ):
+                selected_valid = candidate_valid[supervised]
+                selected_verify = verify_logits.detach().float()[supervised]
+                candidate_target = (
+                    torch.arange(2, device=selected_labels.device).view(1, 2, 1)
+                    == selected_labels.view(-1, 1, 1)
+                ).expand_as(selected_valid)
+                metrics["candidate_auroc"] = _tie_aware_binary_auroc(
+                    selected_verify[selected_valid],
+                    candidate_target[selected_valid],
+                    zero,
+                )
         correct = _query_prediction_correct(pc, z_main, gt, valid)
         gate_vector = _query_vector(gate, count, "gate")
         metrics["gate_on_error"] = _masked_query_mean(
@@ -335,6 +450,19 @@ def _mean_abs(value, zero):
     if not torch.is_tensor(value) or value.numel() == 0:
         return zero
     return value.detach().float().abs().mean()
+
+
+def _tie_aware_binary_auroc(scores, targets, zero):
+    scores = scores.detach().float().reshape(-1)
+    targets = targets.detach().bool().reshape(-1)
+    positives = scores[targets]
+    negatives = scores[~targets]
+    if positives.numel() == 0 or negatives.numel() == 0:
+        return zero
+    comparisons = positives[:, None] - negatives[None, :]
+    return (
+        (comparisons > 0.0).float() + 0.5 * (comparisons == 0.0).float()
+    ).mean()
 
 
 def _as_float(value: Any) -> float:

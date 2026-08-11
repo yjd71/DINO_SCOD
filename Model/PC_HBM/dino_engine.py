@@ -353,6 +353,11 @@ class DinoPCHBMEngine(nn.Module):
         return {
             "query_batch_ids": batch_ids,
             "query_flat_indices": flat_indices,
+            "query_scores": query_scores,
+            "verification_q3": q3,
+            "verification_q_child": child["q_child"],
+            "retrieval_parent_keys": retrieval["parent_keys"],
+            "retrieval_child_keys": retrieval["paired_p2_keys"],
             "query_valid": verified["query_valid"],
             "pair_scores": verified["pair_scores"],
             "pair_weight": verified["pair_weight"],
