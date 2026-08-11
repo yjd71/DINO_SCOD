@@ -132,6 +132,21 @@ def test_lite_config_accepts_tunable_hyperparameters() -> None:
         tau_parent=0.12,
         tau_child=0.18,
         child_mix_init_logit=0.4,
+        child_verification_mode="parent_conditioned",
+        verification_temperature=0.2,
+        verification_strength_init=0.3,
+        verification_abs_weight_init=0.07,
+        verification_rel_weight_init=0.08,
+        verification_bias_init=-0.1,
+        verification_logit_clip=5.0,
+        relation_norm_eps=2.0e-4,
+        parent_hard_margin=0.3,
+        parent_wrong_target_margin=0.15,
+        verification_gain_margin=0.12,
+        verification_preserve_tolerance=0.04,
+        lambda_candidate_verify=0.6,
+        lambda_parent_repair=0.7,
+        lambda_parent_preserve=0.2,
         verify_start_epoch=2,
         full_pc_start_epoch=4,
         teacher_only_full_start_epoch=3,
@@ -153,6 +168,10 @@ def test_lite_config_accepts_tunable_hyperparameters() -> None:
     assert cfg.route_global_weight == pytest.approx(0.7)
     assert cfg.region_max_quota == (60, 72)
     assert cfg.child_window_size == 5
+    assert cfg.child_verification_mode == "parent_conditioned"
+    assert cfg.verification_temperature == pytest.approx(0.2)
+    assert cfg.verification_strength_init == pytest.approx(0.3)
+    assert cfg.lambda_parent_preserve == pytest.approx(0.2)
     assert cfg.memory_storage_dtype == "bfloat16"
     assert cfg.dino_layer_indices == (1, 4, 7, 10)
     assert cfg.expected_memory_meta() == {
@@ -195,6 +214,28 @@ def test_lite_config_accepts_tunable_hyperparameters() -> None:
         "verify_only",
         "full",
     ]
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"child_verification_mode": "unknown"}, "child_verification_mode"),
+        ({"verification_temperature": 0.0}, "verification_temperature"),
+        ({"verification_strength_init": 1.0}, "verification_strength_init"),
+        ({"verification_abs_weight_init": 0.0}, "verification_abs_weight_init"),
+        ({"verification_rel_weight_init": -0.1}, "verification_rel_weight_init"),
+        ({"verification_logit_clip": 0.0}, "verification_logit_clip"),
+        ({"relation_norm_eps": 0.0}, "relation_norm_eps"),
+        ({"lambda_candidate_verify": -0.1}, "lambda_candidate_verify"),
+        ({"lambda_parent_repair": -0.1}, "lambda_parent_repair"),
+        ({"lambda_parent_preserve": -0.1}, "lambda_parent_preserve"),
+    ],
+)
+def test_child_verifier_v2_config_rejects_invalid_values(
+    kwargs: dict, match: str
+) -> None:
+    with pytest.raises(ValueError, match=match):
+        DinoPCHBMConfig(**kwargs)
 
 
 def test_lite_config_accepts_safe_zero_and_closed_boundary_values() -> None:

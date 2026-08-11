@@ -87,13 +87,16 @@ def test_decoder_v2_round_trip_and_baseline_only_loading(tmp_path):
     cfg = DinoPCHBMConfig()
     source = TinyDecoder()
     path = tmp_path / "decoder.pth"
-    save_decoder_checkpoint(
+    payload = save_decoder_checkpoint(
         path,
         source,
         cfg,
         3,
         artifact_meta=_metadata("decoder"),
     )
+    assert payload["child_verifier_version"] == 2
+    assert payload["child_verification_mode"] == "weighted_sum"
+    assert payload["pc_cfg"]["verification_temperature"] == pytest.approx(0.1)
     target = TinyDecoder()
     load_decoder_compatible(
         target,
@@ -115,6 +118,23 @@ def test_decoder_v2_round_trip_and_baseline_only_loading(tmp_path):
     load_decoder_compatible(other, baseline)
     for key, value in before_pc.items():
         assert torch.equal(value, other.pc_hbm.state_dict()[key])
+
+
+def test_decoder_v2_rejects_missing_child_verifier_metadata(tmp_path):
+    cfg = DinoPCHBMConfig()
+    source = TinyDecoder()
+    path = tmp_path / "decoder.pth"
+    payload = save_decoder_checkpoint(path, source, cfg, 1)
+    payload.pop("child_verifier_version")
+    torch.save(payload, path)
+
+    with pytest.raises(RuntimeError, match="child_verifier_version=2"):
+        load_decoder_compatible(
+            TinyDecoder(),
+            path,
+            require_pc_complete=True,
+            expected_pc_cfg=cfg,
+        )
 
 
 def test_decoder_config_is_reconstructed_and_mismatch_is_atomic(tmp_path):

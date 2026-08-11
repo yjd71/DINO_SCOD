@@ -69,11 +69,13 @@ class PairVerifier(nn.Module):
         tau_parent: float = 0.07,
         tau_child: float = 0.10,
         child_mix_init_logit: float = 0.0,
+        child_verification_mode: str = "weighted_sum",
     ) -> None:
         super().__init__()
         self.dim = int(dim)
         self.tau_parent = float(tau_parent)
         self.tau_child = float(tau_child)
+        self.child_verification_mode = str(child_verification_mode).lower()
         if self.dim <= 0:
             raise ValueError("dim must be positive")
         if (
@@ -85,6 +87,11 @@ class PairVerifier(nn.Module):
             raise ValueError("cosine temperatures must be positive")
         if not math.isfinite(float(child_mix_init_logit)):
             raise ValueError("child_mix_init_logit must be finite")
+        if self.child_verification_mode != "weighted_sum":
+            raise ValueError(
+                "PairVerifier currently supports child_verification_mode="
+                "'weighted_sum' only"
+            )
         # The verifier has exactly one learnable mixing scalar.
         self.raw_child_mix = nn.Parameter(
             torch.tensor(float(child_mix_init_logit), dtype=torch.float32)
@@ -150,6 +157,16 @@ class PairVerifier(nn.Module):
             valid, pair_scores, pair_scores.new_full((), -1.0e4)
         )
 
+        parent_scores = torch.nan_to_num(
+            parent_cosine / self.tau_parent,
+            nan=0.0,
+            posinf=1.0e4,
+            neginf=-1.0e4,
+        ).clamp(-1.0e4, 1.0e4)
+        parent_scores = torch.where(
+            valid, parent_scores, parent_scores.new_full((), -1.0e4)
+        )
+
         region_has_candidate = valid.any(dim=-1)
         query_valid = region_has_candidate.all(dim=-1)
         pair_weight = _masked_softmax_fp32(pair_scores, valid, dim=-1)
@@ -162,6 +179,22 @@ class PairVerifier(nn.Module):
             query_valid[:, None],
             region_probability,
             torch.zeros_like(region_probability),
+        )
+        parent_region_logits = _masked_logmeanexp_fp32(
+            parent_scores, valid, dim=-1
+        )
+        parent_region_logits = torch.where(
+            query_valid[:, None],
+            parent_region_logits,
+            torch.zeros_like(parent_region_logits),
+        )
+        parent_region_probability = torch.softmax(
+            parent_region_logits, dim=-1
+        )
+        parent_region_probability = torch.where(
+            query_valid[:, None],
+            parent_region_probability,
+            torch.zeros_like(parent_region_probability),
         )
 
         contexts = torch.einsum(
@@ -218,17 +251,34 @@ class PairVerifier(nn.Module):
             torch.zeros_like(correction),
         )
 
+        parent_cosine_masked = torch.where(
+            valid, parent_cosine, torch.zeros_like(parent_cosine)
+        )
+        child_cosine_masked = torch.where(
+            valid, child_cosine, torch.zeros_like(child_cosine)
+        )
+        zero_evidence = torch.zeros_like(child_cosine_masked)
         return {
-            "parent_cosine": torch.where(
-                valid, parent_cosine, torch.zeros_like(parent_cosine)
-            ),
-            "child_cosine": torch.where(
-                valid, child_cosine, torch.zeros_like(child_cosine)
-            ),
+            "parent_cosine": parent_cosine_masked,
+            "parent_scores": parent_scores,
+            "parent_region_logits": parent_region_logits,
+            "parent_region_prob": parent_region_probability,
+            "child_abs_cosine": child_cosine_masked,
+            "child_relation_cosine": zero_evidence,
+            "relation_valid": torch.zeros_like(valid),
+            "child_verify_logits": zero_evidence,
+            "verification_strength": beta.new_zeros(()),
+            "verification_abs_weight": beta.new_zeros(()),
+            "verification_rel_weight": beta.new_zeros(()),
+            "verification_bias": beta.new_zeros(()),
+            "child_cosine": child_cosine_masked,
             "pair_scores": pair_scores,
+            "verified_scores": pair_scores,
             "pair_weight": pair_weight,
             "pair_logits": region_logits,
+            "verified_region_logits": region_logits,
             "region_prob": region_probability,
+            "verified_region_prob": region_probability,
             "region_context": contexts.to(dtype=q3.dtype),
             "memory_context": memory_context.to(dtype=q3.dtype),
             "candidate_entropy": candidate_entropy,

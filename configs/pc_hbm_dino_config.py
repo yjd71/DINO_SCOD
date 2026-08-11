@@ -130,6 +130,23 @@ class DinoPCHBMConfig:
     tau_parent: float = 0.07
     tau_child: float = 0.10
     child_mix_init_logit: float = 0.0
+    child_verification_mode: str = "weighted_sum"
+    verification_temperature: float = 0.10
+    verification_strength_init: float = 0.25
+    verification_abs_weight_init: float = 0.05
+    verification_rel_weight_init: float = 0.05
+    verification_bias_init: float = 0.0
+    verification_logit_clip: float = 6.0
+    relation_norm_eps: float = 1.0e-4
+
+    # Parent-conditioned verification objectives.
+    parent_hard_margin: float = 0.20
+    parent_wrong_target_margin: float = 0.10
+    verification_gain_margin: float = 0.10
+    verification_preserve_tolerance: float = 0.05
+    lambda_candidate_verify: float = 0.50
+    lambda_parent_repair: float = 0.50
+    lambda_parent_preserve: float = 0.25
 
     # Stage schedule.
     verify_start_epoch: int = 6
@@ -155,6 +172,60 @@ class DinoPCHBMConfig:
     warn_delta_large_threshold: float = 1.0
 
     def __post_init__(self) -> None:
+        self.child_verification_mode = _as_nonempty_str(
+            "child_verification_mode", self.child_verification_mode
+        ).lower()
+        if self.child_verification_mode not in {
+            "weighted_sum",
+            "parent_conditioned",
+        }:
+            raise ValueError(
+                "child_verification_mode must be 'weighted_sum' or "
+                "'parent_conditioned'"
+            )
+        for name in (
+            "verification_temperature",
+            "verification_abs_weight_init",
+            "verification_rel_weight_init",
+            "verification_logit_clip",
+            "relation_norm_eps",
+        ):
+            setattr(
+                self,
+                name,
+                _as_float(
+                    name,
+                    getattr(self, name),
+                    minimum=0.0,
+                    minimum_open=True,
+                ),
+            )
+        self.verification_strength_init = _as_float(
+            "verification_strength_init",
+            self.verification_strength_init,
+            minimum=0.0,
+            maximum=1.0,
+            minimum_open=True,
+            maximum_open=True,
+        )
+        self.verification_bias_init = _as_float(
+            "verification_bias_init", self.verification_bias_init
+        )
+        for name in (
+            "parent_hard_margin",
+            "parent_wrong_target_margin",
+            "verification_gain_margin",
+            "verification_preserve_tolerance",
+            "lambda_candidate_verify",
+            "lambda_parent_repair",
+            "lambda_parent_preserve",
+        ):
+            setattr(
+                self,
+                name,
+                _as_float(name, getattr(self, name), minimum=0.0),
+            )
+
         for name in (
             "enabled",
             "use_unlabeled_memory_update",

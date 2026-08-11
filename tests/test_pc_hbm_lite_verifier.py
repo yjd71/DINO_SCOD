@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 from Model.PC_HBM.fusion import P3GatedResidual
 from Model.PC_HBM.retrieval import PairVerifier
@@ -65,6 +66,64 @@ def test_pair_verifier_has_one_scalar_and_fp32_binary_evidence() -> None:
     torch.testing.assert_close(
         result["gate"], 0.25 * result["memory_confidence"]
     )
+    assert torch.equal(result["verified_scores"], result["pair_scores"])
+    assert torch.equal(
+        result["verified_region_logits"], result["pair_logits"]
+    )
+    assert torch.equal(result["verified_region_prob"], result["region_prob"])
+    assert torch.equal(result["child_abs_cosine"], result["child_cosine"])
+    assert torch.count_nonzero(result["child_relation_cosine"]) == 0
+    assert torch.count_nonzero(result["child_verify_logits"]) == 0
+
+
+def test_weighted_sum_pair_scores_are_strict_legacy_parity() -> None:
+    torch.manual_seed(7)
+    verifier = PairVerifier(
+        dim=4,
+        tau_parent=0.17,
+        tau_child=0.23,
+        child_mix_init_logit=-0.4,
+        child_verification_mode="weighted_sum",
+    )
+    q3 = torch.randn(3, 4)
+    q_child = torch.randn(3, 4)
+    valid = torch.tensor(
+        [
+            [[True, True], [True, False]],
+            [[False, True], [True, True]],
+            [[True, True], [True, True]],
+        ]
+    )
+    retrieval = {
+        "parent_keys": torch.randn(3, 2, 2, 4),
+        "paired_p2_keys": torch.randn(3, 2, 2, 4),
+        "valid": valid,
+    }
+
+    result = verifier(q3, q_child, retrieval, torch.ones(3, 1))
+    parent_cosine = F.cosine_similarity(
+        q3.float()[:, None, None, :],
+        retrieval["parent_keys"].float(),
+        dim=-1,
+        eps=1.0e-6,
+    )
+    child_cosine = F.cosine_similarity(
+        q_child.float()[:, None, None, :],
+        retrieval["paired_p2_keys"].float(),
+        dim=-1,
+        eps=1.0e-6,
+    )
+    beta = torch.sigmoid(verifier.raw_child_mix)
+    expected = (
+        (1.0 - beta) * (parent_cosine / verifier.tau_parent)
+        + beta * (child_cosine / verifier.tau_child)
+    )
+    expected = torch.nan_to_num(
+        expected, nan=0.0, posinf=1.0e4, neginf=-1.0e4
+    ).clamp(-1.0e4, 1.0e4)
+    expected = torch.where(valid, expected, expected.new_full((), -1.0e4))
+
+    assert torch.equal(result["pair_scores"], expected)
 
 
 def test_pair_verifier_confidence_uses_probability_weighted_region_entropy() -> None:

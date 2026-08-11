@@ -22,6 +22,7 @@ from torch import nn
 ARTIFACT_METADATA_VERSION = 2
 PC_HBM_ARCHITECTURE = "DINO_SCOD_PC_HBM_LITE"
 PC_HBM_SCHEMA_VERSION = 2
+CHILD_VERIFIER_VERSION = 2
 CANONICAL_LABELED_SPLIT_COUNT = 202
 CANONICAL_LABELED_SPLIT_FINGERPRINT = (
     "1f7cbfa5cd9f3afcc72910d482a762fb5bdb81b35585285d5626be6d1a2698b0"
@@ -149,6 +150,8 @@ def save_decoder_checkpoint(
         "schema_version": PC_HBM_SCHEMA_VERSION,
         "architecture": PC_HBM_ARCHITECTURE,
         "checkpoint_type": "decoder",
+        "child_verifier_version": CHILD_VERIFIER_VERSION,
+        "child_verification_mode": config_state["child_verification_mode"],
         "epoch": int(epoch),
         "decoder": _unwrap(decoder).state_dict(),
         "pc_cfg": config_state,
@@ -245,6 +248,8 @@ def save_training_resume(
         "schema_version": PC_HBM_SCHEMA_VERSION,
         "architecture": PC_HBM_ARCHITECTURE,
         "checkpoint_type": "training_resume",
+        "child_verifier_version": CHILD_VERIFIER_VERSION,
+        "child_verification_mode": config_state["child_verification_mode"],
         "epoch": int(epoch),
         "model": _unwrap(model).state_dict(),
         "optimizer": optimizer.state_dict(),
@@ -872,7 +877,20 @@ def _preflight_pc_v2(checkpoint: Mapping[str, Any], *, context: str) -> None:
             f"{context} architecture must be {PC_HBM_ARCHITECTURE!r}"
         )
     if "pc_cfg" in checkpoint:
-        _validate_lite_config(checkpoint.get("pc_cfg"), context=context)
+        config_state = checkpoint.get("pc_cfg")
+        _validate_lite_config(config_state, context=context)
+        if int(checkpoint.get("child_verifier_version", -1)) != (
+            CHILD_VERIFIER_VERSION
+        ):
+            raise RuntimeError(
+                f"{context} must use child_verifier_version="
+                f"{CHILD_VERIFIER_VERSION}"
+            )
+        expected_mode = config_state["child_verification_mode"]
+        if checkpoint.get("child_verification_mode") != expected_mode:
+            raise RuntimeError(
+                f"{context} child_verification_mode metadata must match pc_cfg"
+            )
 
 
 def _validate_lite_config(config: Any, *, context: str) -> None:
