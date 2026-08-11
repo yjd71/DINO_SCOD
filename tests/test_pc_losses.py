@@ -68,7 +68,10 @@ def test_binary_pair_ce_uses_foreground_and_background_targets():
     gt = torch.tensor([[[[1.0, 0.0], [0.0, 0.0]]]])
     aux = _aux()
     loss, metrics = binary_pair_loss(
-        aux, gt, aux["pc_hbm"]["pair_logits"], DinoPCHBMConfig()
+        aux,
+        gt,
+        aux["pc_hbm"]["pair_logits"],
+        DinoPCHBMConfig(child_verification_mode="weighted_sum"),
     )
     assert float(loss.detach()) < 0.01
     assert float(metrics["pair_accuracy"]) == 1.0
@@ -92,7 +95,7 @@ def test_fully_invalid_pair_loss_is_finite_differentiable_zero():
 
 
 def test_two_stage_and_teacher_only_labeled_objectives():
-    cfg = DinoPCHBMConfig()
+    cfg = DinoPCHBMConfig(child_verification_mode="weighted_sum")
     gt = torch.tensor([[[[1.0, 0.0], [0.0, 0.0]]]])
     outputs = _outputs()
     aux = _aux()

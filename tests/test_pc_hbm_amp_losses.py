@@ -42,7 +42,7 @@ def test_pair_ce_promotes_low_precision_logits_to_fp32():
         aux,
         torch.tensor([[[[1.0, 0.0], [0.0, 0.0]]]], device=device),
         logits,
-        DinoPCHBMConfig(),
+        DinoPCHBMConfig(child_verification_mode="weighted_sum"),
     )
     assert loss.dtype == torch.float32
     assert torch.isfinite(loss)
