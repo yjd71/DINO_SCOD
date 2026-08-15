@@ -102,7 +102,7 @@ class DinoPCHBMConfig:
     exclude_self_match: bool = True
 
     # Parameter-free dual-context routing.
-    route_top_img_k: int = 4
+    route_top_img_k: int = 12
     route_global_weight: float = 0.5
     route_environment_weight: float = 0.5
     route_environment_min_mass: float = 1.0e-3
@@ -119,14 +119,13 @@ class DinoPCHBMConfig:
     bg_near_kernel: int = 7
     gt_binary_threshold: float = 0.5
     region_names: tuple[str, str] = ("fg_boundary", "bg_near")
-    region_max_quota: tuple[int, int] = (48, 48)
-    region_min_quota: tuple[int, int] = (8, 8)
-    region_sampling_ratio: tuple[float, float] = (0.50, 0.50)
-
+    region_max_quota: tuple[int, int] = (784, 784)
+    region_min_quota: tuple[int, int] = (0,0 )
+    region_sampling_ratio: tuple[float, float] = (1.0, 1.0)
     # Balanced retrieval and local Child verification.
-    parent_topk_per_region: int = 4
+    parent_topk_per_region: int =  64
     query_chunk_size: int = 512
-    child_window_size: int = 3
+    child_window_size: int = 7
     tau_parent: float = 0.07
     tau_child: float = 0.10
     child_mix_init_logit: float = 0.0
@@ -155,9 +154,9 @@ class DinoPCHBMConfig:
     pc_injection_ramp_epochs: int = 3
 
     # Labeled and unlabeled objectives.
-    lambda_pair: float = 0.20
+    lambda_pair: float = 1.0
     lambda_u: float = 1.0
-    feature_distill_p3_weight: float = 0.05
+    feature_distill_p3_weight: float = 1.0
 
     # Optimization.
     use_amp: bool = True

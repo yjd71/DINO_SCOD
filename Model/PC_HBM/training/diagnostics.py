@@ -455,14 +455,28 @@ def _mean_abs(value, zero):
 def _tie_aware_binary_auroc(scores, targets, zero):
     scores = scores.detach().float().reshape(-1)
     targets = targets.detach().bool().reshape(-1)
-    positives = scores[targets]
-    negatives = scores[~targets]
-    if positives.numel() == 0 or negatives.numel() == 0:
+    positive_count = targets.sum()
+    negative_count = targets.numel() - positive_count
+    if int(positive_count) == 0 or int(negative_count) == 0:
         return zero
-    comparisons = positives[:, None] - negatives[None, :]
-    return (
-        (comparisons > 0.0).float() + 0.5 * (comparisons == 0.0).float()
-    ).mean()
+
+    # Mann-Whitney U with average ranks is exactly equivalent to pairwise
+    # tie-aware AUROC, but needs O(N) memory instead of O(P * N).
+    sorted_scores, order = torch.sort(scores)
+    sorted_targets = targets[order]
+    _, tie_counts = torch.unique_consecutive(
+        sorted_scores, return_counts=True
+    )
+    tie_starts = tie_counts.cumsum(dim=0) - tie_counts
+    average_ranks = tie_starts.float() + (tie_counts.float() + 1.0) * 0.5
+    rank_per_item = torch.repeat_interleave(average_ranks, tie_counts)
+    positive_rank_sum = rank_per_item[sorted_targets].sum()
+    positive_count_fp = positive_count.float()
+    u_statistic = (
+        positive_rank_sum
+        - positive_count_fp * (positive_count_fp + 1.0) * 0.5
+    )
+    return u_statistic / (positive_count_fp * negative_count.float())
 
 
 def _as_float(value: Any) -> float:

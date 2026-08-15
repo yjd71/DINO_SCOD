@@ -54,18 +54,26 @@ def parse_args() -> argparse.Namespace:
 def exact_tie_aware_auroc(scores: torch.Tensor, targets: torch.Tensor) -> float:
     scores = scores.detach().float().reshape(-1)
     targets = targets.detach().bool().reshape(-1)
-    positives = scores[targets]
-    negatives = scores[~targets]
-    if positives.numel() == 0 or negatives.numel() == 0:
+    positive_count = targets.sum()
+    negative_count = targets.numel() - positive_count
+    if int(positive_count) == 0 or int(negative_count) == 0:
         return 0.0
-    differences = positives[:, None] - negatives[None, :]
+
+    sorted_scores, order = torch.sort(scores)
+    sorted_targets = targets[order]
+    _, tie_counts = torch.unique_consecutive(
+        sorted_scores, return_counts=True
+    )
+    tie_starts = tie_counts.cumsum(dim=0) - tie_counts
+    average_ranks = tie_starts.float() + (tie_counts.float() + 1.0) * 0.5
+    rank_per_item = torch.repeat_interleave(average_ranks, tie_counts)
+    positive_count_fp = positive_count.float()
+    u_statistic = (
+        rank_per_item[sorted_targets].sum()
+        - positive_count_fp * (positive_count_fp + 1.0) * 0.5
+    )
     return float(
-        (
-            (differences > 0.0).float()
-            + 0.5 * (differences == 0.0).float()
-        )
-        .mean()
-        .item()
+        (u_statistic / (positive_count_fp * negative_count.float())).item()
     )
 
 

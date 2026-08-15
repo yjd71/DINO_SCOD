@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import torch
 
-from Model.PC_HBM.training.diagnostics import collect_pc_diagnostics
+from Model.PC_HBM.training.diagnostics import (
+    _tie_aware_binary_auroc,
+    collect_pc_diagnostics,
+)
 from tools.evaluate_child_verification import (
     exact_tie_aware_auroc,
     same_region_derangement,
@@ -84,6 +87,38 @@ def test_exact_auroc_is_tie_aware() -> None:
     assert exact_tie_aware_auroc(
         torch.tensor([1.0]), torch.tensor([True])
     ) == 0.0
+
+
+def test_exact_auroc_matches_pairwise_reference_with_ties() -> None:
+    torch.manual_seed(23)
+    scores = torch.randint(-3, 4, (257,), dtype=torch.float32)
+    targets = torch.rand(257) > 0.55
+    positives = scores[targets]
+    negatives = scores[~targets]
+    differences = positives[:, None] - negatives[None, :]
+    reference = (
+        (differences > 0.0).float()
+        + 0.5 * (differences == 0.0).float()
+    ).mean()
+
+    assert exact_tie_aware_auroc(scores, targets) == reference.item()
+    torch.testing.assert_close(
+        _tie_aware_binary_auroc(scores, targets, torch.tensor(0.0)),
+        reference,
+    )
+
+
+def test_exact_auroc_handles_large_candidate_batches_without_quadratic_memory() -> None:
+    scores = torch.arange(100_000, dtype=torch.float32).remainder(101)
+    targets = torch.arange(100_000).remainder(3) == 0
+
+    result = exact_tie_aware_auroc(scores, targets)
+    training_result = _tie_aware_binary_auroc(
+        scores, targets, torch.tensor(0.0)
+    )
+
+    assert 0.0 <= result <= 1.0
+    assert training_result.item() == result
 
 
 def test_same_region_shuffle_is_seeded_deranged_and_mask_preserving() -> None:
