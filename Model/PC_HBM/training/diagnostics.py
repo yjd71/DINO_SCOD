@@ -41,10 +41,12 @@ DIAGNOSTIC_NAMES = (
     "margin_gain_parent_correct",
     "candidate_auroc",
     "relation_valid_ratio",
+    "child_match_strength",
+    "child_match_logit_mean",
+    "child_match_logit_std",
+    "child_update_parent_ratio",
+    # Deprecated V2 aliases retained for log consumers during V3.
     "verification_strength",
-    "verification_abs_weight",
-    "verification_rel_weight",
-    "verification_bias",
     "verify_logit_mean",
     "verify_logit_std",
     "verification_update_parent_ratio",
@@ -145,26 +147,23 @@ def collect_pc_diagnostics(
     metrics["gate_mean"] = _masked_query_mean(gate, valid, zero)
     metrics["p3_delta_l1"] = _mean_abs(pc.get("p3_delta"), zero)
     metrics["child_mix_beta"] = _mean_tensor(pc.get("beta"), zero)
-    metrics["verification_strength"] = _mean_tensor(
-        pc.get("verification_strength"), zero
-    )
-    metrics["verification_abs_weight"] = _mean_tensor(
-        pc.get("verification_abs_weight"), zero
-    )
-    metrics["verification_rel_weight"] = _mean_tensor(
-        pc.get("verification_rel_weight"), zero
-    )
-    metrics["verification_bias"] = _mean_tensor(
-        pc.get("verification_bias"), zero
-    )
-    verify_logits = pc.get("child_verify_logits")
-    if torch.is_tensor(verify_logits) and candidate_valid is not None:
-        if verify_logits.shape != candidate_valid.shape:
-            raise ValueError("child_verify_logits must match retrieval_valid")
-        verify_values = verify_logits.detach().float()[candidate_valid]
-        if verify_values.numel():
-            metrics["verify_logit_mean"] = verify_values.mean()
-            metrics["verify_logit_std"] = verify_values.std(unbiased=False)
+    match_strength = pc.get("child_match_strength")
+    if not torch.is_tensor(match_strength):
+        match_strength = pc.get("verification_strength")
+    metrics["child_match_strength"] = _mean_tensor(match_strength, zero)
+    metrics["verification_strength"] = metrics["child_match_strength"]
+    match_logits = pc.get("child_match_logits")
+    if not torch.is_tensor(match_logits):
+        match_logits = pc.get("child_verify_logits")
+    if torch.is_tensor(match_logits) and candidate_valid is not None:
+        if match_logits.shape != candidate_valid.shape:
+            raise ValueError("child_match_logits must match retrieval_valid")
+        match_values = match_logits.detach().float()[candidate_valid]
+        if match_values.numel():
+            metrics["child_match_logit_mean"] = match_values.mean()
+            metrics["child_match_logit_std"] = match_values.std(unbiased=False)
+            metrics["verify_logit_mean"] = metrics["child_match_logit_mean"]
+            metrics["verify_logit_std"] = metrics["child_match_logit_std"]
         relation_valid = pc.get("relation_valid")
         if torch.is_tensor(relation_valid):
             if relation_valid.shape != candidate_valid.shape:
@@ -174,20 +173,26 @@ def collect_pc_diagnostics(
                 relation_valid.detach().bool() & candidate_valid
             ).sum().float() / denominator
         candidate_parent_scores = pc.get("parent_scores")
-        strength = pc.get("verification_strength")
+        strength = match_strength
         if (
             torch.is_tensor(candidate_parent_scores)
             and candidate_parent_scores.shape == candidate_valid.shape
             and torch.is_tensor(strength)
             and strength.numel() == 1
         ):
-            update = strength.detach().float().reshape(()) * verify_logits.detach().float()
+            update = (
+                strength.detach().float().reshape(())
+                * match_logits.detach().float()
+            )
             ratio = update.abs() / (
                 candidate_parent_scores.detach().float().abs() + 1.0e-6
             )
             ratio_values = ratio[candidate_valid]
             if ratio_values.numel():
-                metrics["verification_update_parent_ratio"] = ratio_values.mean()
+                metrics["child_update_parent_ratio"] = ratio_values.mean()
+                metrics["verification_update_parent_ratio"] = metrics[
+                    "child_update_parent_ratio"
+                ]
 
     query_map = pc.get("query_mask_map")
     if pseudo_confidence is not None and torch.is_tensor(query_map):
@@ -256,18 +261,18 @@ def collect_pc_diagnostics(
                     margin_gain, parent_margin > 0.0, zero
                 )
             if (
-                torch.is_tensor(verify_logits)
+                torch.is_tensor(match_logits)
                 and candidate_valid is not None
-                and verify_logits.shape == candidate_valid.shape
+                and match_logits.shape == candidate_valid.shape
             ):
                 selected_valid = candidate_valid[supervised]
-                selected_verify = verify_logits.detach().float()[supervised]
+                selected_match = match_logits.detach().float()[supervised]
                 candidate_target = (
                     torch.arange(2, device=selected_labels.device).view(1, 2, 1)
                     == selected_labels.view(-1, 1, 1)
                 ).expand_as(selected_valid)
                 metrics["candidate_auroc"] = _tie_aware_binary_auroc(
-                    selected_verify[selected_valid],
+                    selected_match[selected_valid],
                     candidate_target[selected_valid],
                     zero,
                 )

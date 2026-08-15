@@ -128,11 +128,11 @@ def binary_pair_loss(
     flat_indices = flat_indices.to(device=logits.device, dtype=torch.long)
     if count == 0 or not bool(valid.any()):
         empty_loss = logits.float().sum() * 0.0
-        verify_reference = pc.get("child_verify_logits")
+        match_reference = _child_match_logits(pc)
         if verification_mode == "parent_conditioned" and torch.is_tensor(
-            verify_reference
+            match_reference
         ):
-            empty_loss = empty_loss + verify_reference.float().sum() * 0.0
+            empty_loss = empty_loss + match_reference.float().sum() * 0.0
         return empty_loss, _empty_pair_metrics(zero)
 
     if gt.ndim == 3:
@@ -161,11 +161,11 @@ def binary_pair_loss(
     supervised = selected_target >= 0
     if not bool(supervised.any()):
         empty_loss = logits.float().sum() * 0.0
-        verify_reference = pc.get("child_verify_logits")
+        match_reference = _child_match_logits(pc)
         if verification_mode == "parent_conditioned" and torch.is_tensor(
-            verify_reference
+            match_reference
         ):
-            empty_loss = empty_loss + verify_reference.float().sum() * 0.0
+            empty_loss = empty_loss + match_reference.float().sum() * 0.0
         return empty_loss, _empty_pair_metrics(zero)
     effective_valid = valid.clone()
     effective_valid[valid] = supervised
@@ -186,37 +186,26 @@ def binary_pair_loss(
             "'parent_conditioned'"
         )
 
-    verify_logits = pc.get("child_verify_logits")
-    parent_scores = pc.get("parent_scores")
+    match_logits = _child_match_logits(pc)
     retrieval_valid = pc.get("retrieval_valid")
-    strength = pc.get("verification_strength")
     if not all(
         torch.is_tensor(value)
-        for value in (
-            verify_logits,
-            parent_scores,
-            retrieval_valid,
-            strength,
-        )
+        for value in (match_logits, retrieval_valid)
     ):
         raise KeyError(
-            "parent-conditioned supervision requires child_verify_logits, "
-            "parent_scores, retrieval_valid and verification_strength"
+            "parent-conditioned supervision requires child_match_logits "
+            "and retrieval_valid"
         )
     if (
-        verify_logits.ndim != 3
-        or verify_logits.shape[:2] != (count, 2)
-        or parent_scores.shape != verify_logits.shape
-        or retrieval_valid.shape != verify_logits.shape
+        match_logits.ndim != 3
+        or match_logits.shape[:2] != (count, 2)
+        or retrieval_valid.shape != match_logits.shape
     ):
         raise ValueError(
-            "child_verify_logits, parent_scores and retrieval_valid must "
-            "share [M,2,K]"
+            "child_match_logits and retrieval_valid must share [M,2,K]"
         )
-    if strength.numel() != 1:
-        raise ValueError("verification_strength must be a scalar tensor")
 
-    candidate_logits = verify_logits[effective_valid].float()
+    candidate_logits = match_logits[effective_valid].float()
     candidate_valid = retrieval_valid[effective_valid].to(
         device=candidate_logits.device, dtype=torch.bool
     )
@@ -236,65 +225,17 @@ def binary_pair_loss(
         / candidate_count
     ).mean()
 
-    detached_parent_scores = parent_scores[effective_valid].float().detach()
-    auxiliary_scores = (
-        detached_parent_scores
-        + strength.float().reshape(()) * candidate_logits
-    )
-    parent_region_logits = _masked_candidate_logmeanexp(
-        detached_parent_scores, candidate_valid
-    )
-    auxiliary_region_logits = _masked_candidate_logmeanexp(
-        auxiliary_scores, candidate_valid
-    )
-    parent_margin = _target_region_margin(parent_region_logits, target)
-    auxiliary_margin = _target_region_margin(auxiliary_region_logits, target)
-    margin_gain = auxiliary_margin - parent_margin
-
-    hard_margin = float(getattr(config, "parent_hard_margin", 0.20))
-    wrong_target_margin = float(
-        getattr(config, "parent_wrong_target_margin", 0.10)
-    )
-    gain_margin = float(getattr(config, "verification_gain_margin", 0.10))
-    preserve_tolerance = float(
-        getattr(config, "verification_preserve_tolerance", 0.05)
-    )
-    repair_mask = parent_margin <= -hard_margin
-    preserve_mask = parent_margin >= hard_margin
-    repair_terms = (
-        F.relu(wrong_target_margin - auxiliary_margin)
-        + F.relu(gain_margin - margin_gain)
-    )
-    preserve_terms = F.relu(-margin_gain - preserve_tolerance)
-    repair_loss = _masked_query_mean(
-        repair_terms, repair_mask, candidate_logits
-    )
-    preserve_loss = _masked_query_mean(
-        preserve_terms, preserve_mask, candidate_logits
-    )
-
     lambda_candidate = float(getattr(config, "lambda_candidate_verify", 0.50))
-    lambda_repair = float(getattr(config, "lambda_parent_repair", 0.50))
-    lambda_preserve = float(getattr(config, "lambda_parent_preserve", 0.25))
-    if min(lambda_candidate, lambda_repair, lambda_preserve) < 0.0:
-        raise ValueError("verification auxiliary loss weights must be non-negative")
-    loss = (
-        region_loss
-        + lambda_candidate * candidate_loss
-        + lambda_repair * repair_loss
-        + lambda_preserve * preserve_loss
-    )
+    if lambda_candidate < 0.0:
+        raise ValueError("lambda_candidate_verify must be non-negative")
+    loss = region_loss + lambda_candidate * candidate_loss
     return loss, {
         **_empty_pair_metrics(zero),
         "pair_valid_count": effective_valid.sum().detach().float(),
         "pair_accuracy": accuracy.detach(),
         "candidate_valid_count": candidate_valid.sum().detach().float(),
-        "parent_repair_count": repair_mask.sum().detach().float(),
-        "parent_preserve_count": preserve_mask.sum().detach().float(),
         "L_pair_region": region_loss.detach(),
         "L_candidate_verify": candidate_loss.detach(),
-        "L_parent_repair": repair_loss.detach(),
-        "L_parent_preserve": preserve_loss.detach(),
     }
 
 
@@ -425,40 +366,14 @@ def _empty_pair_metrics(zero: torch.Tensor) -> dict[str, torch.Tensor]:
         "pair_valid_count": detached,
         "pair_accuracy": detached,
         "candidate_valid_count": detached,
-        "parent_repair_count": detached,
-        "parent_preserve_count": detached,
         "L_pair_region": detached,
         "L_candidate_verify": detached,
-        "L_parent_repair": detached,
-        "L_parent_preserve": detached,
     }
 
 
-def _masked_candidate_logmeanexp(
-    scores: torch.Tensor, valid: torch.Tensor
-) -> torch.Tensor:
-    masked = scores.masked_fill(~valid, float("-inf"))
-    count = valid.sum(dim=-1)
-    result = torch.logsumexp(masked, dim=-1) - count.clamp_min(1).float().log()
-    return torch.where(count > 0, result, torch.zeros_like(result))
-
-
-def _target_region_margin(
-    region_logits: torch.Tensor, target: torch.Tensor
-) -> torch.Tensor:
-    target_logits = region_logits.gather(1, target[:, None]).squeeze(1)
-    other_logits = region_logits.gather(1, (1 - target)[:, None]).squeeze(1)
-    return target_logits - other_logits
-
-
-def _masked_query_mean(
-    values: torch.Tensor,
-    mask: torch.Tensor,
-    differentiable_reference: torch.Tensor,
-) -> torch.Tensor:
-    if bool(mask.any()):
-        return values[mask].mean()
-    return differentiable_reference.sum() * 0.0
+def _child_match_logits(pc: Mapping[str, Any]) -> Any:
+    logits = pc.get("child_match_logits")
+    return pc.get("child_verify_logits") if logits is None else logits
 
 
 __all__ = [

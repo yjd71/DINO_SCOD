@@ -82,12 +82,21 @@ def parse_args() -> argparse.Namespace:
             "for teacher_only."
         ),
     )
-    parser.add_argument(
+    migration = parser.add_mutually_exclusive_group()
+    migration.add_argument(
         "--init-pcv-from-legacy",
         action="store_true",
         help=(
             "Initialize a fresh parent-conditioned verifier from a complete "
             "legacy weighted_sum Decoder; retain all non-verifier weights."
+        ),
+    )
+    migration.add_argument(
+        "--init-pcv-from-v2",
+        action="store_true",
+        help=(
+            "Explicitly migrate a V2 parent-conditioned Decoder to V3; "
+            "retain non-verifier weights, W32, and verification strength only."
         ),
     )
     parser.add_argument("--seed", type=int, default=2025)
@@ -120,6 +129,8 @@ def validate_training_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--init-pcv-from-legacy requires --decoder-checkpoint"
         )
+    if args.init_pcv_from_v2 and not args.decoder_checkpoint:
+        raise ValueError("--init-pcv-from-v2 requires --decoder-checkpoint")
     if args.training_design == "teacher_only" and not args.baseline_checkpoint:
         raise ValueError(
             "--baseline-checkpoint is required for teacher_only"
@@ -184,6 +195,7 @@ def main() -> None:
                 args.decoder_checkpoint,
                 context="Base Decoder checkpoint",
                 init_pcv_from_legacy=args.init_pcv_from_legacy,
+                init_pcv_from_v2=args.init_pcv_from_v2,
             )
         else:
             pc_cfg = DinoPCHBMConfig()
@@ -198,6 +210,7 @@ def main() -> None:
                 require_pc_complete=True,
                 expected_pc_cfg=pc_cfg,
                 init_pcv_from_legacy=args.init_pcv_from_legacy,
+                init_pcv_from_v2=args.init_pcv_from_v2,
             )
         pc_cfg.configure_training_design(args.training_design)
         if args.allow_self_match and not args.resume:

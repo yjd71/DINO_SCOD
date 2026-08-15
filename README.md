@@ -137,7 +137,10 @@ The pre-trained DINOv2 model weights can be downloaded from https://github.com/f
 
 The opt-in DINO PC-HBM training, resume, inference, compatibility, and smoke-test
 commands are documented in [docs/PC_HBM.md](docs/PC_HBM.md). The original RSBL
-entry points remain available.
+entry points remain available. The current V3 matcher uses a fixed average of
+absolute P2 and Parent-conditioned cross-level relation cosine, with a single
+bounded learned update strength; the strict legacy `weighted_sum` baseline is
+still supported.
 
 ### PC-BACS offline sampling
 

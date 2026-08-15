@@ -120,32 +120,23 @@ class DinoPCHBMConfig:
     gt_binary_threshold: float = 0.5
     region_names: tuple[str, str] = ("fg_boundary", "bg_near")
     region_max_quota: tuple[int, int] = (784, 784)
-    region_min_quota: tuple[int, int] = (0,0 )
+    region_min_quota: tuple[int, int] = (0, 0)
     region_sampling_ratio: tuple[float, float] = (1.0, 1.0)
+
     # Balanced retrieval and local Child verification.
-    parent_topk_per_region: int =  64
+    parent_topk_per_region: int = 64
     query_chunk_size: int = 512
-    child_window_size: int = 7
+    child_window_size: int = 3
     tau_parent: float = 0.07
     tau_child: float = 0.10
     child_mix_init_logit: float = 0.0
     child_verification_mode: str = "parent_conditioned"
-    verification_temperature: float = 0.10
     verification_strength_init: float = 0.25
-    verification_abs_weight_init: float = 0.05
-    verification_rel_weight_init: float = 0.05
-    verification_bias_init: float = 0.0
     verification_logit_clip: float = 6.0
     relation_norm_eps: float = 1.0e-4
 
-    # Parent-conditioned verification objectives.
-    parent_hard_margin: float = 0.20
-    parent_wrong_target_margin: float = 0.10
-    verification_gain_margin: float = 0.10
-    verification_preserve_tolerance: float = 0.05
+    # Direct fixed-Child matching objective.
     lambda_candidate_verify: float = 0.50
-    lambda_parent_repair: float = 0.50
-    lambda_parent_preserve: float = 0.25
 
     # Stage schedule.
     verify_start_epoch: int = 6
@@ -182,13 +173,7 @@ class DinoPCHBMConfig:
                 "child_verification_mode must be 'weighted_sum' or "
                 "'parent_conditioned'"
             )
-        for name in (
-            "verification_temperature",
-            "verification_abs_weight_init",
-            "verification_rel_weight_init",
-            "verification_logit_clip",
-            "relation_norm_eps",
-        ):
+        for name in ("verification_logit_clip", "relation_norm_eps"):
             setattr(
                 self,
                 name,
@@ -207,23 +192,11 @@ class DinoPCHBMConfig:
             minimum_open=True,
             maximum_open=True,
         )
-        self.verification_bias_init = _as_float(
-            "verification_bias_init", self.verification_bias_init
-        )
-        for name in (
-            "parent_hard_margin",
-            "parent_wrong_target_margin",
-            "verification_gain_margin",
-            "verification_preserve_tolerance",
+        self.lambda_candidate_verify = _as_float(
             "lambda_candidate_verify",
-            "lambda_parent_repair",
-            "lambda_parent_preserve",
-        ):
-            setattr(
-                self,
-                name,
-                _as_float(name, getattr(self, name), minimum=0.0),
-            )
+            self.lambda_candidate_verify,
+            minimum=0.0,
+        )
 
         for name in (
             "enabled",

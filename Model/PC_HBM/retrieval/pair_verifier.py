@@ -70,11 +70,7 @@ class PairVerifier(nn.Module):
         tau_child: float = 0.10,
         child_mix_init_logit: float = 0.0,
         child_verification_mode: str = "weighted_sum",
-        verification_temperature: float = 0.10,
         verification_strength_init: float = 0.25,
-        verification_abs_weight_init: float = 0.05,
-        verification_rel_weight_init: float = 0.05,
-        verification_bias_init: float = 0.0,
         verification_logit_clip: float = 6.0,
         relation_norm_eps: float = 1.0e-4,
     ) -> None:
@@ -83,7 +79,6 @@ class PairVerifier(nn.Module):
         self.tau_parent = float(tau_parent)
         self.tau_child = float(tau_child)
         self.child_verification_mode = str(child_verification_mode).lower()
-        self.verification_temperature = float(verification_temperature)
         self.verification_logit_clip = float(verification_logit_clip)
         self.relation_norm_eps = float(relation_norm_eps)
         if self.dim <= 0:
@@ -106,11 +101,8 @@ class PairVerifier(nn.Module):
                 "'parent_conditioned'"
             )
         for name, value in (
-            ("verification_temperature", self.verification_temperature),
             ("verification_logit_clip", self.verification_logit_clip),
             ("relation_norm_eps", self.relation_norm_eps),
-            ("verification_abs_weight_init", verification_abs_weight_init),
-            ("verification_rel_weight_init", verification_rel_weight_init),
         ):
             if not math.isfinite(float(value)) or float(value) <= 0.0:
                 raise ValueError(f"{name} must be positive and finite")
@@ -121,9 +113,6 @@ class PairVerifier(nn.Module):
             or strength_init >= 1.0
         ):
             raise ValueError("verification_strength_init must be in (0, 1)")
-        if not math.isfinite(float(verification_bias_init)):
-            raise ValueError("verification_bias_init must be finite")
-
         if self.child_verification_mode == "weighted_sum":
             # Strict legacy baseline: this mode owns exactly one scalar.
             self.raw_child_mix = nn.Parameter(
@@ -139,21 +128,6 @@ class PairVerifier(nn.Module):
                     dtype=torch.float32,
                 )
             )
-            self.raw_verification_abs_weight = nn.Parameter(
-                torch.tensor(
-                    math.log(math.expm1(float(verification_abs_weight_init))),
-                    dtype=torch.float32,
-                )
-            )
-            self.raw_verification_rel_weight = nn.Parameter(
-                torch.tensor(
-                    math.log(math.expm1(float(verification_rel_weight_init))),
-                    dtype=torch.float32,
-                )
-            )
-            self.verification_bias = nn.Parameter(
-                torch.tensor(float(verification_bias_init), dtype=torch.float32)
-            )
 
     @property
     def beta(self) -> torch.Tensor:
@@ -165,18 +139,6 @@ class PairVerifier(nn.Module):
     def verification_strength(self) -> torch.Tensor:
         if self.child_verification_mode == "parent_conditioned":
             return torch.sigmoid(self.raw_verification_strength)
-        return self.raw_child_mix.new_zeros(())
-
-    @property
-    def verification_abs_weight(self) -> torch.Tensor:
-        if self.child_verification_mode == "parent_conditioned":
-            return F.softplus(self.raw_verification_abs_weight)
-        return self.raw_child_mix.new_zeros(())
-
-    @property
-    def verification_rel_weight(self) -> torch.Tensor:
-        if self.child_verification_mode == "parent_conditioned":
-            return F.softplus(self.raw_verification_rel_weight)
         return self.raw_child_mix.new_zeros(())
 
     def forward(
@@ -251,11 +213,8 @@ class PairVerifier(nn.Module):
             )
             relation_cosine = torch.zeros_like(child_cosine_masked)
             relation_valid = torch.zeros_like(valid)
-            child_verify_logits = torch.zeros_like(child_cosine_masked)
+            child_match_logits = torch.zeros_like(child_cosine_masked)
             strength = self.verification_strength
-            abs_weight = self.verification_abs_weight
-            rel_weight = self.verification_rel_weight
-            verification_bias = beta.new_zeros(())
         else:
             projection_weight = self.parent_to_child.weight.float()
             aligned_q3 = F.linear(q3.detach().float(), projection_weight)
@@ -287,16 +246,11 @@ class PairVerifier(nn.Module):
                 torch.zeros_like(relation_cosine_raw),
             )
             strength = self.verification_strength.float()
-            abs_weight = self.verification_abs_weight.float()
-            rel_weight = self.verification_rel_weight.float()
-            verification_bias = self.verification_bias.float()
-            child_verify_logits = (
-                abs_weight * child_cosine_masked
-                + rel_weight * relation_cosine
-                + verification_bias
-            ) / self.verification_temperature
-            child_verify_logits = torch.nan_to_num(
-                child_verify_logits,
+            child_match_logits = 0.5 * (
+                child_cosine_masked + relation_cosine
+            )
+            child_match_logits = torch.nan_to_num(
+                child_match_logits,
                 nan=0.0,
                 posinf=self.verification_logit_clip,
                 neginf=-self.verification_logit_clip,
@@ -304,14 +258,14 @@ class PairVerifier(nn.Module):
                 -self.verification_logit_clip,
                 self.verification_logit_clip,
             )
-            child_verify_logits = torch.where(
+            child_match_logits = torch.where(
                 valid,
-                child_verify_logits,
-                torch.zeros_like(child_verify_logits),
+                child_match_logits,
+                torch.zeros_like(child_match_logits),
             )
-            updated_scores = parent_scores + strength * child_verify_logits
+            updated_scores = parent_scores + strength * child_match_logits
             pair_scores = torch.where(
-                child_verify_logits == 0.0,
+                child_match_logits == 0.0,
                 parent_scores,
                 updated_scores,
             )
@@ -414,11 +368,12 @@ class PairVerifier(nn.Module):
             "child_abs_cosine": child_cosine_masked,
             "child_relation_cosine": relation_cosine,
             "relation_valid": relation_valid,
-            "child_verify_logits": child_verify_logits,
+            "child_match_logits": child_match_logits,
+            # Deprecated V2 alias. Keep exact tensor identity during V3.
+            "child_verify_logits": child_match_logits,
+            "child_match_strength": strength,
+            # Deprecated V2 alias.
             "verification_strength": strength,
-            "verification_abs_weight": abs_weight,
-            "verification_rel_weight": rel_weight,
-            "verification_bias": verification_bias,
             "child_cosine": child_cosine_masked,
             "pair_scores": pair_scores,
             "verified_scores": pair_scores,

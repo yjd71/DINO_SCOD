@@ -104,9 +104,9 @@ def test_engine_verify_only_runs_pairs_but_is_identity() -> None:
     assert torch.count_nonzero(result["p3_delta"]) == 0
     assert result["p3_delta"].shape == (64, 128)
     assert result["pair_logits"].shape == (64, 2)
-    assert result["retrieval_valid"].shape == (64, 2, 4)
-    assert result["parent_cosine"].shape == (64, 2, 4)
-    assert result["child_cosine"].shape == (64, 2, 4)
+    assert result["retrieval_valid"].shape == (64, 2, 64)
+    assert result["parent_cosine"].shape == (64, 2, 64)
+    assert result["child_cosine"].shape == (64, 2, 64)
     assert result["query_valid"].all()
     assert result["query_mask_map"].sum().item() == 64
     scalar_maps = {

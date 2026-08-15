@@ -29,11 +29,7 @@ class _VerifierSmokeModule(nn.Module):
             tau_parent=0.3,
             tau_child=0.4,
             child_verification_mode=mode,
-            verification_temperature=0.2,
             verification_strength_init=0.25,
-            verification_abs_weight_init=0.05,
-            verification_rel_weight_init=0.05,
-            verification_bias_init=0.0,
         ).to(device)
 
     def forward(

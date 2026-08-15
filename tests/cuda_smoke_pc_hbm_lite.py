@@ -132,9 +132,9 @@ def main() -> None:
     )
     if pc_cfg.child_verification_mode != "parent_conditioned":
         raise AssertionError("CUDA smoke must exercise parent_conditioned mode")
-    if verifier_parameter_count != 16_388:
+    if verifier_parameter_count != 16_385:
         raise AssertionError(
-            f"Expected 16,388 verifier parameters, got {verifier_parameter_count}"
+            f"Expected 16,385 verifier parameters, got {verifier_parameter_count}"
         )
     loader = build_labeled_memory_loader(
         l_image_root=cfg.train_imgs,

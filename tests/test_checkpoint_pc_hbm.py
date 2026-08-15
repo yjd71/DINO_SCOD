@@ -83,7 +83,7 @@ def _ready_memory(cfg):
     return memory
 
 
-def test_decoder_v2_round_trip_and_baseline_only_loading(tmp_path):
+def test_decoder_v3_round_trip_and_baseline_only_loading(tmp_path):
     cfg = DinoPCHBMConfig()
     source = TinyDecoder()
     path = tmp_path / "decoder.pth"
@@ -94,9 +94,11 @@ def test_decoder_v2_round_trip_and_baseline_only_loading(tmp_path):
         3,
         artifact_meta=_metadata("decoder"),
     )
-    assert payload["child_verifier_version"] == 2
+    assert payload["child_verifier_version"] == 3
     assert payload["child_verification_mode"] == "parent_conditioned"
-    assert payload["pc_cfg"]["verification_temperature"] == pytest.approx(0.1)
+    assert payload["pc_cfg"]["verification_strength_init"] == pytest.approx(
+        0.25
+    )
     target = TinyDecoder()
     load_decoder_compatible(
         target,
@@ -120,7 +122,7 @@ def test_decoder_v2_round_trip_and_baseline_only_loading(tmp_path):
         assert torch.equal(value, other.pc_hbm.state_dict()[key])
 
 
-def test_decoder_v2_rejects_missing_child_verifier_metadata(tmp_path):
+def test_decoder_v3_rejects_missing_child_verifier_metadata(tmp_path):
     cfg = DinoPCHBMConfig()
     source = TinyDecoder()
     path = tmp_path / "decoder.pth"
@@ -128,7 +130,7 @@ def test_decoder_v2_rejects_missing_child_verifier_metadata(tmp_path):
     payload.pop("child_verifier_version")
     torch.save(payload, path)
 
-    with pytest.raises(RuntimeError, match="child_verifier_version=2"):
+    with pytest.raises(RuntimeError, match="child_verifier_version=3"):
         load_decoder_compatible(
             TinyDecoder(),
             path,

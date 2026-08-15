@@ -22,25 +22,37 @@ from torch import nn
 ARTIFACT_METADATA_VERSION = 2
 PC_HBM_ARCHITECTURE = "DINO_SCOD_PC_HBM_LITE"
 PC_HBM_SCHEMA_VERSION = 2
-CHILD_VERIFIER_VERSION = 2
+CHILD_VERIFIER_VERSION = 3
+PREVIOUS_CHILD_VERIFIER_VERSION = 2
 _VERIFIER_STATE_PREFIX = "pc_hbm.pair_verifier."
 _LEGACY_VERIFIER_STATE_KEY = _VERIFIER_STATE_PREFIX + "raw_child_mix"
 _PCV_CONFIG_FIELDS = {
     "child_verification_mode",
-    "verification_temperature",
     "verification_strength_init",
+    "verification_logit_clip",
+    "relation_norm_eps",
+    "lambda_candidate_verify",
+}
+_V2_REMOVED_CONFIG_FIELDS = {
+    "verification_temperature",
     "verification_abs_weight_init",
     "verification_rel_weight_init",
     "verification_bias_init",
-    "verification_logit_clip",
-    "relation_norm_eps",
     "parent_hard_margin",
     "parent_wrong_target_margin",
     "verification_gain_margin",
     "verification_preserve_tolerance",
-    "lambda_candidate_verify",
     "lambda_parent_repair",
     "lambda_parent_preserve",
+}
+_V3_TRANSFERRED_VERIFIER_KEYS = {
+    _VERIFIER_STATE_PREFIX + "parent_to_child.weight",
+    _VERIFIER_STATE_PREFIX + "raw_verification_strength",
+}
+_V2_REMOVED_VERIFIER_KEYS = {
+    _VERIFIER_STATE_PREFIX + "raw_verification_abs_weight",
+    _VERIFIER_STATE_PREFIX + "raw_verification_rel_weight",
+    _VERIFIER_STATE_PREFIX + "verification_bias",
 }
 CANONICAL_LABELED_SPLIT_COUNT = 202
 CANONICAL_LABELED_SPLIT_FINGERPRINT = (
@@ -74,14 +86,24 @@ def load_decoder_compatible(
     expected_artifact_meta: Mapping[str, Any] | None = None,
     expected_pc_cfg: Any | None = None,
     init_pcv_from_legacy: bool = False,
+    init_pcv_from_v2: bool = False,
 ):
-    """Load a baseline or complete V2 Lite Decoder after full preflight."""
+    """Load a baseline or complete current Lite Decoder after full preflight."""
 
     checkpoint = _load_source(source)
     if not isinstance(checkpoint, Mapping):
         raise TypeError("Decoder checkpoint must be a mapping")
+    if init_pcv_from_legacy and init_pcv_from_v2:
+        raise ValueError("PCV legacy and V2 migration modes are mutually exclusive")
     if init_pcv_from_legacy:
         return _load_legacy_decoder_into_pcv(
+            decoder,
+            checkpoint,
+            expected_artifact_meta=expected_artifact_meta,
+            expected_pc_cfg=expected_pc_cfg,
+        )
+    if init_pcv_from_v2:
+        return _load_v2_decoder_into_v3(
             decoder,
             checkpoint,
             expected_artifact_meta=expected_artifact_meta,
@@ -91,6 +113,9 @@ def load_decoder_compatible(
         validate_artifact_metadata(checkpoint, expected_artifact_meta)
     state = extract_decoder_state(checkpoint)
     target_state = decoder.state_dict()
+    checkpoint_has_pc = any(key.startswith("pc_hbm.") for key in state)
+    if checkpoint_has_pc:
+        _preflight_pc_v2(checkpoint, context="Decoder checkpoint")
     unexpected = sorted(set(state) - set(target_state))
     if unexpected:
         raise RuntimeError(f"Unexpected decoder checkpoint keys: {unexpected}")
@@ -104,7 +129,6 @@ def load_decoder_compatible(
     missing_pc = sorted(
         key for key in target_state if key.startswith("pc_hbm.") and key not in state
     )
-    checkpoint_has_pc = any(key.startswith("pc_hbm.") for key in state)
     if missing_pc and (require_pc_complete or checkpoint_has_pc):
         raise RuntimeError(
             f"Incomplete PC-HBM-Lite decoder checkpoint; missing keys: {missing_pc}"
@@ -112,7 +136,6 @@ def load_decoder_compatible(
     if require_pc_complete and not checkpoint_has_pc:
         raise RuntimeError("A complete PC-HBM-Lite Decoder checkpoint is required")
     if checkpoint_has_pc:
-        _preflight_pc_v2(checkpoint, context="Decoder checkpoint")
         _validate_pc_config_match(
             checkpoint.get("pc_cfg"),
             (
@@ -140,14 +163,19 @@ def read_pc_config(
     *,
     context: str = "PC-HBM checkpoint",
     init_pcv_from_legacy: bool = False,
+    init_pcv_from_v2: bool = False,
 ):
-    """Reconstruct the canonical runtime config from a V2 Decoder/resume."""
+    """Reconstruct the canonical runtime config from a Decoder/resume."""
 
     checkpoint = _load_source(source)
     if not isinstance(checkpoint, Mapping):
         raise TypeError(f"{context} must be a mapping")
+    if init_pcv_from_legacy and init_pcv_from_v2:
+        raise ValueError("PCV legacy and V2 migration modes are mutually exclusive")
     if init_pcv_from_legacy:
         return _legacy_decoder_pcv_config(checkpoint, context=context)
+    if init_pcv_from_v2:
+        return _v2_decoder_v3_config(checkpoint, context=context)
     _preflight_pc_v2(checkpoint, context=context)
     raw_config = checkpoint.get("pc_cfg")
     _validate_lite_config(raw_config, context=context)
@@ -176,9 +204,10 @@ def _legacy_decoder_pcv_config(
             f"{context} legacy PCV initialization requires checkpoint_type='decoder'"
         )
     metadata_version = checkpoint.get("child_verifier_version")
-    if metadata_version is not None and int(metadata_version) != (
-        CHILD_VERIFIER_VERSION
-    ):
+    if metadata_version is not None and int(metadata_version) not in {
+        PREVIOUS_CHILD_VERIFIER_VERSION,
+        CHILD_VERIFIER_VERSION,
+    }:
         raise RuntimeError(f"{context} has unsupported child_verifier_version")
     metadata_mode = checkpoint.get("child_verification_mode")
     if metadata_mode is not None and metadata_mode != "weighted_sum":
@@ -191,23 +220,28 @@ def _legacy_decoder_pcv_config(
         raise RuntimeError(f"{context} must contain a pc_cfg mapping")
     from configs.pc_hbm_dino_config import DinoPCHBMConfig
 
+    filtered_config = {
+        name: value
+        for name, value in raw_config.items()
+        if name not in _V2_REMOVED_CONFIG_FIELDS
+    }
     weighted_defaults = asdict(
         DinoPCHBMConfig(child_verification_mode="weighted_sum")
     )
-    unknown = sorted(set(raw_config) - set(weighted_defaults))
+    unknown = sorted(set(filtered_config) - set(weighted_defaults))
     if unknown:
         raise RuntimeError(f"{context} pc_cfg has unknown fields: {unknown}")
     normalized_weighted = DinoPCHBMConfig(
         **{
             **weighted_defaults,
-            **dict(raw_config),
+            **filtered_config,
             "child_verification_mode": "weighted_sum",
         }
     )
     normalized_state = asdict(normalized_weighted)
     mismatched = sorted(
         name
-        for name, value in raw_config.items()
+        for name, value in filtered_config.items()
         if name not in _PCV_CONFIG_FIELDS and normalized_state[name] != value
     )
     if mismatched:
@@ -215,8 +249,8 @@ def _legacy_decoder_pcv_config(
             f"{context} pc_cfg is not canonical for fields: {mismatched}"
         )
     if (
-        "child_verification_mode" in raw_config
-        and raw_config["child_verification_mode"] != "weighted_sum"
+        "child_verification_mode" in filtered_config
+        and filtered_config["child_verification_mode"] != "weighted_sum"
     ):
         raise RuntimeError(
             f"{context} migration only accepts weighted_sum pc_cfg"
@@ -227,6 +261,119 @@ def _legacy_decoder_pcv_config(
     for name in _PCV_CONFIG_FIELDS:
         migrated_state[name] = pcv_defaults[name]
     return DinoPCHBMConfig(**migrated_state)
+
+
+def _v2_decoder_v3_config(
+    checkpoint: Mapping[str, Any], *, context: str
+):
+    """Validate a complete V2 PCV Decoder and remove V2-only config fields."""
+
+    if int(checkpoint.get("format_version", -1)) != 2:
+        raise RuntimeError(f"{context} must use format_version=2")
+    if int(checkpoint.get("schema_version", -1)) != PC_HBM_SCHEMA_VERSION:
+        raise RuntimeError(
+            f"{context} must use schema_version={PC_HBM_SCHEMA_VERSION}"
+        )
+    if checkpoint.get("architecture") != PC_HBM_ARCHITECTURE:
+        raise RuntimeError(
+            f"{context} architecture must be {PC_HBM_ARCHITECTURE!r}"
+        )
+    if checkpoint.get("checkpoint_type") != "decoder":
+        raise RuntimeError(
+            f"{context} V2 migration requires checkpoint_type='decoder'"
+        )
+    if int(checkpoint.get("child_verifier_version", -1)) != (
+        PREVIOUS_CHILD_VERIFIER_VERSION
+    ):
+        raise RuntimeError(
+            f"{context} V2 migration requires child_verifier_version="
+            f"{PREVIOUS_CHILD_VERIFIER_VERSION}"
+        )
+    if checkpoint.get("child_verification_mode") != "parent_conditioned":
+        raise RuntimeError(
+            f"{context} V2 migration only accepts parent_conditioned checkpoints"
+        )
+    raw_config = checkpoint.get("pc_cfg")
+    if not isinstance(raw_config, Mapping):
+        raise RuntimeError(f"{context} must contain a pc_cfg mapping")
+    if raw_config.get("child_verification_mode") != "parent_conditioned":
+        raise RuntimeError(
+            f"{context} pc_cfg must use child_verification_mode="
+            "'parent_conditioned'"
+        )
+
+    from configs.pc_hbm_dino_config import DinoPCHBMConfig
+
+    defaults = asdict(DinoPCHBMConfig())
+    unknown = sorted(
+        set(raw_config) - set(defaults) - _V2_REMOVED_CONFIG_FIELDS
+    )
+    if unknown:
+        raise RuntimeError(f"{context} pc_cfg has unknown fields: {unknown}")
+    migrated_state = {
+        name: value
+        for name, value in raw_config.items()
+        if name not in _V2_REMOVED_CONFIG_FIELDS
+    }
+    return DinoPCHBMConfig(**{**defaults, **migrated_state})
+
+
+def _load_v2_decoder_into_v3(
+    decoder: nn.Module,
+    checkpoint: Mapping[str, Any],
+    *,
+    expected_artifact_meta: Mapping[str, Any] | None,
+    expected_pc_cfg: Any | None,
+):
+    """Explicitly migrate only stable V2 PCV tensors into a V3 Decoder."""
+
+    if expected_artifact_meta is not None:
+        validate_artifact_metadata(checkpoint, expected_artifact_meta)
+    migrated_config = _v2_decoder_v3_config(
+        checkpoint, context="V2 Decoder checkpoint"
+    )
+    target_config = (
+        expected_pc_cfg
+        if expected_pc_cfg is not None
+        else getattr(decoder, "pc_cfg", None)
+    )
+    _validate_pc_config_match(
+        asdict(migrated_config),
+        target_config,
+        context="V2 Decoder checkpoint migration",
+    )
+
+    state = extract_decoder_state(checkpoint)
+    target_state = decoder.state_dict()
+    verifier_keys = {
+        key for key in state if key.startswith(_VERIFIER_STATE_PREFIX)
+    }
+    expected_v2_verifier_keys = (
+        _V3_TRANSFERRED_VERIFIER_KEYS | _V2_REMOVED_VERIFIER_KEYS
+    )
+    if verifier_keys != expected_v2_verifier_keys:
+        raise RuntimeError(
+            "V2 Decoder checkpoint has an unexpected verifier state; "
+            f"missing={sorted(expected_v2_verifier_keys - verifier_keys)}, "
+            f"unexpected={sorted(verifier_keys - expected_v2_verifier_keys)}"
+        )
+    retained_state = {
+        key: value
+        for key, value in state.items()
+        if not key.startswith(_VERIFIER_STATE_PREFIX)
+        or key in _V3_TRANSFERRED_VERIFIER_KEYS
+    }
+    _validate_state_compatible(
+        retained_state,
+        target_state,
+        context="V2 Decoder checkpoint migration",
+    )
+    candidate_decoder = copy.deepcopy(decoder)
+    try:
+        candidate_decoder.load_state_dict(copy.deepcopy(retained_state), strict=True)
+    except Exception as error:
+        raise RuntimeError("V2 Decoder migration failed load preflight") from error
+    return decoder.load_state_dict(retained_state, strict=True)
 
 
 def _load_legacy_decoder_into_pcv(
@@ -306,7 +453,7 @@ def save_decoder_checkpoint(
     extra: Mapping[str, Any] | None = None,
     artifact_meta: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Save the version-2 standalone Decoder artifact."""
+    """Save a format-V2 standalone Decoder with the current verifier contract."""
 
     config_state = _config_dict(pc_cfg)
     _validate_lite_config(config_state, context="Decoder save")
@@ -1043,7 +1190,6 @@ def _preflight_pc_v2(checkpoint: Mapping[str, Any], *, context: str) -> None:
         )
     if "pc_cfg" in checkpoint:
         config_state = checkpoint.get("pc_cfg")
-        _validate_lite_config(config_state, context=context)
         if int(checkpoint.get("child_verifier_version", -1)) != (
             CHILD_VERIFIER_VERSION
         ):
@@ -1051,6 +1197,7 @@ def _preflight_pc_v2(checkpoint: Mapping[str, Any], *, context: str) -> None:
                 f"{context} must use child_verifier_version="
                 f"{CHILD_VERIFIER_VERSION}"
             )
+        _validate_lite_config(config_state, context=context)
         expected_mode = config_state["child_verification_mode"]
         if checkpoint.get("child_verification_mode") != expected_mode:
             raise RuntimeError(

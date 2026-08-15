@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
+from Model.PC_HBM.retrieval import PairVerifier
 from Model.PC_HBM.training.losses import binary_pair_loss
 
 
@@ -14,8 +15,6 @@ def _config(**kwargs) -> DinoPCHBMConfig:
     options = {
         "child_verification_mode": "parent_conditioned",
         "lambda_candidate_verify": 0.5,
-        "lambda_parent_repair": 0.5,
-        "lambda_parent_preserve": 0.25,
     }
     options.update(kwargs)
     return DinoPCHBMConfig(**options)
@@ -52,9 +51,13 @@ def _aux(
             "query_mask_map": torch.ones(
                 1, 1, 2, 2, device=verify_logits.device
             ),
+            "child_match_logits": verify_logits,
             "child_verify_logits": verify_logits,
             "parent_scores": parent_scores,
             "retrieval_valid": retrieval_valid.to(device=verify_logits.device),
+            "child_match_strength": torch.tensor(
+                0.5, device=verify_logits.device, requires_grad=True
+            ),
             "verification_strength": torch.tensor(
                 0.5, device=verify_logits.device, requires_grad=True
             ),
@@ -77,11 +80,7 @@ def test_candidate_bce_is_normalized_per_query_and_masked() -> None:
             [[True, True], [True, True]],
         ]
     )
-    cfg = _config(
-        lambda_candidate_verify=1.0,
-        lambda_parent_repair=0.0,
-        lambda_parent_preserve=0.0,
-    )
+    cfg = _config(lambda_candidate_verify=1.0)
 
     loss, metrics = binary_pair_loss(
         _aux(verify, parent, retrieval_valid=valid), GT, verify, cfg
@@ -104,72 +103,24 @@ def test_candidate_bce_is_normalized_per_query_and_masked() -> None:
     )
 
 
-def test_repair_loss_rewards_gain_without_parent_prior_gradient() -> None:
-    parent = torch.tensor(
-        [
-            [[-1.0, -1.0], [1.0, 1.0]],
-            [[-1.0, -1.0], [1.0, 1.0]],
-        ],
-        requires_grad=True,
-    )
-    good_verify = torch.tensor(
-        [
-            [[3.0, 3.0], [-3.0, -3.0]],
-            [[0.0, 0.0], [0.0, 0.0]],
-        ],
-        requires_grad=True,
-    )
-    cfg = _config(
-        lambda_candidate_verify=0.0,
-        lambda_parent_repair=1.0,
-        lambda_parent_preserve=0.0,
-    )
-    loss, metrics = binary_pair_loss(_aux(good_verify, parent), GT, good_verify, cfg)
+def test_zero_candidate_weight_reduces_pair_loss_to_region_ce() -> None:
+    match = torch.randn(2, 2, 2, requires_grad=True)
+    parent = torch.randn_like(match, requires_grad=True)
 
-    assert metrics["parent_repair_count"] == 1.0
-    assert metrics["L_parent_repair"] == 0.0
-    loss.backward()
-    assert parent.grad is None
-    assert good_verify.grad is not None and torch.isfinite(good_verify.grad).all()
-
-    bad_verify = torch.zeros(2, 2, 2, requires_grad=True)
-    _, bad_metrics = binary_pair_loss(
-        _aux(bad_verify, parent.detach().clone().requires_grad_()),
+    loss, metrics = binary_pair_loss(
+        _aux(match, parent),
         GT,
-        bad_verify,
-        cfg,
-    )
-    assert bad_metrics["L_parent_repair"] > 0.0
-
-
-def test_preserve_loss_penalizes_harm_to_confident_correct_parent() -> None:
-    parent = torch.tensor(
-        [
-            [[-1.0, -1.0], [1.0, 1.0]],
-            [[-1.0, -1.0], [1.0, 1.0]],
-        ],
-        requires_grad=True,
-    )
-    verify = torch.tensor(
-        [
-            [[3.0, 3.0], [-3.0, -3.0]],
-            [[3.0, 3.0], [-3.0, -3.0]],
-        ],
-        requires_grad=True,
-    )
-    cfg = _config(
-        lambda_candidate_verify=0.0,
-        lambda_parent_repair=0.0,
-        lambda_parent_preserve=1.0,
+        match,
+        _config(lambda_candidate_verify=0.0),
     )
 
-    loss, metrics = binary_pair_loss(_aux(verify, parent), GT, verify, cfg)
-
-    assert metrics["parent_preserve_count"] == 1.0
-    assert metrics["L_parent_preserve"] > 0.0
+    torch.testing.assert_close(loss, metrics["L_pair_region"])
+    assert metrics["L_candidate_verify"] > 0.0
+    assert "L_parent_repair" not in metrics
+    assert "L_parent_preserve" not in metrics
     loss.backward()
-    assert parent.grad is None
-    assert verify.grad is not None and torch.isfinite(verify.grad).all()
+    assert match.grad is not None
+    assert torch.count_nonzero(match.grad) == 0
 
 
 def test_parent_conditioned_empty_and_unsupervised_masks_are_zero() -> None:
@@ -217,3 +168,64 @@ def test_parent_conditioned_fp16_loss_is_fp32_finite() -> None:
     assert all(torch.isfinite(value) for value in metrics.values())
     loss.backward()
     assert verify.grad is not None and torch.isfinite(verify.grad).all()
+
+
+def test_candidate_and_region_losses_route_matcher_gradients() -> None:
+    torch.manual_seed(29)
+    verifier = PairVerifier(
+        dim=4,
+        tau_parent=1.0,
+        child_verification_mode="parent_conditioned",
+    )
+    q3 = torch.randn(2, 4)
+    q_child = torch.randn(2, 4, requires_grad=True)
+    parent = torch.randn(2, 2, 2, 4)
+    child = torch.randn(2, 2, 2, 4, requires_grad=True)
+    retrieval = {
+        "parent_keys": parent,
+        "paired_p2_keys": child,
+        "valid": torch.ones(2, 2, 2, dtype=torch.bool),
+    }
+
+    result = verifier(q3, q_child, retrieval, torch.ones(2, 1))
+    candidate_target = torch.tensor(
+        [
+            [[1.0, 1.0], [0.0, 0.0]],
+            [[0.0, 0.0], [1.0, 1.0]],
+        ]
+    )
+    candidate_only = F.binary_cross_entropy_with_logits(
+        result["child_match_logits"], candidate_target
+    )
+    candidate_only.backward()
+    assert verifier.parent_to_child.weight.grad is not None
+    assert verifier.raw_verification_strength.grad is None
+
+    verifier.zero_grad(set_to_none=True)
+    result = verifier(q3, q_child, retrieval, torch.ones(2, 1))
+    aux = {
+        "pc_hbm": {
+            **result,
+            "retrieval_valid": retrieval["valid"],
+            "query_batch_ids": torch.zeros(2, dtype=torch.long),
+            "query_flat_indices": torch.arange(2),
+            "query_mask_map": torch.ones(1, 1, 2, 2),
+        }
+    }
+    region_only, _ = binary_pair_loss(
+        aux,
+        GT,
+        q_child,
+        _config(lambda_candidate_verify=0.0),
+    )
+    region_only.backward()
+    assert verifier.parent_to_child.weight.grad is not None
+    assert verifier.raw_verification_strength.grad is not None
+
+    verifier.zero_grad(set_to_none=True)
+    result = verifier(q3, q_child, retrieval, torch.ones(2, 1))
+    aux["pc_hbm"].update(result)
+    total, _ = binary_pair_loss(aux, GT, q_child, _config())
+    total.backward()
+    assert verifier.parent_to_child.weight.grad is not None
+    assert verifier.raw_verification_strength.grad is not None

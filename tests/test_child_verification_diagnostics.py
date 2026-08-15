@@ -42,12 +42,11 @@ def test_verification_diagnostics_report_repairs_auroc_and_margins() -> None:
             "parent_cosine": parent_scores,
             "parent_scores": parent_scores,
             "child_cosine": torch.ones_like(parent_scores),
+            "child_match_logits": verify_logits,
             "child_verify_logits": verify_logits,
             "relation_valid": relation_valid,
+            "child_match_strength": torch.tensor(0.25),
             "verification_strength": torch.tensor(0.25),
-            "verification_abs_weight": torch.tensor(0.05),
-            "verification_rel_weight": torch.tensor(0.06),
-            "verification_bias": torch.tensor(0.0),
             "candidate_entropy": torch.zeros(2),
             "memory_confidence": torch.ones(2, 1),
             "gate": torch.ones(2, 1),
@@ -68,12 +67,19 @@ def test_verification_diagnostics_report_repairs_auroc_and_margins() -> None:
     assert metrics["margin_gain_parent_wrong"] > 0.0
     assert metrics["candidate_auroc"] == 1.0
     assert metrics["relation_valid_ratio"] == 7.0 / 8.0
+    assert metrics["child_match_strength"] == 0.25
     assert metrics["verification_strength"] == 0.25
-    assert metrics["verification_abs_weight"] == 0.05
-    assert metrics["verification_rel_weight"] == 0.06
+    assert metrics["child_match_logit_mean"] == metrics["verify_logit_mean"]
+    assert metrics["child_match_logit_std"] == metrics["verify_logit_std"]
+    assert metrics["child_update_parent_ratio"] == metrics[
+        "verification_update_parent_ratio"
+    ]
     assert torch.isfinite(metrics["verify_logit_mean"])
     assert torch.isfinite(metrics["verify_logit_std"])
     assert torch.isfinite(metrics["verification_update_parent_ratio"])
+    assert "verification_abs_weight" not in metrics
+    assert "verification_rel_weight" not in metrics
+    assert "verification_bias" not in metrics
 
 
 def test_exact_auroc_is_tie_aware() -> None:

@@ -281,7 +281,7 @@ def main() -> None:
                 supervised,
             )
             observations = _candidate_observations(
-                pc["child_verify_logits"],
+                pc["child_match_logits"],
                 pc["retrieval_valid"],
                 labels,
                 supervised,
@@ -314,7 +314,7 @@ def main() -> None:
                 supervised,
             )
             observations = _candidate_observations(
-                shuffled_result["child_verify_logits"],
+                shuffled_result["child_match_logits"],
                 pc["retrieval_valid"],
                 labels,
                 supervised,

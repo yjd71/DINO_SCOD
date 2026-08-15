@@ -160,6 +160,7 @@ def test_decoder_off_path_supports_configured_grid_and_width() -> None:
         decoder_dim=64,
         memory_dim=64,
         dino_layer_indices=(1, 4, 7, 10),
+        region_max_quota=(100, 100),
     )
     model = Decoder(
         in_dim=cfg.encoder_dim,
