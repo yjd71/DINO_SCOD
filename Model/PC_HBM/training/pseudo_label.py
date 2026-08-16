@@ -205,20 +205,15 @@ def pc_unlabeled_loss(
         student_p3, teacher_p3, confidence
     )
 
-    feature_weight = float(
-        getattr(config, "feature_distill_p3_weight", 0.05)
-    )
     unlabeled_weight = float(getattr(config, "lambda_u", 1.0))
-    if feature_weight < 0.0 or unlabeled_weight < 0.0:
-        raise ValueError("unlabeled loss weights must be non-negative")
-    feature_weighted = feature_weight * feature
-    total = unlabeled_weight * (main + side + feature_weighted)
+    if unlabeled_weight < 0.0:
+        raise ValueError("lambda_u must be non-negative")
+    total = unlabeled_weight * (main + side + feature)
     positive = confidence.detach() > 0
     metrics = {
         "L_u_main": main.detach(),
         "L_u_side": side.detach(),
         "L_u_feat_p3": feature.detach(),
-        "L_u_feat_p3_weighted": feature_weighted.detach(),
         "L_u_total": total.detach(),
         "pseudo_conf_mean": confidence.detach().float().mean(),
         "pseudo_coverage": positive.float().mean(),

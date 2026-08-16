@@ -113,11 +113,14 @@ def test_unlabeled_loss_has_soft_main_sides_and_p3_only():
         "L_u_main",
         "L_u_side",
         "L_u_feat_p3",
-        "L_u_feat_p3_weighted",
         "L_u_total",
         "pseudo_conf_mean",
         "pseudo_coverage",
     }
+    torch.testing.assert_close(
+        metrics["L_u_total"],
+        metrics["L_u_main"] + metrics["L_u_side"] + metrics["L_u_feat_p3"],
+    )
     loss.backward()
     assert student_p3.grad is not None
     assert teacher_p3.grad is None

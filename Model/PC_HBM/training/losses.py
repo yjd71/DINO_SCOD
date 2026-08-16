@@ -97,10 +97,6 @@ def binary_pair_loss(
     pc = aux.get("pc_hbm") if isinstance(aux, Mapping) else None
     if not isinstance(pc, Mapping):
         raise KeyError("active PC-HBM-Lite mode requires aux['pc_hbm']")
-    verification_mode = str(
-        getattr(config, "child_verification_mode", "weighted_sum")
-    ).lower()
-
     logits = pc.get("pair_logits")
     valid = pc.get("query_valid")
     batch_ids = pc.get("query_batch_ids")
@@ -127,13 +123,7 @@ def binary_pair_loss(
     batch_ids = batch_ids.to(device=logits.device, dtype=torch.long)
     flat_indices = flat_indices.to(device=logits.device, dtype=torch.long)
     if count == 0 or not bool(valid.any()):
-        empty_loss = logits.float().sum() * 0.0
-        match_reference = _child_match_logits(pc)
-        if verification_mode == "parent_conditioned" and torch.is_tensor(
-            match_reference
-        ):
-            empty_loss = empty_loss + match_reference.float().sum() * 0.0
-        return empty_loss, _empty_pair_metrics(zero)
+        return logits.float().sum() * 0.0, _empty_pair_metrics(zero)
 
     if gt.ndim == 3:
         gt = gt.unsqueeze(1)
@@ -160,82 +150,18 @@ def binary_pair_loss(
     selected_target = target_map[selected_batch, selected_flat]
     supervised = selected_target >= 0
     if not bool(supervised.any()):
-        empty_loss = logits.float().sum() * 0.0
-        match_reference = _child_match_logits(pc)
-        if verification_mode == "parent_conditioned" and torch.is_tensor(
-            match_reference
-        ):
-            empty_loss = empty_loss + match_reference.float().sum() * 0.0
-        return empty_loss, _empty_pair_metrics(zero)
+        return logits.float().sum() * 0.0, _empty_pair_metrics(zero)
     effective_valid = valid.clone()
     effective_valid[valid] = supervised
     target = selected_target[supervised].long()
     selected_logits = logits[effective_valid].float()
     region_loss = F.cross_entropy(selected_logits, target)
     accuracy = (selected_logits.argmax(dim=1) == target).float().mean()
-    if verification_mode == "weighted_sum":
-        return region_loss, {
-            **_empty_pair_metrics(zero),
-            "pair_valid_count": effective_valid.sum().detach().float(),
-            "pair_accuracy": accuracy.detach(),
-            "L_pair_region": region_loss.detach(),
-        }
-    if verification_mode != "parent_conditioned":
-        raise ValueError(
-            "child_verification_mode must be 'weighted_sum' or "
-            "'parent_conditioned'"
-        )
-
-    match_logits = _child_match_logits(pc)
-    retrieval_valid = pc.get("retrieval_valid")
-    if not all(
-        torch.is_tensor(value)
-        for value in (match_logits, retrieval_valid)
-    ):
-        raise KeyError(
-            "parent-conditioned supervision requires child_match_logits "
-            "and retrieval_valid"
-        )
-    if (
-        match_logits.ndim != 3
-        or match_logits.shape[:2] != (count, 2)
-        or retrieval_valid.shape != match_logits.shape
-    ):
-        raise ValueError(
-            "child_match_logits and retrieval_valid must share [M,2,K]"
-        )
-
-    candidate_logits = match_logits[effective_valid].float()
-    candidate_valid = retrieval_valid[effective_valid].to(
-        device=candidate_logits.device, dtype=torch.bool
-    )
-    region_ids = torch.arange(2, device=target.device).view(1, 2, 1)
-    candidate_target = (region_ids == target.view(-1, 1, 1)).to(
-        dtype=candidate_logits.dtype
-    )
-    candidate_target = candidate_target.expand_as(candidate_logits)
-    candidate_bce = F.binary_cross_entropy_with_logits(
-        candidate_logits,
-        candidate_target,
-        reduction="none",
-    )
-    candidate_count = candidate_valid.sum(dim=(1, 2)).clamp_min(1).float()
-    candidate_loss = (
-        (candidate_bce * candidate_valid.float()).sum(dim=(1, 2))
-        / candidate_count
-    ).mean()
-
-    lambda_candidate = float(getattr(config, "lambda_candidate_verify", 0.50))
-    if lambda_candidate < 0.0:
-        raise ValueError("lambda_candidate_verify must be non-negative")
-    loss = region_loss + lambda_candidate * candidate_loss
-    return loss, {
+    return region_loss, {
         **_empty_pair_metrics(zero),
         "pair_valid_count": effective_valid.sum().detach().float(),
         "pair_accuracy": accuracy.detach(),
-        "candidate_valid_count": candidate_valid.sum().detach().float(),
         "L_pair_region": region_loss.detach(),
-        "L_candidate_verify": candidate_loss.detach(),
     }
 
 
@@ -278,15 +204,11 @@ def pc_hbm_labeled_loss(
     elif mode == "off":
         raise RuntimeError("teacher_only Base training does not support off mode")
 
-    pair_weight = float(getattr(config, "lambda_pair", 0.20))
-    if pair_weight < 0.0:
-        raise ValueError("lambda_pair must be non-negative")
-    total = base + main + pair_weight * pair
+    total = base + main + pair
     metrics = {
         "L_base": base.detach(),
         "L_main": main.detach(),
         "L_pair": pair.detach(),
-        "L_pair_weighted": (pair_weight * pair).detach(),
         "L_total": total.detach(),
         **pair_metrics,
     }
@@ -365,15 +287,8 @@ def _empty_pair_metrics(zero: torch.Tensor) -> dict[str, torch.Tensor]:
     return {
         "pair_valid_count": detached,
         "pair_accuracy": detached,
-        "candidate_valid_count": detached,
         "L_pair_region": detached,
-        "L_candidate_verify": detached,
     }
-
-
-def _child_match_logits(pc: Mapping[str, Any]) -> Any:
-    logits = pc.get("child_match_logits")
-    return pc.get("child_verify_logits") if logits is None else logits
 
 
 __all__ = [

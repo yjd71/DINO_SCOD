@@ -165,17 +165,19 @@ existing downstream consumers do not need to change. Existing
 `pair_scores`, `pair_logits`, and `region_prob` continue to mean the final
 verified result.
 
-The directly supervised matching objective is
+The matching objective is the binary region classification loss itself:
 
 ```text
-L_match = L_reg + 0.5 * L_cand
-L_enh = L_seg + 1.0 * L_match
+L_match = L_reg
+L_enh = L_seg + L_match
 ```
 
-`L_cand` is BCE on the unscaled fixed Child logits. It trains the Child query
-path and `W32`, but does not directly train `raw_eta`. Repair, harm, net-gain,
-and margin-gain remain no-gradient diagnostics; V2 repair/preserve objectives
-and their configuration fields have been removed.
+`L_reg` is cross-entropy on the verified binary region logits and therefore
+trains the Child query path, `W32`, and `raw_eta` through the verified score.
+There is no candidate BCE and no candidate-loss weight. `L_match` is added to
+the segmentation objective directly; the former `lambda_pair` control has
+been removed. Repair, harm, net-gain, margin-gain, and candidate AUROC remain
+no-gradient diagnostics.
 
 Decoder and resume checkpoints now carry `child_verifier_version=3` while the
 Memory format/schema remains V2. Strict load, resume, TS teacher loading, and
@@ -195,6 +197,12 @@ for complete legacy `weighted_sum` Decoder checkpoints; the two migration
 flags are mutually exclusive. Because `child_window_size` is compatibility
 metadata, a Memory built with a different window (for example 7) must be
 rebuilt even though its schema version is still 2.
+
+New checkpoints omit `lambda_candidate_verify`, `lambda_pair`, and
+`feature_distill_p3_weight`. Strict loading rejects checkpoints whose `pc_cfg`
+still contains these obsolete objective controls rather than silently changing
+their training semantics. V2 Decoder initialization drops them through the
+explicit migration path above.
 
 ## Modes and training
 
@@ -218,7 +226,8 @@ Formal semi-supervised training is Teacher-only:
   `2 * abs(p_final - 0.5) * (1 - Q + Q * C_mem)`.
 - Targets: soft probability, confidence, and corrected P3 only.
 - Student loss: labeled legacy structure loss, confidence-weighted main and
-  side losses, plus P3 cosine distillation with weight `1.0`.
+  side losses, plus P3 cosine distillation added directly with coefficient 1.
+  The former `feature_distill_p3_weight` control has been removed.
 - EMA updates only names shared by the raw Student and legacy Teacher Decoder.
 
 ## Commands

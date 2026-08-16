@@ -99,6 +99,12 @@ def test_decoder_v3_round_trip_and_baseline_only_loading(tmp_path):
     assert payload["pc_cfg"]["verification_strength_init"] == pytest.approx(
         0.25
     )
+    for removed_name in (
+        "lambda_candidate_verify",
+        "lambda_pair",
+        "feature_distill_p3_weight",
+    ):
+        assert removed_name not in payload["pc_cfg"]
     target = TinyDecoder()
     load_decoder_compatible(
         target,
@@ -137,6 +143,33 @@ def test_decoder_v3_rejects_missing_child_verifier_metadata(tmp_path):
             require_pc_complete=True,
             expected_pc_cfg=cfg,
         )
+
+
+def test_decoder_rejects_removed_loss_controls_before_mutation(tmp_path):
+    cfg = DinoPCHBMConfig()
+    source = TinyDecoder()
+    path = tmp_path / "decoder_with_obsolete_loss_controls.pth"
+    payload = save_decoder_checkpoint(path, source, cfg, 1)
+    payload["pc_cfg"].update(
+        {
+            "lambda_candidate_verify": 0.5,
+            "lambda_pair": 1.0,
+            "feature_distill_p3_weight": 1.0,
+        }
+    )
+    torch.save(payload, path)
+
+    target = TinyDecoder()
+    before = copy.deepcopy(target.state_dict())
+    with pytest.raises(RuntimeError, match="invalid PC-HBM-Lite config"):
+        load_decoder_compatible(
+            target,
+            path,
+            require_pc_complete=True,
+            expected_pc_cfg=cfg,
+        )
+    for name, value in before.items():
+        assert torch.equal(value, target.state_dict()[name])
 
 
 def test_decoder_config_is_reconstructed_and_mismatch_is_atomic(tmp_path):
@@ -331,9 +364,7 @@ def test_memory_compat_excludes_training_only_configuration():
         full_pc_start_epoch=4,
         teacher_only_full_start_epoch=3,
         pc_injection_ramp_epochs=2,
-        lambda_pair=0.4,
         lambda_u=0.7,
-        feature_distill_p3_weight=0.2,
         use_amp=False,
         grad_clip_norm=0.0,
         ema_momentum=1.0,

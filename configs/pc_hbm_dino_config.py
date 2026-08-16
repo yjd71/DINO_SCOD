@@ -135,19 +135,14 @@ class DinoPCHBMConfig:
     verification_logit_clip: float = 6.0
     relation_norm_eps: float = 1.0e-4
 
-    # Direct fixed-Child matching objective.
-    lambda_candidate_verify: float = 0.50
-
     # Stage schedule.
     verify_start_epoch: int = 6
     full_pc_start_epoch: int = 11
     teacher_only_full_start_epoch: int = 6
     pc_injection_ramp_epochs: int = 3
 
-    # Labeled and unlabeled objectives.
-    lambda_pair: float = 1.0
+    # Unlabeled objective.
     lambda_u: float = 1.0
-    feature_distill_p3_weight: float = 1.0
 
     # Optimization.
     use_amp: bool = True
@@ -192,12 +187,6 @@ class DinoPCHBMConfig:
             minimum_open=True,
             maximum_open=True,
         )
-        self.lambda_candidate_verify = _as_float(
-            "lambda_candidate_verify",
-            self.lambda_candidate_verify,
-            minimum=0.0,
-        )
-
         for name in (
             "enabled",
             "use_unlabeled_memory_update",
@@ -472,16 +461,9 @@ class DinoPCHBMConfig:
         if self.full_pc_start_epoch < self.verify_start_epoch:
             raise ValueError("full_pc_start_epoch must not precede verification")
 
-        for name in (
-            "lambda_pair",
-            "lambda_u",
-            "feature_distill_p3_weight",
-        ):
-            setattr(
-                self,
-                name,
-                _as_float(name, getattr(self, name), minimum=0.0),
-            )
+        self.lambda_u = _as_float(
+            "lambda_u", self.lambda_u, minimum=0.0
+        )
         self.grad_clip_norm = _as_float(
             "grad_clip_norm",
             self.grad_clip_norm,

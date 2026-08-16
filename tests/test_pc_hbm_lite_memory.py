@@ -136,14 +136,11 @@ def test_lite_config_accepts_tunable_hyperparameters() -> None:
         verification_strength_init=0.3,
         verification_logit_clip=5.0,
         relation_norm_eps=2.0e-4,
-        lambda_candidate_verify=0.6,
         verify_start_epoch=2,
         full_pc_start_epoch=4,
         teacher_only_full_start_epoch=3,
         pc_injection_ramp_epochs=2,
-        lambda_pair=0.35,
         lambda_u=0.8,
-        feature_distill_p3_weight=0.1,
         use_amp=False,
         grad_clip_norm=2.5,
         ema_momentum=0.98,
@@ -160,7 +157,6 @@ def test_lite_config_accepts_tunable_hyperparameters() -> None:
     assert cfg.child_window_size == 5
     assert cfg.child_verification_mode == "parent_conditioned"
     assert cfg.verification_strength_init == pytest.approx(0.3)
-    assert cfg.lambda_candidate_verify == pytest.approx(0.6)
     assert cfg.memory_storage_dtype == "bfloat16"
     assert cfg.dino_layer_indices == (1, 4, 7, 10)
     assert cfg.expected_memory_meta() == {
@@ -212,7 +208,6 @@ def test_lite_config_accepts_tunable_hyperparameters() -> None:
         ({"verification_strength_init": 1.0}, "verification_strength_init"),
         ({"verification_logit_clip": 0.0}, "verification_logit_clip"),
         ({"relation_norm_eps": 0.0}, "relation_norm_eps"),
-        ({"lambda_candidate_verify": -0.1}, "lambda_candidate_verify"),
     ],
 )
 def test_child_verifier_v3_config_rejects_invalid_values(
@@ -220,6 +215,21 @@ def test_child_verifier_v3_config_rejects_invalid_values(
 ) -> None:
     with pytest.raises(ValueError, match=match):
         DinoPCHBMConfig(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "removed_name",
+    (
+        "lambda_candidate_verify",
+        "lambda_pair",
+        "feature_distill_p3_weight",
+    ),
+)
+def test_removed_loss_weights_are_not_configurable(removed_name: str) -> None:
+    cfg = DinoPCHBMConfig()
+    assert not hasattr(cfg, removed_name)
+    with pytest.raises(TypeError, match=removed_name):
+        DinoPCHBMConfig(**{removed_name: 1.0})
 
 
 def test_lite_config_accepts_safe_zero_and_closed_boundary_values() -> None:
@@ -315,7 +325,6 @@ def test_memory_storage_dtype_is_tunable_on_cpu(
             "full_pc_start_epoch",
         ),
         ({"pc_injection_ramp_epochs": 0}, "pc_injection_ramp_epochs"),
-        ({"lambda_pair": float("inf")}, "lambda_pair"),
         ({"warn_low_pair_valid_ratio": float("nan")}, "finite"),
         ({"memory_storage_dtype": "int8"}, "memory_storage_dtype"),
         ({"memory_source": "pseudo"}, "labeled_only"),

@@ -275,6 +275,9 @@ def test_explicit_v2_to_v3_migration_keeps_only_stable_verifier_state(
             "verification_preserve_tolerance": 0.05,
             "lambda_parent_repair": 0.50,
             "lambda_parent_preserve": 0.25,
+            "lambda_candidate_verify": 0.50,
+            "lambda_pair": 1.0,
+            "feature_distill_p3_weight": 1.0,
         }
     )
     state = payload["decoder"]
@@ -299,7 +302,13 @@ def test_explicit_v2_to_v3_migration_keeps_only_stable_verifier_state(
         assert torch.equal(value, target.state_dict()[name])
 
     migrated_cfg = read_pc_config(path, init_pcv_from_v2=True)
-    assert not hasattr(migrated_cfg, "verification_temperature")
+    for removed_name in (
+        "verification_temperature",
+        "lambda_candidate_verify",
+        "lambda_pair",
+        "feature_distill_p3_weight",
+    ):
+        assert not hasattr(migrated_cfg, removed_name)
     migrated = _MigrationDecoder(migrated_cfg)
     load_decoder_compatible(
         migrated,

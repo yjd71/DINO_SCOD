@@ -31,7 +31,6 @@ _PCV_CONFIG_FIELDS = {
     "verification_strength_init",
     "verification_logit_clip",
     "relation_norm_eps",
-    "lambda_candidate_verify",
 }
 _V2_REMOVED_CONFIG_FIELDS = {
     "verification_temperature",
@@ -44,6 +43,9 @@ _V2_REMOVED_CONFIG_FIELDS = {
     "verification_preserve_tolerance",
     "lambda_parent_repair",
     "lambda_parent_preserve",
+    "lambda_candidate_verify",
+    "lambda_pair",
+    "feature_distill_p3_weight",
 }
 _V3_TRANSFERRED_VERIFIER_KEYS = {
     _VERIFIER_STATE_PREFIX + "parent_to_child.weight",

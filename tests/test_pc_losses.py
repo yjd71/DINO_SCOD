@@ -122,10 +122,8 @@ def test_two_stage_and_teacher_only_labeled_objectives():
     )
     assert float(verify_log["L_base"]) == 0.0
     assert float(verify_log["L_main"]) == 0.0
-    assert torch.allclose(
-        verify,
-        cfg.lambda_pair * verify_log["L_pair"],
-    )
+    assert torch.allclose(verify, verify_log["L_pair"])
+    assert "L_pair_weighted" not in verify_log
 
     full, full_log = pc_hbm_pc_only_labeled_loss(
         outputs,
