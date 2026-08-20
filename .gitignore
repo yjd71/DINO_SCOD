@@ -11,6 +11,16 @@ tests/*
 !tests/test_pc_bacs_dataset.py
 !tests/test_pc_bacs_checkpoint_cli.py
 !tests/pc_bacs_smoke.py
+!tests/test_global_additive_selection.py
+!tests/test_global_additive_cli.py
+!tests/test_global_multiplicative_selection.py
+!tests/test_global_multiplicative_cli.py
+!tests/test_kmeans_only_selection.py
+!tests/test_kmeans_only_cli.py
+!tests/test_kmeans_dbd_selection.py
+!tests/test_kmeans_dbd_cli.py
+!tests/test_kmeans_dall_selection.py
+!tests/test_kmeans_dall_cli.py
 ./cache
 .git
 .agents

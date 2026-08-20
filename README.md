@@ -152,6 +152,71 @@ artifacts. Existing score caches are refused by default: use `--reuse-scores`
 for fingerprint-validated reuse, or `--rebuild-scores` for an explicit atomic
 replacement.
 
+### Global-Additive offline sampling (without KMeans)
+
+The Global-Additive ablation starts from an external 40-image labeled seed and
+reuses its matching 5-epoch selector score cache. It ranks every remaining
+training image globally by `D_bd + (1 - D_all)` and generates nested
+`41/202/404/808` stable-key splits (1%/5%/10%/20%). The default mode is pure
+global Top-K; an optional `dino-cosine` mode applies global DINO deduplication
+against all already selected samples with a default threshold of `0.95`. Neither
+mode runs KMeans or allocates cluster quotas, and neither changes or overwrites
+the existing PC-BACS protocol. See
+[docs/GLOBAL_ADDITIVE_SELECTION.md](docs/GLOBAL_ADDITIVE_SELECTION.md) for the
+`yjd` command, strict cache contract, and paired `.pt`/`.txt` artifacts.
+
+### Global multiplicative-V offline sampling (KMeans seed, no selection-time KMeans)
+
+The Global-Multiplicative ablation reuses the existing 40-image KMeans-center
+seed, its matching 5-epoch selector, and the validated full-precision score
+cache. It does not run KMeans during selection: every non-seed image is ranked
+once by `(-D_bd * (1 - D_all), sample_key)` and pure global Top-K produces the
+nested `41/202/404/808` stable-key splits without cluster quotas or
+deduplication. The manifest records the KMeans seed lineage explicitly so this
+protocol is not confused with a fully KMeans-free experiment. See
+[docs/GLOBAL_MULTIPLICATIVE_SELECTION.md](docs/GLOBAL_MULTIPLICATIVE_SELECTION.md)
+for the formal `yjd` command, strict cache contract, expected fingerprints, and
+paired `.pt`/`.txt` artifacts.
+
+### KMeans-only offline sampling
+
+The KMeans-only ablation reuses the keyed 4040-image DINO cache but does not
+load a selector, score cache, GT, or any PC-BACS disagreement score. It fits the
+fixed 40-cluster KMeans protocol, assigns each incremental budget with
+square-root cluster quotas, and selects only by distance to the fitted center.
+It generates nested `41/202/404/808` stable-key splits plus paired labeled-name
+TXT files under `Dataset/COD/splits/kmeans_only`. See
+[docs/KMEANS_ONLY_SELECTION.md](docs/KMEANS_ONLY_SELECTION.md) for the exact
+protocol, command, fingerprints, and audit artifacts.
+
+### KMeans + boundary-disagreement offline sampling
+
+The KMeans-Dbd ablation uses the same deterministic 40-cluster DINO seed and
+its matching 5-epoch selector. KMeans determines cluster membership, the
+center-nearest seeds, and square-root incremental quotas; candidates inside
+each cluster are ranked only by boundary disagreement (`D_bd`). Same-cluster
+DINO cosine deduplication uses a fixed `0.95` threshold and exact backfill. The
+global disagreement and the multiplicative PC-BACS value are validated only as
+source-cache integrity fields and never affect selection. The workflow produces
+nested `41/202/404/808` PT/TXT pairs under
+`Dataset/COD/splits/kmeans_dbd_dedup`. See
+[docs/KMEANS_DBD_SELECTION.md](docs/KMEANS_DBD_SELECTION.md) for the formal
+command, cache contract, and expected fingerprints.
+
+### KMeans + high/low global-disagreement offline sampling
+
+The KMeans-Dall ablation produces two controlled variants from the same
+40-image KMeans seed, matching 5-epoch selector, square-root quotas, and
+same-cluster DINO cosine deduplication. The high variant ranks candidates by
+`(-D_all, sample_key)` while the low variant ranks the original float32 values
+by `(D_all, sample_key)` without constructing `1 - D_all`. Boundary
+disagreement and the multiplicative PC-BACS value are source-cache integrity
+fields only and never affect either selection. Both variants generate nested
+`41/202/404/808` PT/TXT pairs under
+`Dataset/COD/splits/kmeans_dall_dedup/{high,low}`. See
+[docs/KMEANS_DALL_SELECTION.md](docs/KMEANS_DALL_SELECTION.md) for the formal
+command, cache contract, and expected fingerprints.
+
 + Pre-computed Maps: 
    + 1% Training Data: [Google Drive](https://drive.google.com/drive/folders/1Ljd9nxno9qznMyEmQKohbXD8-vRZmAmu?usp=sharing)
    + 5% Training Data: [Google Drive](https://drive.google.com/drive/folders/1tPLR9Jsnymsfv4LvDSCX3rX4_OrQOiJp?usp=sharing)
