@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from copy import deepcopy
 
 import pytest
 import torch
@@ -100,6 +101,7 @@ def test_decoder_lite_modes_have_stable_output_and_aux(
     assert all(output.shape == (1, 1, 98, 98) for output in outputs)
     assert all(torch.isfinite(output).all() for output in outputs)
     assert aux["pc_active"] is True
+    assert aux["pc_engine_source"] == "internal_trainable"
     assert aux["forward_mode"] == mode
     assert torch.equal(aux["z_final"], aux["z_main"])
     torch.testing.assert_close(aux["p_final"], torch.sigmoid(aux["z_main"]))
@@ -126,23 +128,37 @@ def test_decoder_rejects_removed_modes_without_aliases(
         model(features, memory=memory, pc_mode=mode)
 
 
-def test_decoder_missing_memory_falls_back_but_incompatible_memory_raises(
+def test_decoder_active_modes_fail_fast_without_memory_or_engine(
     decoder_inputs,
 ) -> None:
     model, features, _ = decoder_inputs
-    baseline = model(features, pc_mode="off")
-    fallback, aux = model(
-        features, memory=None, pc_mode="full", return_aux=True
-    )
-    assert aux["pc_active"] is False
-    assert aux["fallback_reason"] == "memory_missing"
-    for actual, expected in zip(fallback, baseline):
-        torch.testing.assert_close(actual, expected)
+    with pytest.raises(RuntimeError, match="requires finalized PC-HBM memory"):
+        model(features, memory=None, pc_mode="full", return_aux=True)
 
     with pytest.raises(ValueError, match="Incompatible PC-HBM-Lite memory"):
         model(features, memory=_Memory(compatible=False), pc_mode="full")
-    with pytest.raises(ValueError, match="Incompatible PC-HBM-Lite memory"):
-        model(features, memory=_Memory(compatible=False), pc_mode="off")
+    raw = Decoder(in_dim=768, out_dim=128, pc_cfg=None)
+    raw.load_state_dict(
+        {name: value for name, value in model.state_dict().items() if not name.startswith("pc_hbm.")},
+        strict=True,
+    )
+    with pytest.raises(RuntimeError, match="requires an internal or external"):
+        raw(features, memory=_Memory(), pc_mode="full")
+
+
+def test_decoder_external_readonly_engine_is_audited(decoder_inputs) -> None:
+    model, features, memory = decoder_inputs
+    readonly = deepcopy(model.pc_hbm)
+    readonly.requires_grad_(False).eval()
+    _, aux = model(
+        features,
+        memory=memory,
+        pc_mode="full",
+        return_aux=True,
+        pc_engine_override=readonly,
+    )
+    assert aux["pc_active"] is True
+    assert aux["pc_engine_source"] == "external_readonly"
 
 
 def test_decoder_lite_rejects_nonfixed_dino_grid() -> None:

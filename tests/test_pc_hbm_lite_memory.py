@@ -22,6 +22,7 @@ def _entry(image_ids: tuple[str, ...], *, dim: int = 128) -> dict:
     pair_count = len(pair_meta)
     return {
         "source": "labeled_only",
+        "producer_role": "labeled_student",
         "route": {
             "global_keys": F.normalize(torch.randn(count, dim), dim=-1),
             "environment_keys": F.normalize(torch.randn(count, dim), dim=-1),
@@ -61,6 +62,7 @@ def test_lite_config_contract_and_stage_schedules() -> None:
         "region_names": ("fg_boundary", "bg_near"),
         "storage_dtype": "float16",
         "source": "labeled_only",
+        "producer_role": "labeled_student",
         "route_environment_min_mass": 1.0e-3,
         "fg_boundary_kernel": 3,
         "bg_near_kernel": 7,
@@ -76,12 +78,7 @@ def test_lite_config_contract_and_stage_schedules() -> None:
         "verify_only",
         "full",
     ]
-    assert [cfg.injection_scale(epoch) for epoch in (10, 11, 12, 13)] == [
-        0.0,
-        pytest.approx(1.0 / 3.0),
-        pytest.approx(2.0 / 3.0),
-        1.0,
-    ]
+    assert not hasattr(cfg, "injection_scale")
     cfg.configure_training_design("teacher_only")
     assert [cfg.pc_mode_for_epoch(epoch) for epoch in (1, 5, 6)] == [
         "verify_only",
@@ -141,6 +138,7 @@ def test_lite_config_accepts_tunable_hyperparameters() -> None:
         teacher_only_full_start_epoch=3,
         pc_injection_ramp_epochs=2,
         lambda_u=0.8,
+        lambda_pair=0.7,
         use_amp=False,
         grad_clip_norm=2.5,
         ema_momentum=0.98,
@@ -157,6 +155,7 @@ def test_lite_config_accepts_tunable_hyperparameters() -> None:
     assert cfg.child_window_size == 5
     assert cfg.child_verification_mode == "parent_conditioned"
     assert cfg.verification_strength_init == pytest.approx(0.3)
+    assert cfg.lambda_pair == pytest.approx(0.7)
     assert cfg.memory_storage_dtype == "bfloat16"
     assert cfg.dino_layer_indices == (1, 4, 7, 10)
     assert cfg.expected_memory_meta() == {
@@ -173,6 +172,7 @@ def test_lite_config_accepts_tunable_hyperparameters() -> None:
         "region_names": ("edge", "near"),
         "storage_dtype": "bfloat16",
         "source": "labeled_only",
+        "producer_role": "labeled_student",
         "route_environment_min_mass": 0.02,
         "fg_boundary_kernel": 5,
         "bg_near_kernel": 9,
@@ -188,11 +188,7 @@ def test_lite_config_accepts_tunable_hyperparameters() -> None:
         "verify_only",
         "full",
     ]
-    assert [cfg.injection_scale(epoch) for epoch in (3, 4, 5)] == [
-        0.0,
-        pytest.approx(0.5),
-        1.0,
-    ]
+    assert not hasattr(cfg, "injection_scale")
     cfg.configure_training_design("teacher_only")
     assert [cfg.pc_mode_for_epoch(epoch) for epoch in (1, 2, 3)] == [
         "verify_only",
@@ -219,10 +215,9 @@ def test_child_verifier_v3_config_rejects_invalid_values(
 
 @pytest.mark.parametrize(
     "removed_name",
-    (
-        "lambda_candidate_verify",
-        "lambda_pair",
-        "feature_distill_p3_weight",
+        (
+            "lambda_candidate_verify",
+            "feature_distill_p3_weight",
     ),
 )
 def test_removed_loss_weights_are_not_configurable(removed_name: str) -> None:
@@ -366,6 +361,10 @@ def test_duplicate_route_id_and_unlabeled_entry_are_rejected() -> None:
     rejected["source"] = "pseudo"
     with pytest.raises(ValueError, match="labeled"):
         memory.append(rejected)
+    wrong_producer = _entry(("C",))
+    wrong_producer["producer_role"] = "teacher"
+    with pytest.raises(ValueError, match="labeled_student"):
+        memory.append(wrong_producer)
 
 
 @pytest.mark.parametrize(
@@ -514,7 +513,8 @@ def test_memory_builder_uses_aligned_p3_p2_pairs_and_no_m2() -> None:
         gt,
         ["A", "B"],
     )
-    assert set(entries) == {"source", "route", "pairs"}
+    assert set(entries) == {"source", "producer_role", "route", "pairs"}
+    assert entries["producer_role"] == "labeled_student"
     assert set(entries["route"]) == {"global_keys", "environment_keys", "img_ids"}
     assert set(entries["pairs"]) == {"p3_keys", "p2_keys", "region_ids", "pair_meta"}
     assert entries["pairs"]["p3_keys"].shape == entries["pairs"]["p2_keys"].shape

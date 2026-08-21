@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import copy
+import random
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.nn as nn
 
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
+from Model.decoder import Decoder
 from Model.PC_HBM.memory import PCMemory
 from tools.export_non_pc_decoder import export_non_pc_decoder
 from utils.checkpoint_pc_hbm import (
@@ -23,7 +26,9 @@ from utils.checkpoint_pc_hbm import (
     save_decoder_checkpoint,
     save_memory_checkpoint,
     save_training_resume,
+    state_dict_fingerprint,
     validate_canonical_labeled_indices_pt,
+    validate_base_student_checkpoint,
     validate_canonical_labeled_split_fingerprint,
     validate_labeled_indices_pt,
     validate_labeled_sample_txt,
@@ -100,9 +105,8 @@ def test_decoder_v3_round_trip_and_baseline_only_loading(tmp_path):
         0.25
     )
     for removed_name in (
-        "lambda_candidate_verify",
-        "lambda_pair",
-        "feature_distill_p3_weight",
+            "lambda_candidate_verify",
+            "feature_distill_p3_weight",
     ):
         assert removed_name not in payload["pc_cfg"]
     target = TinyDecoder()
@@ -307,6 +311,46 @@ def test_resume_preflights_rng_before_model_mutation(tmp_path):
         assert torch.equal(value, model.state_dict()[key])
 
 
+def test_resume_restores_student_and_exact_rng_continuation(tmp_path):
+    cfg = DinoPCHBMConfig()
+    model = TinyDecoder()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1.0e-3)
+    random.seed(1234)
+    np.random.seed(1234)
+    torch.manual_seed(1234)
+    resume_path = tmp_path / "deterministic_resume.pth"
+    save_training_resume(
+        resume_path,
+        epoch=2,
+        model=model,
+        optimizer=optimizer,
+        pc_cfg=cfg,
+        artifact_meta=_metadata(),
+    )
+    expected = (random.random(), np.random.rand(), torch.rand(4))
+    saved_model = copy.deepcopy(model.state_dict())
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.add_(torch.randn_like(parameter))
+    random.seed(99)
+    np.random.seed(99)
+    torch.manual_seed(99)
+
+    load_training_resume(
+        resume_path,
+        model=model,
+        optimizer=optimizer,
+        pc_cfg=cfg,
+        restore_rng=True,
+    )
+
+    for name, value in saved_model.items():
+        torch.testing.assert_close(model.state_dict()[name], value)
+    assert random.random() == expected[0]
+    assert np.random.rand() == expected[1]
+    torch.testing.assert_close(torch.rand(4), expected[2])
+
+
 def test_resume_config_mismatch_is_rejected_before_mutation(tmp_path):
     cfg = DinoPCHBMConfig(tau_child=0.2)
     model = TinyDecoder()
@@ -456,3 +500,49 @@ def test_labeled_split_source_falls_back_to_txt_and_pt_overrides(tmp_path):
     torch.save(["TR-CAMO/c"], pt_path)
     pt_identity = validate_labeled_indices_pt(pt_path)
     assert validate_labeled_split_source(pt_path, txt_path) == pt_identity
+
+
+def test_base_student_checkpoint_requires_complete_state_and_matching_fingerprint(
+    tmp_path,
+):
+    cfg = DinoPCHBMConfig()
+    decoder = Decoder(
+        in_dim=cfg.encoder_dim,
+        out_dim=cfg.decoder_dim,
+        pc_cfg=cfg,
+    )
+    non_pc_fingerprint = state_dict_fingerprint(
+        {
+            name: value
+            for name, value in decoder.state_dict().items()
+            if not name.startswith("pc_hbm.")
+        }
+    )
+    metadata = build_artifact_metadata(
+        training_design="two_stage",
+        artifact_role="base_student",
+        labeled_split_fingerprint=CANONICAL_LABELED_SPLIT_FINGERPRINT,
+        baseline_fingerprint=non_pc_fingerprint,
+        pc_frozen=False,
+    )
+    payload = save_decoder_checkpoint(
+        tmp_path / "base_student.pth",
+        decoder,
+        cfg,
+        1,
+        artifact_meta=metadata,
+    )
+    validated = validate_base_student_checkpoint(
+        payload, CANONICAL_LABELED_SPLIT_FINGERPRINT
+    )
+    assert validated["artifact_role"] == "base_student"
+
+    incomplete = copy.deepcopy(payload)
+    pc_key = next(
+        name for name in incomplete["decoder"] if name.startswith("pc_hbm.")
+    )
+    incomplete["decoder"].pop(pc_key)
+    with pytest.raises(RuntimeError, match="not a complete Decoder state"):
+        validate_base_student_checkpoint(
+            incomplete, CANONICAL_LABELED_SPLIT_FINGERPRINT
+        )

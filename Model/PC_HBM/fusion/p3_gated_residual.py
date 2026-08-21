@@ -1,4 +1,4 @@
-"""The single learnable PC-HBM-Lite write-back."""
+"""Learnable PC-HBM-Lite write-back without confidence gating or ramping."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from torch import nn
 
 
 class P3GatedResidual(nn.Module):
-    """Apply one zero-initialized gated residual at selected P3 tokens."""
+    """Project memory context and write it at valid selected P3 tokens."""
 
     def __init__(self, dim: int = 128, p3_ch: int = 128) -> None:
         super().__init__()
@@ -23,9 +23,7 @@ class P3GatedResidual(nn.Module):
         batch_ids: torch.Tensor,
         flat_indices: torch.Tensor,
         correction_token: torch.Tensor,
-        gate_token: torch.Tensor,
         query_valid: torch.Tensor,
-        injection_scale: float | torch.Tensor = 1.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if p3.ndim != 4 or p3.size(1) != self.p3_ch:
             raise ValueError(
@@ -36,38 +34,17 @@ class P3GatedResidual(nn.Module):
             raise ValueError("flat_indices must align with batch_ids")
         if correction_token.shape != (query_count, self.dim):
             raise ValueError(f"correction_token must be [M,{self.dim}]")
-        if gate_token.shape != (query_count, 1):
-            raise ValueError("gate_token must be [M,1]")
         if query_valid.shape != (query_count,):
             raise ValueError("query_valid must be [M]")
         if batch_ids.dtype != torch.long or flat_indices.dtype != torch.long:
             raise TypeError("batch_ids and flat_indices must be torch.long")
 
-        if isinstance(injection_scale, torch.Tensor):
-            if injection_scale.numel() != 1:
-                raise ValueError("injection_scale must be scalar")
-            scale = injection_scale.to(
-                device=correction_token.device, dtype=correction_token.dtype
-            ).reshape(())
-        else:
-            scale = correction_token.new_tensor(float(injection_scale))
-        if not bool(torch.isfinite(scale)) or not 0.0 <= float(scale) <= 1.0:
-            raise ValueError("injection_scale must be finite and in [0,1]")
-
         valid = query_valid.to(device=correction_token.device, dtype=torch.bool)
         safe_correction = torch.nan_to_num(
             correction_token, nan=0.0, posinf=0.0, neginf=0.0
         )
-        safe_gate = torch.nan_to_num(
-            gate_token, nan=0.0, posinf=1.0, neginf=0.0
-        ).clamp(0.0, 1.0)
         delta_tokens = self.out(safe_correction)
-        delta_tokens = (
-            delta_tokens
-            * safe_gate.to(dtype=delta_tokens.dtype)
-            * valid[:, None].to(dtype=delta_tokens.dtype)
-            * scale
-        )
+        delta_tokens = delta_tokens * valid[:, None].to(dtype=delta_tokens.dtype)
 
         corrected = p3.clone()
         if query_count == 0:

@@ -26,10 +26,8 @@ from Model.PC_HBM.memory import PCMemory
 from Model.PC_HBM.training import (
     DiagnosticWarningTracker,
     collect_pc_diagnostics,
-    make_ema_copy,
     pc_hbm_labeled_loss,
     pc_mode_for_epoch,
-    update_ema_module,
 )
 from Model.PC_HBM.training.losses import pc_hbm_pc_only_labeled_loss
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
@@ -114,7 +112,6 @@ class BasePCHBMTrainer:
         optimizer=None,
         scheduler=None,
         scaler=None,
-        memory_decoder: nn.Module | None = None,
         memory_rebuild_fn: Callable[..., Any] = rebuild_memory,
         training_design: str | None = None,
     ) -> None:
@@ -168,10 +165,6 @@ class BasePCHBMTrainer:
             and self.device.type == "cuda"
         )
         self.scaler = scaler or torch.amp.GradScaler("cuda", enabled=self.amp_enabled)
-        self.memory_decoder = memory_decoder or make_ema_copy(self.decoder)
-        self.memory_decoder.to(self.device).eval().requires_grad_(False)
-        self._validate_ema_schema()
-
         self.memory = memory or PCMemory(config=self.pc_cfg)
         self.memory_rebuild_fn = memory_rebuild_fn
         self.labeled_train_set = None
@@ -326,33 +319,24 @@ class BasePCHBMTrainer:
                 f"and nothing else (missing={missing}, extra={extra})"
             )
 
-    def _validate_ema_schema(self) -> None:
-        decoder_parameters = dict(self.decoder.named_parameters())
-        ema_parameters = dict(self.memory_decoder.named_parameters())
-        decoder_buffers = dict(self.decoder.named_buffers())
-        ema_buffers = dict(self.memory_decoder.named_buffers())
-        if decoder_parameters.keys() != ema_parameters.keys():
-            raise RuntimeError("Decoder and memory_decoder parameter keys differ")
-        if decoder_buffers.keys() != ema_buffers.keys():
-            raise RuntimeError("Decoder and memory_decoder buffer keys differ")
-
     def _rebuild_epoch_memory(self, epoch: int) -> None:
         compat_meta = build_memory_compat_meta(
-            self.pc_cfg, self.memory_decoder
+            self.pc_cfg, self.decoder
         )
         self.memory_rebuild_fn(
             model=self.model,
-            memory_decoder=self.memory_decoder,
+            memory_decoder=self.decoder,
             memory_loader=self.memory_loader,
             memory=self.memory,
             device=self.device,
             config=self.pc_cfg,
             compat_meta=compat_meta,
+            entry_builder=self.decoder.pc_hbm.build_memory_entries,
             use_amp=self.amp_enabled,
             expected_split_count=int(self.cfg.labeled_split_count),
             expected_split_fingerprint=str(self.cfg.labeled_split_fingerprint),
         )
-        self._assert_memory_ready(epoch, self.memory_decoder)
+        self._assert_memory_ready(epoch, self.decoder)
         synchronize()
 
     def _assert_memory_ready(self, epoch: int, producer: nn.Module) -> None:
@@ -387,7 +371,6 @@ class BasePCHBMTrainer:
         self._rebuild_epoch_memory(epoch)
 
         self._set_model_train_mode()
-        self.memory_decoder.eval()
         running: dict[str, float] = defaultdict(float)
         batch_count = 0
         iterator = tqdm(self.labeled_train_dl, disable=not is_main_process())
@@ -444,8 +427,6 @@ class BasePCHBMTrainer:
             )
             self.scaler.step(self.optimizer)
             self.scaler.update()
-            self._update_memory_decoder()
-
             diagnostics = collect_pc_diagnostics(aux, gt)
             batch_metrics = {
                 **loss_metrics,
@@ -507,7 +488,7 @@ class BasePCHBMTrainer:
                 print(f"{current_time()} >>> Epoch {epoch}/{self.cfg.epochs}")
             self.train_epoch(epoch)
         if self.training_design in {"teacher_only", "two_stage"}:
-            self._finalize_teacher_enhancer()
+            self._finalize_base_student()
         if is_main_process():
             print(f"{current_time()} <<< Base PC-HBM training finished")
 
@@ -540,11 +521,10 @@ class BasePCHBMTrainer:
             parsed_history[str(name)] = [float(value) for value in values]
         checkpoint = load_training_resume(
             checkpoint,
-            model=self.model,
+            model=self.decoder,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
             scaler=self.scaler,
-            ema_model=self.memory_decoder,
             pc_cfg=self.pc_cfg,
             restore_rng=restore_rng,
         )
@@ -589,13 +569,12 @@ class BasePCHBMTrainer:
             name: list(values) for name, values in self.warning_tracker.history.items()
         }
         save_training_resume(
-            self.save_dir / "training_resume.pth",
+            self.save_dir / "base_resume_latest.pth",
             epoch=epoch,
-            model=self.model,
+            model=self.decoder,
             optimizer=self.optimizer,
             scheduler=self.scheduler,
             scaler=self.scaler,
-            ema_model=self.memory_decoder,
             pc_cfg=self.pc_cfg,
             artifact_meta=self._artifact_metadata("resume"),
             extra={
@@ -606,11 +585,11 @@ class BasePCHBMTrainer:
         if not should_export:
             return
         save_decoder_checkpoint(
-            self.save_dir / f"base_pc_hbm_decoder_epoch_{epoch}.pth",
+            self.save_dir / f"base_student_epoch_{epoch:02d}.pth",
             self.decoder,
             self.pc_cfg,
             epoch,
-            artifact_meta=self._artifact_metadata("teacher_enhancer"),
+            artifact_meta=self._artifact_metadata("base_student"),
         )
 
     def _set_model_train_mode(self) -> None:
@@ -624,25 +603,8 @@ class BasePCHBMTrainer:
             self.decoder.pc_hbm.train()
 
     @torch.no_grad()
-    def _update_memory_decoder(self) -> None:
-        update_ema_module(
-            self.decoder,
-            self.memory_decoder,
-            momentum=float(self.pc_cfg.ema_momentum),
-        )
-        if self.training_design != "teacher_only":
-            return
-        # The producer tracks only the learned enhancer by EMA.  Frozen legacy
-        # weights are copied exactly so repeated EMA arithmetic cannot introduce
-        # rounding drift relative to the baseline checkpoint.
-        source = dict(self.decoder.named_parameters())
-        target = dict(self.memory_decoder.named_parameters())
-        for name, source_value in source.items():
-            if not name.startswith("pc_hbm."):
-                target[name].copy_(source_value)
-
-    def _finalize_teacher_enhancer(self) -> None:
-        """Rebuild final memory from the main Decoder and export matched artifacts."""
+    def _finalize_base_student(self) -> None:
+        """Rebuild final memory from the Student and export matched artifacts."""
 
         final_epoch = max(0, self.current_epoch - 1)
         compat_meta = build_memory_compat_meta(
@@ -657,29 +619,46 @@ class BasePCHBMTrainer:
             device=self.device,
             config=self.pc_cfg,
             compat_meta=compat_meta,
+            entry_builder=self.decoder.pc_hbm.build_memory_entries,
             use_amp=self.amp_enabled,
+            expected_split_count=int(self.cfg.labeled_split_count),
+            expected_split_fingerprint=str(self.cfg.labeled_split_fingerprint),
         )
         self._assert_memory_ready(final_epoch, self.decoder)
         synchronize()
         if not is_main_process():
             return
+        legacy = self.training_design == "teacher_only"
+        decoder_name = "teacher_enhancer.pth" if legacy else "base_student_final.pth"
+        memory_name = (
+            "teacher_enhancer_memory.pth"
+            if legacy
+            else "base_student_memory_final.pth"
+        )
+        decoder_role = "teacher_enhancer" if legacy else "base_student"
+        memory_role = "teacher_memory" if legacy else "base_student_memory"
         save_decoder_checkpoint(
-            self.save_dir / "teacher_enhancer.pth",
+            self.save_dir / decoder_name,
             self.decoder,
             self.pc_cfg,
             final_epoch,
-            artifact_meta=self._artifact_metadata("teacher_enhancer"),
+            artifact_meta=self._artifact_metadata(decoder_role),
         )
         save_memory_checkpoint(
-            self.save_dir / "teacher_enhancer_memory.pth",
+            self.save_dir / memory_name,
             self.memory,
             compat_meta=compat_meta,
-            artifact_meta=self._artifact_metadata("teacher_memory"),
+            artifact_meta=self._artifact_metadata(memory_role),
         )
 
     def _artifact_metadata(self, artifact_role: str) -> dict[str, Any]:
         artifact_role = str(artifact_role)
-        if artifact_role in {"teacher_enhancer", "teacher_memory"}:
+        if artifact_role in {
+            "base_student",
+            "base_student_memory",
+            "teacher_enhancer",
+            "teacher_memory",
+        }:
             baseline_fingerprint = self._current_legacy_fingerprint()
         else:
             baseline_fingerprint = self.resume_baseline_fingerprint

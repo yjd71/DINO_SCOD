@@ -9,6 +9,7 @@ from .losses import (
     pc_hbm_pc_only_labeled_loss,
     pc_mode_for_epoch,
     structure_loss,
+    ts_labeled_pc_loss,
 )
 from .pseudo_label import (
     build_pc_confidence,
@@ -29,6 +30,7 @@ __all__ = [
     "make_ema_copy",
     "pc_hbm_labeled_loss",
     "pc_hbm_pc_only_labeled_loss",
+    "ts_labeled_pc_loss",
     "pc_mode_for_epoch",
     "pc_unlabeled_loss",
     "prepare_pseudo_targets",

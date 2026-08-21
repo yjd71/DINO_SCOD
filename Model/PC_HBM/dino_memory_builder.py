@@ -150,6 +150,7 @@ class DinoMemoryBuilder:
             raise RuntimeError("Pair tensors and metadata are not one-to-one")
         return {
             "source": "labeled_only",
+            "producer_role": "labeled_student",
             "route": {
                 "global_keys": route["route_global"],
                 "environment_keys": route["route_environment"],

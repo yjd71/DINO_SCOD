@@ -41,7 +41,7 @@ def _aux(valid=(True, True)):
     }
 
 
-def test_locked_schedules_and_three_epoch_ramp():
+def test_locked_mode_schedules_have_no_residual_ramp():
     cfg = DinoPCHBMConfig()
     cfg.configure_training_design("two_stage")
     assert [pc_mode_for_epoch(epoch, cfg) for epoch in (1, 5, 6, 10, 11)] == [
@@ -51,11 +51,7 @@ def test_locked_schedules_and_three_epoch_ramp():
         "verify_only",
         "full",
     ]
-    assert [cfg.injection_scale(epoch) for epoch in (11, 12, 13)] == [
-        1 / 3,
-        2 / 3,
-        1.0,
-    ]
+    assert not hasattr(cfg, "injection_scale")
     cfg.configure_training_design("teacher_only")
     assert [pc_mode_for_epoch(epoch, cfg) for epoch in (1, 5, 6)] == [
         "verify_only",

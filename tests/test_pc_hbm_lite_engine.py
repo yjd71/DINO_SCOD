@@ -6,6 +6,7 @@ import torch
 
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from Model.PC_HBM.dino_engine import DinoPCHBMEngine
+from Model.PC_HBM.fusion import P3GatedResidual
 
 
 @dataclass(frozen=True)
@@ -123,6 +124,26 @@ def test_engine_verify_only_runs_pairs_but_is_identity() -> None:
         "gate_map",
     }
     assert not list(engine.query_selector.parameters())
+
+
+def test_p3_residual_projects_valid_memory_context_without_gate_or_ramp() -> None:
+    residual = P3GatedResidual(dim=2, p3_ch=2)
+    with torch.no_grad():
+        residual.out.weight.copy_(2.0 * torch.eye(2))
+        residual.out.bias.fill_(1.0)
+    p3 = torch.zeros(1, 2, 2, 2)
+    correction = torch.tensor([[2.0, 4.0], [8.0, 16.0]])
+    corrected, delta = residual(
+        p3,
+        batch_ids=torch.tensor([0, 0]),
+        flat_indices=torch.tensor([0, 3]),
+        correction_token=correction,
+        query_valid=torch.tensor([True, False]),
+    )
+
+    torch.testing.assert_close(delta, torch.tensor([[5.0, 9.0], [0.0, 0.0]]))
+    torch.testing.assert_close(corrected[0, :, 0, 0], torch.tensor([5.0, 9.0]))
+    assert torch.count_nonzero(corrected[0, :, 1, 1]) == 0
 
 
 def test_engine_invalid_side_has_zero_correction_confidence_and_gate() -> None:

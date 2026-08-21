@@ -310,6 +310,7 @@ class Decoder(nn.Module):
             'z_final': seg_1,
             'p_final': torch.sigmoid(seg_1),
             'pc_active': False,
+            'pc_engine_source': None,
             'fallback_reason': None,
             'pc_hbm': None,
             'forward_mode': 'off',
@@ -344,7 +345,7 @@ class Decoder(nn.Module):
             'm3': F.interpolate(m3, size=token_hw, mode='bilinear', align_corners=False),
         }
 
-    def _validate_memory(self, memory):
+    def _validate_memory(self, memory, pc_engine):
         """Reject any provided non-V2/incompatible memory before computation."""
 
         if not hasattr(memory, 'is_ready') or not callable(memory.is_ready):
@@ -353,7 +354,10 @@ class Decoder(nn.Module):
             raise ValueError('PC-HBM memory is not finalized and ready.')
         if not hasattr(memory, 'validate_compat') or not callable(memory.validate_compat):
             raise TypeError('PC-HBM memory must expose validate_compat().')
-        compatible = memory.validate_compat(self.pc_cfg.expected_memory_meta())
+        engine_cfg = getattr(pc_engine, 'cfg', None)
+        if engine_cfg is None or not hasattr(engine_cfg, 'expected_memory_meta'):
+            raise TypeError('The selected PC-HBM engine must expose cfg.expected_memory_meta().')
+        compatible = memory.validate_compat(engine_cfg.expected_memory_meta())
         if not compatible:
             reason = getattr(compatible, 'reason', None)
             raise ValueError(
@@ -365,8 +369,9 @@ class Decoder(nn.Module):
         features,
         memory,
         pc_mode,
-        epoch,
         query_image_ids=None,
+        pc_engine=None,
+        pc_engine_source=None,
     ):
         state = self._project_features(features)
         token_hw = state['token_hw']
@@ -394,22 +399,13 @@ class Decoder(nn.Module):
             m3, size=token_hw, mode='bilinear', align_corners=False
         )
 
-        if pc_mode == 'verify_only':
-            injection_scale = 0.0
-        elif pc_mode == 'teacher_pseudo':
-            injection_scale = 1.0
-        elif epoch is None:
-            injection_scale = 1.0
-        else:
-            injection_scale = float(self.pc_cfg.injection_scale(int(epoch)))
-        pc_aux = self.pc_hbm.forward_lite(
+        pc_aux = pc_engine.forward_lite(
             x3=x3_map,
             p3=p3_map,
             p2=child_map,
             m3=m3_token,
             memory=memory,
             mode=pc_mode,
-            injection_scale=injection_scale,
             query_image_ids=query_image_ids,
         )
 
@@ -446,6 +442,7 @@ class Decoder(nn.Module):
             'z_final': z_final,
             'p_final': p_final,
             'pc_active': True,
+            'pc_engine_source': pc_engine_source,
             'fallback_reason': None,
             'pc_hbm': pc_aux,
             'forward_mode': pc_mode,
@@ -466,36 +463,36 @@ class Decoder(nn.Module):
         epoch=None,
         return_aux=False,
         query_image_ids=None,
+        pc_engine_override=None,
     ):
         if pc_mode not in self.VALID_PC_MODES:
             raise ValueError(f'Unsupported pc_mode={pc_mode!r}. Expected one of {sorted(self.VALID_PC_MODES)}.')
 
-        if memory is not None:
-            if self.pc_hbm is None:
-                raise RuntimeError(
-                    'A memory was provided but this Decoder has no PC-HBM-Lite engine.'
-                )
-            self._validate_memory(memory)
+        pc_engine = pc_engine_override if pc_engine_override is not None else self.pc_hbm
+        pc_engine_source = (
+            'external_readonly'
+            if pc_engine_override is not None
+            else 'internal_trainable'
+        )
 
         if pc_mode == 'off':
             outputs, aux = self._forward_baseline(features)
-        elif memory is None:
-            outputs, aux = self._forward_baseline(features)
-            aux['fallback_reason'] = 'memory_missing'
-            aux['forward_mode'] = pc_mode
         else:
+            if pc_engine is None:
+                raise RuntimeError(
+                    f'pc_mode={pc_mode!r} requires an internal or external PC-HBM-Lite engine.'
+                )
+            if memory is None:
+                raise RuntimeError(f'pc_mode={pc_mode!r} requires finalized PC-HBM memory.')
+            self._validate_memory(memory, pc_engine)
             outputs, aux = self._forward_pc_hbm(
                 features=features,
                 memory=memory,
                 pc_mode=pc_mode,
-                epoch=epoch,
                 query_image_ids=query_image_ids,
+                pc_engine=pc_engine,
+                pc_engine_source=pc_engine_source,
             )
-
-        if pc_mode != 'off' and memory is None:
-            if self.pc_hbm is None:
-                aux['fallback_reason'] = 'pc_hbm_not_attached'
-                aux['forward_mode'] = pc_mode
 
         if return_aux:
             return outputs, aux

@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from .supervision import build_pair_label_map
 
 VALID_PC_MODES = frozenset({"off", "verify_only", "full", "teacher_pseudo"})
-VALID_TRAINING_DESIGNS = frozenset({"two_stage", "teacher_only"})
+VALID_TRAINING_DESIGNS = frozenset({"two_stage", "teacher_only", "student_joint"})
 
 
 def zero_like_loss(reference: torch.Tensor) -> torch.Tensor:
@@ -237,6 +237,36 @@ def pc_hbm_pc_only_labeled_loss(
     )
 
 
+def ts_labeled_pc_loss(
+    outputs: Sequence[torch.Tensor],
+    aux: Mapping[str, Any],
+    gt: torch.Tensor,
+    config: Any,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    """Supervise the labeled Student full-PC path without pseudo confidence."""
+
+    _validate_outputs(outputs)
+    if not isinstance(aux, Mapping):
+        raise TypeError("TS labeled aux must be a mapping")
+    if aux.get("forward_mode") != "full" or aux.get("pc_active") is not True:
+        raise RuntimeError("TS labeled Student must execute the full PC-HBM path")
+    if aux.get("pc_engine_source") != "internal_trainable":
+        raise RuntimeError("TS labeled Student must use its internal trainable PC-HBM")
+    base = base_structure_loss(outputs, gt)
+    pair, pair_metrics = binary_pair_loss(aux, gt, outputs[3], config)
+    pair_weight = float(getattr(config, "lambda_pair", 1.0))
+    if pair_weight < 0.0:
+        raise ValueError("lambda_pair must be non-negative")
+    weighted_pair = pair_weight * pair
+    total = base + weighted_pair
+    return total, {
+        "L_l_seg": base.detach(),
+        "L_l_pair": weighted_pair.detach(),
+        "L_l_total": total.detach(),
+        **pair_metrics,
+    }
+
+
 def _validate_outputs(outputs: Sequence[torch.Tensor]) -> None:
     if not isinstance(outputs, (tuple, list)) or len(outputs) != 5:
         raise ValueError(
@@ -298,6 +328,7 @@ __all__ = [
     "binary_pair_loss",
     "pc_hbm_labeled_loss",
     "pc_hbm_pc_only_labeled_loss",
+    "ts_labeled_pc_loss",
     "pc_mode_for_epoch",
     "structure_loss",
     "zero_like_loss",

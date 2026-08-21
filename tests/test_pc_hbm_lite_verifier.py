@@ -54,7 +54,7 @@ def test_pair_verifier_has_one_scalar_and_fp32_binary_evidence() -> None:
     torch.testing.assert_close(result["memory_context"], expected_context)
     torch.testing.assert_close(
         result["correction"],
-        expected_context - torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        expected_context,
     )
     expected_margin = (
         result["region_prob"][:, 0] - result["region_prob"][:, 1]
@@ -243,29 +243,25 @@ def test_retrieval_and_verifier_accept_zero_queries() -> None:
     assert result["query_valid"].shape == (0,)
 
 
-def test_single_residual_is_zero_initialized_and_never_touches_nonqueries() -> None:
+def test_single_residual_projects_memory_context_and_preserves_nonqueries() -> None:
     module = P3GatedResidual(dim=4, p3_ch=4)
     p3 = torch.randn(1, 4, 3, 3)
     batch_ids = torch.tensor([0])
     flat_indices = torch.tensor([4])
-    correction = torch.ones(1, 4)
+    correction = torch.ones(1, 4, requires_grad=True)
     valid = torch.ones(1, dtype=torch.bool)
 
-    corrected, delta = module(
-        p3, batch_ids, flat_indices, correction, torch.ones(1, 1), valid
-    )
-    assert torch.equal(corrected, p3)
-    assert delta.shape == (1, 4)
-    assert torch.count_nonzero(delta) == 0
-
     with torch.no_grad():
-        module.out.weight.copy_(torch.eye(4))
-        module.out.bias.zero_()
-    corrected, delta = module(
-        p3, batch_ids, flat_indices, correction, torch.ones(1, 1), valid
-    )
+        module.out.weight.copy_(2.0 * torch.eye(4))
+        module.out.bias.fill_(0.5)
+    corrected, delta = module(p3, batch_ids, flat_indices, correction, valid)
     nonquery = torch.ones(3, 3, dtype=torch.bool)
     nonquery[1, 1] = False
     assert torch.equal(corrected[0, :, nonquery], p3[0, :, nonquery])
-    assert delta.shape == (1, 4)
-    torch.testing.assert_close(delta[0], torch.ones(4))
+    torch.testing.assert_close(delta[0], torch.full((4,), 2.5))
+    torch.testing.assert_close(corrected[0, :, 1, 1], p3[0, :, 1, 1] + 2.5)
+
+    delta.sum().backward()
+    torch.testing.assert_close(correction.grad, torch.full_like(correction, 2.0))
+    assert module.out.weight.grad is not None
+    assert module.out.bias.grad is not None

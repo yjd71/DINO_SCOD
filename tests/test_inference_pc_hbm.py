@@ -1,217 +1,248 @@
-from __future__ import annotations
-
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
+import torch.nn as nn
 
-import inference as inference_module
+import inference
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
 
 
-def test_inference_applies_sigmoid_once_and_forwards_memory(monkeypatch, tmp_path):
-    sample = (
-        None,
-        np.zeros((1, 2, 3), dtype=np.uint8),
-        "sample.png",
-        torch.zeros(3, 4, 4),
-        None,
+class FakeDataset:
+    def __init__(self, **kwargs):
+        self.samples = [
+            (
+                torch.zeros(3, 8, 8),
+                torch.zeros(1, 5, 7),
+                "sample.png",
+                torch.zeros(3, 8, 8),
+            )
+        ]
+
+    def __len__(self):
+        return len(self.samples)
+
+    def __getitem__(self, index):
+        return self.samples[index]
+
+
+class FakeModel:
+    def __init__(self):
+        self.calls = []
+
+    def eval(self):
+        return self
+
+    def inference(self, image, memory=None, epoch=None, disable_pc=False):
+        self.calls.append((memory, epoch, disable_pc))
+        return torch.zeros(image.shape[0], 1, 8, 8)
+
+
+def _cfg():
+    return SimpleNamespace(
+        device="cpu",
+        test_size=8,
+        test_CAMO_imgs="images",
+        test_CAMO_masks="masks",
     )
-    monkeypatch.setattr(inference_module, "TestDataset", lambda **_: [sample])
-    monkeypatch.setattr(inference_module, "tqdm", lambda iterable: iterable)
-    captured = {}
 
-    def fake_imwrite(path, prediction):
-        captured["path"] = path
-        captured["prediction"] = prediction.copy()
-        return True
 
-    monkeypatch.setattr(inference_module.cv2, "imwrite", fake_imwrite)
-    sentinel_memory = object()
-
-    class FakeModel:
-        def eval(self):
-            return self
-
-        def inference(self, image, memory=None, epoch=None):
-            captured["memory"] = memory
-            captured["epoch"] = epoch
-            return torch.zeros(image.shape[0], 1, 1, 1)
-
-    cfg = SimpleNamespace(
-        device=torch.device("cpu"),
-        CUDA=False,
-        test_size=392,
-        test_CAMO_imgs="unused-images",
-        test_CAMO_masks="unused-masks",
+def test_inference_with_memory_forwards_strict_pc_mode(monkeypatch, tmp_path):
+    monkeypatch.setattr(inference, "TestDataset", FakeDataset)
+    saved = []
+    monkeypatch.setattr(
+        inference.cv2,
+        "imwrite",
+        lambda path, value: saved.append((path, value.copy())) or True,
     )
-    inference_module.inference(
+    model = FakeModel()
+    memory = object()
+    inference.inference(
         ["CAMO"],
-        FakeModel(),
-        cfg,
+        model,
+        _cfg(),
         str(tmp_path),
-        memory=sentinel_memory,
-        epoch=30,
-    )
-    assert captured["memory"] is sentinel_memory
-    assert captured["epoch"] == 30
-    assert captured["prediction"].shape == (2, 3)
-    # sigmoid(0) * 255 is 127.5 and the existing uint8 conversion truncates it.
-    assert np.all(captured["prediction"] == 127)
-
-
-def test_batched_inference_matches_batch_one_and_restores_variable_sizes(
-    monkeypatch,
-    tmp_path,
-):
-    samples = [
-        (
-            None,
-            np.zeros((1, height, width), dtype=np.uint8),
-            f"sample-{index}.png",
-            torch.full((3, 4, 4), fill_value=logit),
-            None,
-        )
-        for index, (height, width, logit) in enumerate(
-            [(2, 3, -1.0), (4, 2, 0.0), (1, 5, 1.0)]
-        )
-    ]
-    monkeypatch.setattr(inference_module, "TestDataset", lambda **_: samples)
-    monkeypatch.setattr(inference_module, "tqdm", lambda iterable: iterable)
-    predictions = {}
-
-    def fake_imwrite(path, prediction):
-        predictions[path] = prediction.copy()
-        return True
-
-    monkeypatch.setattr(inference_module.cv2, "imwrite", fake_imwrite)
-
-    class FakeModel:
-        def __init__(self):
-            self.batch_sizes = []
-
-        def eval(self):
-            return self
-
-        def inference(self, image, memory=None, epoch=None):
-            self.batch_sizes.append(image.shape[0])
-            return image.mean(dim=(1, 2, 3), keepdim=True)
-
-    cfg = SimpleNamespace(
-        device=torch.device("cpu"),
-        CUDA=False,
-        test_size=392,
-        test_CAMO_imgs="unused-images",
-        test_CAMO_masks="unused-masks",
-    )
-    batched_model = FakeModel()
-    batched_root = tmp_path / "batched"
-    inference_module.inference(
-        ["CAMO"],
-        batched_model,
-        cfg,
-        str(batched_root),
-        batch_size=2,
-        num_workers=0,
-        amp=True,
-    )
-    assert batched_model.batch_sizes == [2, 1]
-
-    single_model = FakeModel()
-    single_root = tmp_path / "single"
-    inference_module.inference(
-        ["CAMO"],
-        single_model,
-        cfg,
-        str(single_root),
+        memory=memory,
+        epoch=12,
         batch_size=1,
-        num_workers=0,
     )
-    assert single_model.batch_sizes == [1, 1, 1]
+    assert model.calls == [(memory, 12, False)]
+    assert saved[0][1].dtype == np.uint8
+    assert np.all(saved[0][1] == 127)
 
-    for sample, (height, width, _) in zip(
-        samples,
-        [(2, 3, -1.0), (4, 2, 0.0), (1, 5, 1.0)],
-    ):
-        name = sample[2]
-        batched = predictions[str(batched_root / "CAMO" / name)]
-        single = predictions[str(single_root / "CAMO" / name)]
-        assert batched.shape == (height, width)
-        np.testing.assert_array_equal(batched, single)
+def test_missing_memory_automatically_uses_pc_off_mode(monkeypatch, tmp_path):
+    monkeypatch.setattr(inference, "TestDataset", FakeDataset)
+    monkeypatch.setattr(inference.cv2, "imwrite", lambda path, value: True)
+    model = FakeModel()
+    inference.inference(
+        ["CAMO"],
+        model,
+        _cfg(),
+        str(tmp_path),
+        memory=None,
+    )
+    assert model.calls[-1] == (None, 30, True)
 
 
-def test_supplied_incompatible_memory_is_rejected(monkeypatch):
-    def reject(*args, **kwargs):
-        raise RuntimeError("compat_mismatch:schema_version")
+def test_inference_cli_contract_rejects_ambiguous_memory_modes():
+    assert inference.validate_inference_args(
+        SimpleNamespace(disable_pc=False, memory_checkpoint=None)
+    ) is True
+    assert inference.validate_inference_args(
+        SimpleNamespace(disable_pc=False, memory_checkpoint="memory.pth")
+    ) is False
+    assert inference.validate_inference_args(
+        SimpleNamespace(disable_pc=True, memory_checkpoint=None)
+    ) is True
+    with pytest.raises(ValueError, match="cannot be combined"):
+        inference.validate_inference_args(
+            SimpleNamespace(disable_pc=True, memory_checkpoint="memory.pth")
+        )
+    with pytest.raises(ValueError, match="requires --memory-checkpoint"):
+        inference.validate_inference_args(
+            SimpleNamespace(
+                disable_pc=False,
+                memory_checkpoint=None,
+                allow_memory_mismatch=True,
+            )
+        )
+    assert inference.validate_inference_args(
+        SimpleNamespace(
+            disable_pc=False,
+            memory_checkpoint="memory.pth",
+            allow_memory_mismatch=True,
+        )
+    ) is False
 
-    monkeypatch.setattr(inference_module, "load_memory_checkpoint", reject)
-    with pytest.raises(RuntimeError, match="schema_version"):
-        inference_module.load_inference_memory(
-            "incompatible-memory.pth",
-            DinoPCHBMConfig(),
-            torch.nn.Linear(1, 1),
+
+def test_artifact_mismatch_opt_in_only_relaxes_exact_student_fingerprint(
+    monkeypatch,
+):
+    decoder_meta = {
+        "training_design": "student_joint",
+        "artifact_role": "ts_student",
+        "labeled_split_fingerprint": "same-split",
+        "baseline_fingerprint": "decoder-fingerprint",
+        "pc_frozen": False,
+    }
+    memory_meta = {
+        "training_design": "student_joint",
+        "artifact_role": "ts_student_memory",
+        "labeled_split_fingerprint": "same-split",
+        "baseline_fingerprint": "memory-fingerprint",
+        "pc_frozen": False,
+    }
+
+    def validate(path, expected):
+        actual = decoder_meta if path == "decoder.pth" else memory_meta
+        for key, value in expected.items():
+            if actual.get(key) != value:
+                raise RuntimeError(f"Artifact metadata mismatch for {key}")
+        return dict(actual)
+
+    monkeypatch.setattr(inference, "validate_artifact_metadata", validate)
+    with pytest.raises(RuntimeError, match="baseline_fingerprint"):
+        inference.validate_inference_artifacts(
+            "decoder.pth", "memory.pth"
+        )
+
+    inference.validate_inference_artifacts(
+        "decoder.pth",
+        "memory.pth",
+        allow_memory_mismatch=True,
+    )
+
+    memory_meta["labeled_split_fingerprint"] = "different-split"
+    with pytest.raises(RuntimeError, match="labeled_split_fingerprint"):
+        inference.validate_inference_artifacts(
+            "decoder.pth",
+            "memory.pth",
+            allow_memory_mismatch=True,
         )
 
 
-def test_missing_memory_warns_and_legacy_checkpoint_alias(monkeypatch):
-    with pytest.warns(RuntimeWarning, match="z_main"):
-        assert inference_module.load_inference_memory(None) is None
-    monkeypatch.setattr(
-        "sys.argv",
-        ["inference.py", "--checkpoint", "legacy.pth", "--datasets", "CAMO"],
-    )
-    args = inference_module.parse_args()
-    assert args.decoder_checkpoint == "legacy.pth"
-    assert args.memory_checkpoint is None
-    assert args.datasets == ["CAMO"]
-    assert args.batch_size == 16
-    assert args.num_workers == 4
-    assert args.amp is False
-
-
-def test_supplied_memory_always_requires_exact_loaded_producer(monkeypatch):
+def test_memory_loader_requires_exact_student_producer(monkeypatch):
+    cfg = DinoPCHBMConfig()
+    producer = nn.Linear(2, 2)
     captured = {}
 
-    def load(_path, _memory, *, expected_compat, require_producer_match):
-        captured["expected_compat"] = expected_compat
-        captured["require_producer_match"] = require_producer_match
+    def load(path, memory, *, expected_compat, require_producer_match):
+        captured.update(expected_compat)
+        captured["required"] = require_producer_match
 
-    monkeypatch.setattr(inference_module, "load_memory_checkpoint", load)
+    monkeypatch.setattr(inference, "load_memory_checkpoint", load)
+    memory = inference.load_inference_memory(
+        "memory.pth", pc_cfg=cfg, producer=producer
+    )
+    assert memory is not None
+    assert captured["producer_role"] == "labeled_student"
+    assert captured["required"] is True
+
+    captured.clear()
+    memory = inference.load_inference_memory(
+        "memory.pth",
+        pc_cfg=cfg,
+        producer=producer,
+        allow_memory_mismatch=True,
+    )
+    assert memory is not None
+    assert captured["producer_role"] == "labeled_student"
+    assert captured["required"] is False
+
+
+def test_memory_mismatch_opt_in_preserves_structural_validation():
     cfg = DinoPCHBMConfig()
-    producer = torch.nn.Linear(2, 2)
-    inference_module.load_inference_memory("memory.pth", cfg, producer)
-    assert captured["require_producer_match"] is True
-    assert (
-        captured["expected_compat"]["producer_fingerprint"]
-        == inference_module.module_fingerprint(producer)
+    producer = nn.Linear(2, 2)
+    compat_meta = cfg.expected_memory_meta(
+        producer_fingerprint="a" * 64
     )
+    memory_dim = int(compat_meta["memory_dim"])
+    state = {
+        "format_version": 2,
+        "schema_version": 2,
+        "compat_meta": compat_meta,
+        "memory_dim": memory_dim,
+        "storage_dtype": compat_meta["storage_dtype"],
+        "route": {
+            "global_keys": torch.randn(1, memory_dim).half(),
+            "environment_keys": torch.randn(1, memory_dim).half(),
+            "img_ids": ["sample"],
+        },
+        "pairs": {
+            "p3_keys": torch.randn(2, memory_dim).half(),
+            "p2_keys": torch.randn(2, memory_dim).half(),
+            "region_ids": torch.tensor([0, 1]),
+            "pair_meta": [
+                {"image_id": "sample", "region_id": 0},
+                {"image_id": "sample", "region_id": 1},
+            ],
+        },
+        "finalized": True,
+    }
 
-    with pytest.raises(TypeError, match="Decoder"):
-        inference_module.load_inference_memory("memory.pth", cfg)
+    with pytest.raises(RuntimeError, match="compatibility validation failed"):
+        inference.load_inference_memory(
+            state,
+            pc_cfg=cfg,
+            producer=producer,
+        )
 
-
-def test_inference_cli_accepts_throughput_options(monkeypatch):
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "inference.py",
-            "--batch-size",
-            "7",
-            "--num-workers",
-            "0",
-            "--amp",
-        ],
+    memory = inference.load_inference_memory(
+        state,
+        pc_cfg=cfg,
+        producer=producer,
+        allow_memory_mismatch=True,
     )
-    args = inference_module.parse_args()
-    assert args.batch_size == 7
-    assert args.num_workers == 0
-    assert args.amp is True
+    assert memory.is_ready()
 
-    monkeypatch.setattr("sys.argv", ["inference.py", "--batch-size", "0"])
-    with pytest.raises(SystemExit):
-        inference_module.parse_args()
-
-    monkeypatch.setattr("sys.argv", ["inference.py", "--num-workers", "-1"])
-    with pytest.raises(SystemExit):
-        inference_module.parse_args()
+    incompatible_state = dict(state)
+    incompatible_state["compat_meta"] = dict(compat_meta)
+    incompatible_state["compat_meta"]["producer_role"] = "teacher"
+    with pytest.raises((ValueError, RuntimeError), match="producer_role"):
+        inference.load_inference_memory(
+            incompatible_state,
+            pc_cfg=cfg,
+            producer=producer,
+            allow_memory_mismatch=True,
+        )

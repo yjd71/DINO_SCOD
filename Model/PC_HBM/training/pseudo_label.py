@@ -68,25 +68,22 @@ def build_pc_confidence(
 def prepare_pseudo_targets(
     teacher_aux: Mapping[str, Any],
 ) -> dict[str, torch.Tensor]:
-    """Clone only the soft mask, confidence, and corrected P3 target."""
+    """Materialize backward-safe detached targets from the inference Teacher."""
 
-    probability = teacher_aux.get("p_final")
-    if not torch.is_tensor(probability):
-        raise KeyError("Teacher aux['p_final'] is required")
-    confidence = build_pc_confidence(teacher_aux)
-    distill = teacher_aux.get("distill_features")
-    corrected_p3 = (
-        distill.get("p3_corr") if isinstance(distill, Mapping) else None
-    )
-    if not torch.is_tensor(corrected_p3):
-        raise KeyError(
-            "Teacher distill_features['p3_corr'] is required"
-        )
-    return {
-        "p_soft": probability.detach().clone(),
-        "confidence": confidence.detach().clone(),
-        "p3_corr": corrected_p3.detach().clone(),
-    }
+    # ``detach().clone()`` executed inside an outer inference_mode still creates
+    # inference tensors, which autograd cannot save while differentiating the
+    # Student loss.  Explicitly leave inference mode at this boundary and keep
+    # graph construction disabled so both returned tensors are ordinary,
+    # immutable training targets.
+    with torch.inference_mode(False), torch.no_grad():
+        probability = teacher_aux.get("p_final")
+        if not torch.is_tensor(probability):
+            raise KeyError("Teacher aux['p_final'] is required")
+        confidence = build_pc_confidence(teacher_aux)
+        return {
+            "p_soft": probability.detach().clone(),
+            "confidence": confidence.detach().clone(),
+        }
 
 
 def weighted_structure_loss(
@@ -161,19 +158,19 @@ def pc_unlabeled_loss(
     pseudo: torch.Tensor,
     confidence: torch.Tensor,
     config: Any,
-    *,
-    teacher_features: Mapping[str, Any],
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-    """Train the raw Student with soft masks and corrected P3 only."""
+    """Train the PC-corrected Student using confidence-weighted soft masks."""
 
     if not isinstance(outputs, (tuple, list)) or len(outputs) != 5:
         raise ValueError(
             "Student outputs must be (m4, m3, m2, z_main, global_logit)"
         )
-    if not isinstance(aux, Mapping) or aux.get("forward_mode") != "off":
-        raise RuntimeError("Teacher-only TS requires the Student in off mode")
-    if aux.get("pc_active") is not False:
-        raise RuntimeError("Raw Student must not activate PC-HBM-Lite")
+    if not isinstance(aux, Mapping) or aux.get("forward_mode") != "full":
+        raise RuntimeError("Student-joint TS requires full mode")
+    if aux.get("pc_active") is not True:
+        raise RuntimeError("Unlabeled Student must activate PC-HBM-Lite")
+    if aux.get("pc_engine_source") != "external_readonly":
+        raise RuntimeError("Unlabeled Student must use the readonly external PC-HBM")
     z_main = aux.get("z_main")
     if not torch.is_tensor(z_main):
         raise KeyError("Student aux['z_main'] is required")
@@ -192,28 +189,16 @@ def pc_unlabeled_loss(
         + 0.10 * weighted_structure_loss(m4, pseudo, confidence)
         + 0.10 * weighted_structure_loss(global_logit, pseudo, confidence)
     )
-    if not isinstance(teacher_features, Mapping):
-        raise TypeError("teacher_features must be a mapping")
-    student_features = aux.get("features")
-    if not isinstance(student_features, Mapping):
-        raise KeyError("Student aux['features'] is required")
-    student_p3 = student_features.get("p3")
-    teacher_p3 = teacher_features.get("p3_corr")
-    if not torch.is_tensor(student_p3) or not torch.is_tensor(teacher_p3):
-        raise KeyError("Student p3 and Teacher p3_corr are required")
-    feature = confidence_weighted_feature_cosine_loss(
-        student_p3, teacher_p3, confidence
-    )
-
     unlabeled_weight = float(getattr(config, "lambda_u", 1.0))
     if unlabeled_weight < 0.0:
         raise ValueError("lambda_u must be non-negative")
-    total = unlabeled_weight * (main + side + feature)
+    pseudo_loss = main + side
+    total = unlabeled_weight * pseudo_loss
     positive = confidence.detach() > 0
     metrics = {
         "L_u_main": main.detach(),
         "L_u_side": side.detach(),
-        "L_u_feat_p3": feature.detach(),
+        "L_u_pseudo": pseudo_loss.detach(),
         "L_u_total": total.detach(),
         "pseudo_conf_mean": confidence.detach().float().mean(),
         "pseudo_coverage": positive.float().mean(),

@@ -69,6 +69,9 @@ def build_memory_compat_meta(
             ),
             "storage_dtype": str(getattr(config, "memory_storage_dtype", "float16")),
             "source": str(getattr(config, "memory_source", "labeled_only")),
+            "producer_role": str(
+                getattr(config, "memory_producer_role", "labeled_student")
+            ),
             "route_environment_min_mass": float(
                 getattr(config, "route_environment_min_mass", 1.0e-3)
             ),
@@ -94,6 +97,8 @@ def build_memory_compat_meta(
         meta["producer_fingerprint"] = fingerprint
     if meta.get("source") != "labeled_only":
         raise ValueError("PC-HBM memory compatibility source must be labeled_only")
+    if meta.get("producer_role") != "labeled_student":
+        raise ValueError("PC-HBM memory producer_role must be labeled_student")
     if meta.get("architecture") != "DINO_SCOD_PC_HBM_LITE":
         raise ValueError(
             "PC-HBM-Lite compatibility requires architecture "
@@ -176,43 +181,59 @@ def rebuild_memory(
             raise ValueError("Memory rebuild only accepts labeled_only configuration")
         if bool(getattr(config, "use_unlabeled_memory_update", False)):
             raise ValueError("Unlabeled pseudo labels cannot update PC-HBM memory")
+        if str(getattr(config, "memory_producer_role", "labeled_student")) != "labeled_student":
+            raise ValueError("Memory rebuild requires producer_role=labeled_student")
 
+    decoder_was_training = decoder.training
     memory.clear()
     decoder.eval()
     seen_ids: set[str] = set()
-    for batch in memory_loader:
-        image_ids, images, gts = unpack_memory_batch(batch)
-        duplicate = seen_ids.intersection(image_ids)
-        if duplicate:
-            raise ValueError(f"Memory loader repeated stable image ids: {sorted(duplicate)[:5]}")
-        seen_ids.update(image_ids)
-        images = images.to(device=device, non_blocking=True)
-        gts = gts.to(device=device, non_blocking=True)
-        amp_enabled = bool(use_amp and device.type == "cuda")
-        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-            features = feature_model.extract_features(images)
-            memory_features = decoder.forward_memory_features(features)
-            entries = entry_builder(
-                features=memory_features,
-                gt=gts,
-                image_ids=image_ids,
-            )
-        if not isinstance(entries, Mapping):
-            raise TypeError("build_memory_entries must return a mapping")
-        memory.append(entries)
+    try:
+        for batch in memory_loader:
+            image_ids, images, gts = unpack_memory_batch(batch)
+            duplicate = seen_ids.intersection(image_ids)
+            if duplicate:
+                raise ValueError(
+                    f"Memory loader repeated stable image ids: {sorted(duplicate)[:5]}"
+                )
+            seen_ids.update(image_ids)
+            images = images.to(device=device, non_blocking=True)
+            gts = gts.to(device=device, non_blocking=True)
+            amp_enabled = bool(use_amp and device.type == "cuda")
+            with torch.autocast(
+                device_type=device.type,
+                dtype=torch.float16,
+                enabled=amp_enabled,
+            ):
+                features = feature_model.extract_features(images)
+                memory_features = decoder.forward_memory_features(features)
+                entries = entry_builder(
+                    features=memory_features,
+                    gt=gts,
+                    image_ids=image_ids,
+                )
+            if not isinstance(entries, Mapping):
+                raise TypeError("build_memory_entries must return a mapping")
+            if str(entries.get("source", "labeled_only")) != "labeled_only":
+                raise ValueError("Memory entries must be sourced from labeled data")
+            memory.append(entries)
 
-    if not seen_ids:
-        raise RuntimeError("Cannot finalize an empty PC-HBM labeled memory")
-    if compat_meta is None and config is not None:
-        compat_meta = build_memory_compat_meta(config, decoder)
-    memory.finalize(
-        device=torch.device("cpu"),
-        dtype=memory.storage_dtype,
-        compat_meta=dict(compat_meta or {}),
-    )
-    if not memory.is_ready():
-        raise RuntimeError("PC-HBM memory did not become ready after finalize")
-    return memory
+        if not seen_ids:
+            raise RuntimeError("Cannot finalize an empty PC-HBM labeled memory")
+        if compat_meta is None and config is not None:
+            compat_meta = build_memory_compat_meta(config, decoder)
+        if dict(compat_meta or {}).get("producer_role") != "labeled_student":
+            raise ValueError("Memory compat metadata must identify labeled_student")
+        memory.finalize(
+            device=torch.device("cpu"),
+            dtype=memory.storage_dtype,
+            compat_meta=dict(compat_meta or {}),
+        )
+        if not memory.is_ready():
+            raise RuntimeError("PC-HBM memory did not become ready after finalize")
+        return memory
+    finally:
+        decoder.train(decoder_was_training)
 
 
 def _validate_memory_loader(memory_loader) -> None:

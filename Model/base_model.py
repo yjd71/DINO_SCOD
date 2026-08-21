@@ -96,17 +96,14 @@ class BaseModel(nn.Module):
             query_image_ids=query_image_ids,
         )
     
-    def inference(self, x, memory=None, epoch=None):
+    def inference(self, x, memory=None, epoch=None, disable_pc=False):
         x_features = self.extract_features(x)
+        if disable_pc:
+            return self.decoder(features=x_features, pc_mode='off')[3]
         if self.decoder.pc_hbm is None:
-            return self.decoder(features=x_features, pc_mode='off')[3]
+            raise RuntimeError('Formal inference requires a Decoder with PC-HBM attached.')
         if memory is None:
-            warnings.warn(
-                'PC-HBM memory is missing; using z_main logits.',
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return self.decoder(features=x_features, pc_mode='off')[3]
+            raise RuntimeError('Formal inference requires finalized PC-HBM memory.')
         _, aux = self.decoder(
             features=x_features,
             memory=memory,
@@ -114,15 +111,9 @@ class BaseModel(nn.Module):
             epoch=epoch,
             return_aux=True,
         )
-        if not aux['pc_active']:
-            warnings.warn(
-                f'PC-HBM inference fallback: {aux.get("fallback_reason")}; '
-                'using z_main logits.',
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            return aux['z_main']
-        return aux['z_final'] if aux['z_final'] is not None else aux['z_main']
+        if not aux['pc_active'] or aux.get('pc_engine_source') != 'internal_trainable':
+            raise RuntimeError('Formal inference did not execute the internal PC-HBM path.')
+        return aux['z_final']
     
     def save_decoder_checkpoint(self, path):
         assert path.endswith('.pth'), f'Path should end with .pth, but got: {path}'

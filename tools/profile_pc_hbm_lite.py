@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from copy import deepcopy
 import json
 import math
 import random
@@ -23,7 +24,7 @@ from configs.base_model_config import Config
 from configs.pc_hbm_dino_config import DinoPCHBMConfig
 from Model.PC_HBM.memory import PCMemory
 from Model.PC_HBM.training import (
-    base_structure_loss,
+    ts_labeled_pc_loss,
     pc_unlabeled_loss,
     prepare_pseudo_targets,
 )
@@ -279,16 +280,10 @@ def main() -> None:
     student = Decoder(
         in_dim=pc_cfg.encoder_dim,
         out_dim=pc_cfg.decoder_dim,
-        pc_cfg=None,
+        pc_cfg=pc_cfg,
     ).to(device).train()
-    student.load_state_dict(
-        {
-            name: value
-            for name, value in decoder.state_dict().items()
-            if not name.startswith("pc_hbm.")
-        },
-        strict=True,
-    )
+    student.load_state_dict(decoder.state_dict(), strict=True)
+    readonly_pc = deepcopy(student.pc_hbm).requires_grad_(False).eval()
     optimizer = torch.optim.Adam(student.parameters(), lr=1.0e-4)
     labeled_gt = torch.rand(
         32,
@@ -312,14 +307,22 @@ def main() -> None:
             )
         pseudo = prepare_pseudo_targets(teacher_aux)
         with torch.autocast("cuda", dtype=torch.float16):
-            labeled_outputs, _ = student(
-                features32, pc_mode="off", return_aux=True
+            labeled_outputs, labeled_aux = student(
+                features32,
+                memory=memory,
+                pc_mode="full",
+                return_aux=True,
+                query_image_ids=[f"labeled-{index}" for index in range(32)],
             )
-            labeled_loss = base_structure_loss(
-                labeled_outputs, labeled_gt
+            labeled_loss, _ = ts_labeled_pc_loss(
+                labeled_outputs, labeled_aux, labeled_gt, pc_cfg
             )
             unlabeled_outputs, student_aux = student(
-                features32, pc_mode="off", return_aux=True
+                features32,
+                memory=memory,
+                pc_mode="full",
+                return_aux=True,
+                pc_engine_override=readonly_pc,
             )
             unlabeled_loss, _ = pc_unlabeled_loss(
                 unlabeled_outputs,
@@ -327,11 +330,11 @@ def main() -> None:
                 pseudo["p_soft"],
                 pseudo["confidence"],
                 pc_cfg,
-                teacher_features={"p3_corr": pseudo["p3_corr"]},
             )
             loss = labeled_loss + unlabeled_loss
         loss.backward()
         optimizer.step()
+        readonly_pc.load_state_dict(student.pc_hbm.state_dict(), strict=True)
         with torch.no_grad():
             update_ema_module(
                 student,

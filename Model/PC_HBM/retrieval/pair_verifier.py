@@ -350,7 +350,7 @@ class PairVerifier(nn.Module):
         gate = torch.where(
             query_valid[:, None], gate, torch.zeros_like(gate)
         )
-        correction = memory_context - q3.float()
+        correction = memory_context
         correction = torch.where(
             query_valid[:, None],
             correction,

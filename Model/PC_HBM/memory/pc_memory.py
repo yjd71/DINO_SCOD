@@ -147,7 +147,11 @@ class PCMemory:
             raise TypeError("memory entries must be a mapping or sequence of mappings")
         if str(entries.get("source", "labeled_only")) != "labeled_only":
             raise ValueError("PC-HBM-Lite memory accepts labeled data only")
-        unknown = set(entries).difference({"source", "route", "pairs", "compat_meta"})
+        if str(entries.get("producer_role", "labeled_student")) != "labeled_student":
+            raise ValueError("PC-HBM-Lite memory accepts labeled_student producer only")
+        unknown = set(entries).difference(
+            {"source", "producer_role", "route", "pairs", "compat_meta"}
+        )
         if unknown:
             raise ValueError(f"Unknown memory entry groups: {sorted(unknown)}")
 
@@ -785,6 +789,7 @@ def _default_compat_meta(
         "region_names": _REGION_NAMES,
         "storage_dtype": str(storage_dtype),
         "source": "labeled_only",
+        "producer_role": "labeled_student",
         "route_environment_min_mass": 1.0e-3,
         "fg_boundary_kernel": 3,
         "bg_near_kernel": 7,
@@ -881,7 +886,10 @@ def _cat_long(items: Sequence[torch.Tensor]) -> torch.Tensor:
 def _validate_meta(actual: Mapping[str, Any], expected: Mapping[str, Any]) -> None:
     if not isinstance(actual, Mapping):
         raise TypeError("Incompatible PC-HBM memory: compat_meta_not_mapping")
-    allowed = set(_REQUIRED_META_KEYS) | {"producer_fingerprint"}
+    allowed = set(_REQUIRED_META_KEYS) | {
+        "producer_fingerprint",
+        "producer_role",
+    }
     unknown = set(actual).difference(allowed)
     if unknown:
         raise ValueError(

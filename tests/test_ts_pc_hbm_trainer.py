@@ -1,254 +1,171 @@
-from __future__ import annotations
-
-from types import SimpleNamespace
+from copy import deepcopy
 
 import pytest
 import torch
 import torch.nn as nn
 
-from configs.pc_hbm_dino_config import DinoPCHBMConfig
-from Model.PC_HBM.training.ema import update_ema_module
+import train_ts_model_pseudo_pc_hbm
 from Model.ts_model import TSModel
-import train_ts_model_pseudo_pc_hbm as ts_entrypoint
-from utils.checkpoint_pc_hbm import (
-    CANONICAL_LABELED_SPLIT_FINGERPRINT,
-    LabeledSplitIdentity,
-    build_artifact_metadata,
-)
-from utils.pc_memory_runner import module_fingerprint
-from utils.trainer_ts_model_pseudo_pc_hbm import (
-    PCHBMPseudoTrainer,
-    validate_teacher_enhancer_checkpoint,
-)
 
 
-def _teacher_aux():
-    p3 = torch.randn(1, 4, 2, 2)
-    return {
-        "p_final": torch.rand(1, 1, 4, 4),
-        "pc_hbm": {
-            "query_mask_map": torch.ones(1, 1, 2, 2),
-            "memory_confidence_map": torch.rand(1, 1, 2, 2),
-        },
-        "distill_features": {"p3_corr": p3},
-    }
-
-
-def test_teacher_targets_clone_only_lite_contract():
-    source = _teacher_aux()
-    cloned = PCHBMPseudoTrainer._clone_teacher_target_aux(source)
-    assert set(cloned["pc_hbm"]) == {
-        "query_mask_map",
-        "memory_confidence_map",
-    }
-    assert set(cloned["distill_features"]) == {"p3_corr"}
-    source["p_final"].zero_()
-    assert not torch.equal(source["p_final"], cloned["p_final"])
-
-
-def test_teacher_pc_fingerprint_is_immutable():
-    trainer = PCHBMPseudoTrainer.__new__(PCHBMPseudoTrainer)
-    trainer.core_model = SimpleNamespace(
-        teacher=SimpleNamespace(pc_hbm=nn.Linear(2, 2))
-    )
-    trainer._teacher_pc_fingerprint = module_fingerprint(
-        trainer.core_model.teacher.pc_hbm
-    )
-    trainer._validate_teacher_pc_contract()
-    with torch.no_grad():
-        trainer.core_model.teacher.pc_hbm.weight.add_(1)
-    with pytest.raises(RuntimeError, match="changed"):
-        trainer._validate_teacher_pc_contract()
-
-
-def test_ema_updates_shared_legacy_names_but_not_teacher_pc():
-    student = nn.Module()
-    student.legacy = nn.Linear(2, 2)
-    teacher = nn.Module()
-    teacher.legacy = nn.Linear(2, 2)
-    teacher.pc_hbm = nn.Linear(2, 2)
-    pc_before = {
-        name: value.clone() for name, value in teacher.pc_hbm.state_dict().items()
-    }
-    update_ema_module(
-        student,
-        teacher,
-        momentum=0.0,
-        shared_only=True,
-        exclude_prefixes=("pc_hbm.",),
-    )
-    for name, value in student.legacy.state_dict().items():
-        assert torch.equal(value, teacher.legacy.state_dict()[name])
-    for name, value in pc_before.items():
-        assert torch.equal(value, teacher.pc_hbm.state_dict()[name])
-
-
-def test_teacher_checkpoint_validation_accepts_only_frozen_v2_identity():
-    metadata = build_artifact_metadata(
-        training_design="two_stage",
-        artifact_role="teacher_enhancer",
-        labeled_split_fingerprint=CANONICAL_LABELED_SPLIT_FINGERPRINT,
-        baseline_fingerprint="base",
-        pc_frozen=True,
-    )
-    payload = {"artifact_meta": metadata}
-    assert validate_teacher_enhancer_checkpoint(
-        payload, CANONICAL_LABELED_SPLIT_FINGERPRINT
-    ) == metadata
-    bad = {"artifact_meta": {**metadata, "pc_frozen": False}}
-    with pytest.raises(RuntimeError):
-        validate_teacher_enhancer_checkpoint(
-            bad, CANONICAL_LABELED_SPLIT_FINGERPRINT
-        )
-
-
-class RecordingStudent(nn.Module):
+class TinyPC(nn.Module):
     def __init__(self):
         super().__init__()
-        self.mode = None
+        self.weight = nn.Parameter(torch.eye(2))
 
-    def forward(self, features, **kwargs):
-        self.mode = kwargs["pc_mode"]
-        return ("outputs", {"forward_mode": self.mode})
+    def forward(self, value):
+        return value @ self.weight
 
 
-def test_ts_student_paths_are_always_off():
+class TinyDecoder(nn.Module):
+    def __init__(self, with_pc):
+        super().__init__()
+        self.backbone = nn.Linear(2, 2, bias=False)
+        self.pc_hbm = TinyPC() if with_pc else None
+
+    def forward(
+        self,
+        features,
+        *,
+        memory=None,
+        pc_mode="off",
+        return_aux=False,
+        pc_engine_override=None,
+        **kwargs,
+    ):
+        value = self.backbone(features)
+        engine = pc_engine_override if pc_engine_override is not None else self.pc_hbm
+        if pc_mode != "off":
+            if engine is None or memory is None:
+                raise RuntimeError("active PC path requires engine and memory")
+            value = value + engine(value)
+        source = None
+        if pc_mode != "off":
+            source = (
+                "external_readonly"
+                if pc_engine_override is not None
+                else "internal_trainable"
+            )
+        outputs = (value, value, value, value, value)
+        aux = {
+            "z_main": value,
+            "z_final": value,
+            "p_final": value.sigmoid(),
+            "pc_active": pc_mode != "off",
+            "forward_mode": pc_mode,
+            "pc_engine_source": source,
+        }
+        return (outputs, aux) if return_aux else outputs
+
+
+def make_model():
     model = TSModel.__new__(TSModel)
     nn.Module.__init__(model)
-    model.student = RecordingStudent()
-    model.student_labeled([torch.empty(0)])
-    assert model.student.mode == "off"
-    model.student_unlabeled([torch.empty(0)])
-    assert model.student.mode == "off"
+    model.training_design = "student_joint"
+    model.student = TinyDecoder(with_pc=True)
+    model.teacher = TinyDecoder(with_pc=False)
+    model._initialize_teacher_from_student()
+    model.teacher.requires_grad_(False).eval()
+    model.pc_hbm_readonly = deepcopy(model.student.pc_hbm)
+    model.pc_hbm_readonly.requires_grad_(False).eval()
+    model.sync_readonly_pc()
+    return model
 
 
-def test_ts_forward_has_no_combined_legacy_branch():
-    model = TSModel.__new__(TSModel)
-    nn.Module.__init__(model)
-    with pytest.raises(TypeError):
-        model(torch.empty(0), torch.empty(0))
+def _pc_grad(model):
+    return model.student.pc_hbm.weight.grad
 
 
-def test_ts_trainer_does_not_remap_teacher_artifact_schedule():
-    pc_cfg = DinoPCHBMConfig(
-        verify_start_epoch=4,
-        full_pc_start_epoch=9,
-        teacher_only_full_start_epoch=5,
+def test_student_joint_modes_and_teacher_use_readonly_pc():
+    model = make_model()
+    features_l = torch.randn(3, 2)
+    features_u = torch.randn(3, 2)
+    joint = model(
+        branch="student_joint",
+        labeled_features=features_l,
+        unlabeled_features=features_u,
+        memory=object(),
+        epoch=1,
+        labeled_image_ids=["a", "b", "c"],
     )
-    expected = dict(vars(pc_cfg))
+    assert joint["labeled"][1]["pc_engine_source"] == "internal_trainable"
+    assert joint["unlabeled"][1]["pc_engine_source"] == "external_readonly"
+    teacher_aux = model.teacher_pseudo(features_u, object(), 1)
+    assert teacher_aux["pc_engine_source"] == "external_readonly"
 
-    model = nn.Module()
-    model.training_design = "teacher_only"
-    model.teacher = nn.Module()
-    model.teacher.pc_hbm = nn.Linear(2, 2)
-    model.student = nn.Module()
-    model.student.pc_hbm = None
-    runtime_cfg = SimpleNamespace(
-        pc_training_design="teacher_only",
-        device="cpu",
-        distributed=False,
-        l_batch_size=31,
-        u_batch_size=32,
+
+def test_unlabeled_graph_cannot_update_trainable_pc():
+    model = make_model()
+    joint = model(
+        branch="student_joint",
+        labeled_features=torch.randn(3, 2),
+        unlabeled_features=torch.randn(3, 2),
+        memory=object(),
+        epoch=1,
+        labeled_image_ids=["a", "b", "c"],
+    )
+    joint["unlabeled"][0][3].sum().backward()
+    assert model.student.backbone.weight.grad is not None
+    assert _pc_grad(model) is None
+    assert all(parameter.grad is None for parameter in model.teacher.parameters())
+    assert all(
+        parameter.grad is None for parameter in model.pc_hbm_readonly.parameters()
     )
 
-    # Stop before dataset/optimizer construction while still exercising the
-    # complete TS config-contract prefix of __init__.
-    with pytest.raises(ValueError, match="batches of 32"):
-        PCHBMPseudoTrainer(model, runtime_cfg, pc_cfg)
 
-    assert vars(pc_cfg) == expected
+def test_labeled_and_combined_pc_gradients_are_identical():
+    model = make_model()
+    labeled = torch.randn(3, 2)
+    unlabeled = torch.randn(3, 2)
 
-
-@pytest.mark.parametrize("resume_path", [None, "resume.pth"])
-def test_ts_entrypoint_preserves_checkpoint_config(
-    monkeypatch,
-    resume_path,
-):
-    pc_cfg = DinoPCHBMConfig(
-        verify_start_epoch=4,
-        full_pc_start_epoch=9,
-        teacher_only_full_start_epoch=5,
+    joint = model(
+        branch="student_joint",
+        labeled_features=labeled,
+        unlabeled_features=unlabeled,
+        memory=object(),
+        epoch=1,
+        labeled_image_ids=["a", "b", "c"],
     )
-    expected = dict(vars(pc_cfg))
-    captured = {}
+    joint["labeled"][0][3].sum().backward()
+    labeled_pc_grad = _pc_grad(model).detach().clone()
+    assert torch.count_nonzero(labeled_pc_grad) > 0
 
-    args = SimpleNamespace(
-        training_design="teacher_only",
-        teacher_checkpoint="teacher.pth",
-        student_checkpoint=None,
-        resume=resume_path,
-        labeled_indices_pt="labeled.pt",
-        output_dir="results",
-        epochs=30,
-        seed=2025,
-        deterministic=False,
-        num_workers=None,
-        learning_rate=None,
-        no_amp=False,
+    model.zero_grad(set_to_none=True)
+    joint = model(
+        branch="student_joint",
+        labeled_features=labeled,
+        unlabeled_features=unlabeled,
+        memory=object(),
+        epoch=1,
+        labeled_image_ids=["a", "b", "c"],
     )
-    runtime_cfg = SimpleNamespace()
+    (joint["labeled"][0][3].sum() + joint["unlabeled"][0][3].sum()).backward()
+    torch.testing.assert_close(_pc_grad(model), labeled_pc_grad)
 
-    class FakeTSModel:
-        def __init__(self, *, teacher_pth, student_pth, pc_cfg, training_design):
-            captured["model_config"] = dict(vars(pc_cfg))
-            captured["teacher_path"] = teacher_pth
-            captured["training_design"] = training_design
 
-        def to(self, device):
-            captured["device"] = device
-            return self
+def test_readonly_pc_sync_is_exact_after_student_update():
+    model = make_model()
+    with torch.no_grad():
+        model.student.pc_hbm.weight.add_(1.0)
+    with pytest.raises(RuntimeError, match="not synchronized"):
+        model.assert_readonly_pc_synced()
+    model.sync_readonly_pc()
+    assert model.assert_readonly_pc_synced()
+    assert model.readonly_pc_sync_max_abs_diff() == 0.0
 
-    class FakeTrainer:
-        def __init__(self, model, cfg, pc_cfg, *, resume_path):
-            captured["trainer_config"] = dict(vars(pc_cfg))
-            captured["resume_path"] = resume_path
 
-        def train(self):
-            captured["trained"] = True
-
-    def configure_distributed(cfg, _context, seed):
-        cfg.seed = seed
-        cfg.device = torch.device("cpu")
-
-    monkeypatch.setattr(ts_entrypoint, "parse_args", lambda: args)
-    monkeypatch.setattr(ts_entrypoint, "init_distributed", lambda: object())
-    monkeypatch.setattr(ts_entrypoint, "cleanup_distributed", lambda: None)
-    monkeypatch.setattr(ts_entrypoint, "Config", lambda: runtime_cfg)
+def test_ts_cli_requires_exactly_one_initialization_source(monkeypatch):
     monkeypatch.setattr(
-        ts_entrypoint,
-        "configure_distributed",
-        configure_distributed,
+        "sys.argv",
+        ["train_ts_model_pseudo_pc_hbm.py", "--base-student-checkpoint", "base.pth"],
     )
-    monkeypatch.setattr(ts_entrypoint, "set_seed", lambda *_: None)
-    monkeypatch.setattr(
-        ts_entrypoint,
-        "read_pc_config",
-        lambda *_args, **_kwargs: pc_cfg,
-    )
-    monkeypatch.setattr(
-        ts_entrypoint,
-        "validate_labeled_split_source",
-        lambda _pt, _txt: LabeledSplitIdentity(count=404, fingerprint="split"),
-    )
-    monkeypatch.setattr(
-        ts_entrypoint,
-        "validate_teacher_enhancer_checkpoint",
-        lambda *_args: {"baseline_fingerprint": "baseline"},
-    )
-    monkeypatch.setattr(ts_entrypoint, "TSModel", FakeTSModel)
-    monkeypatch.setattr(
-        ts_entrypoint,
-        "wrap_distributed",
-        lambda model, *_args, **_kwargs: model,
-    )
-    monkeypatch.setattr(ts_entrypoint, "PCHBMPseudoTrainer", FakeTrainer)
+    args = train_ts_model_pseudo_pc_hbm.parse_args()
+    assert args.base_student_checkpoint == "base.pth"
+    assert args.resume is None
 
-    ts_entrypoint.main()
-
-    assert vars(pc_cfg) == expected
-    assert captured["model_config"] == expected
-    assert captured["trainer_config"] == expected
-    assert captured["teacher_path"] == "teacher.pth"
-    assert captured["training_design"] == "teacher_only"
-    assert captured["resume_path"] == resume_path
-    assert captured["trained"] is True
+    monkeypatch.setattr(
+        "sys.argv",
+        ["train_ts_model_pseudo_pc_hbm.py", "--resume", "resume.pth"],
+    )
+    args = train_ts_model_pseudo_pc_hbm.parse_args()
+    assert args.resume == "resume.pth"

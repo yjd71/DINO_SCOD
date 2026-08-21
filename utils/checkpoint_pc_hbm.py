@@ -44,7 +44,6 @@ _V2_REMOVED_CONFIG_FIELDS = {
     "lambda_parent_repair",
     "lambda_parent_preserve",
     "lambda_candidate_verify",
-    "lambda_pair",
     "feature_distill_p3_weight",
 }
 _V3_TRANSFERRED_VERIFIER_KEYS = {
@@ -69,7 +68,7 @@ ARTIFACT_METADATA_KEYS = (
     "baseline_fingerprint",
     "pc_frozen",
 )
-TRAINING_DESIGNS = frozenset({"teacher_only", "two_stage"})
+TRAINING_DESIGNS = frozenset({"teacher_only", "two_stage", "student_joint"})
 
 
 @dataclass(frozen=True)
@@ -89,12 +88,15 @@ def load_decoder_compatible(
     expected_pc_cfg: Any | None = None,
     init_pcv_from_legacy: bool = False,
     init_pcv_from_v2: bool = False,
+    allow_student_joint_defaults: bool = False,
 ):
     """Load a baseline or complete current Lite Decoder after full preflight."""
 
     checkpoint = _load_source(source)
     if not isinstance(checkpoint, Mapping):
         raise TypeError("Decoder checkpoint must be a mapping")
+    if allow_student_joint_defaults:
+        checkpoint = _checkpoint_with_student_joint_defaults(checkpoint)
     if init_pcv_from_legacy and init_pcv_from_v2:
         raise ValueError("PCV legacy and V2 migration modes are mutually exclusive")
     if init_pcv_from_legacy:
@@ -166,6 +168,7 @@ def read_pc_config(
     context: str = "PC-HBM checkpoint",
     init_pcv_from_legacy: bool = False,
     init_pcv_from_v2: bool = False,
+    allow_student_joint_defaults: bool = False,
 ):
     """Reconstruct the canonical runtime config from a Decoder/resume."""
 
@@ -178,12 +181,33 @@ def read_pc_config(
         return _legacy_decoder_pcv_config(checkpoint, context=context)
     if init_pcv_from_v2:
         return _v2_decoder_v3_config(checkpoint, context=context)
+    if allow_student_joint_defaults:
+        checkpoint = _checkpoint_with_student_joint_defaults(checkpoint)
     _preflight_pc_v2(checkpoint, context=context)
     raw_config = checkpoint.get("pc_cfg")
     _validate_lite_config(raw_config, context=context)
     from configs.pc_hbm_dino_config import DinoPCHBMConfig
 
     return DinoPCHBMConfig(**dict(raw_config))
+
+
+def _checkpoint_with_student_joint_defaults(
+    checkpoint: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Explicitly upgrade only training-time fields for legacy initialization."""
+
+    upgraded = copy.deepcopy(dict(checkpoint))
+    raw_config = upgraded.get("pc_cfg")
+    if not isinstance(raw_config, Mapping):
+        raise RuntimeError("Legacy Student initialization requires serialized pc_cfg")
+    normalized = dict(raw_config)
+    normalized.setdefault("memory_producer_role", "labeled_student")
+    normalized.setdefault("ts_training_design", "student_joint")
+    normalized.setdefault("ts_pc_mode", "full")
+    normalized.setdefault("memory_refresh_interval_epochs", 1)
+    normalized.setdefault("lambda_pair", 1.0)
+    upgraded["pc_cfg"] = normalized
+    return upgraded
 
 
 def _legacy_decoder_pcv_config(
@@ -1027,6 +1051,59 @@ def validate_artifact_metadata(
     return metadata
 
 
+def validate_base_student_checkpoint(
+    source: str | os.PathLike | Mapping[str, Any],
+    labeled_split_fingerprint: str,
+    *,
+    allow_legacy_teacher_enhancer: bool = False,
+) -> dict[str, Any]:
+    """Validate a complete Base Student before constructing student-joint TS."""
+
+    validate_labeled_split_fingerprint(labeled_split_fingerprint)
+    checkpoint = _load_source(source)
+    if not isinstance(checkpoint, Mapping):
+        raise TypeError("Base Student checkpoint must be a mapping")
+    if allow_legacy_teacher_enhancer:
+        checkpoint = _checkpoint_with_student_joint_defaults(checkpoint)
+        expected = {
+            "training_design": ("two_stage", "teacher_only"),
+            "artifact_role": "teacher_enhancer",
+            "labeled_split_fingerprint": str(labeled_split_fingerprint),
+            "pc_frozen": True,
+        }
+    else:
+        expected = {
+            "training_design": "two_stage",
+            "artifact_role": "base_student",
+            "labeled_split_fingerprint": str(labeled_split_fingerprint),
+            "pc_frozen": False,
+        }
+    metadata = validate_artifact_metadata(checkpoint, expected)
+    pc_cfg = read_pc_config(checkpoint, context="Base Student checkpoint")
+    from Model.decoder import Decoder
+
+    candidate = Decoder(
+        in_dim=int(pc_cfg.encoder_dim),
+        out_dim=int(pc_cfg.decoder_dim),
+        pc_cfg=pc_cfg,
+    )
+    state = extract_decoder_state(checkpoint)
+    target_keys = set(candidate.state_dict())
+    missing = sorted(target_keys - set(state))
+    unexpected = sorted(set(state) - target_keys)
+    if missing or unexpected:
+        raise RuntimeError(
+            "Base Student checkpoint is not a complete Decoder state; "
+            f"missing={missing[:5]}, unexpected={unexpected[:5]}"
+        )
+    non_pc_fingerprint = state_dict_fingerprint(
+        {name: value for name, value in state.items() if not name.startswith("pc_hbm.")}
+    )
+    if non_pc_fingerprint != metadata["baseline_fingerprint"]:
+        raise RuntimeError("Base Student non-PC fingerprint does not match artifact metadata")
+    return metadata
+
+
 def extract_decoder_state(
     source: str | os.PathLike | Mapping[str, Any],
 ) -> dict[str, torch.Tensor]:
@@ -1395,6 +1472,7 @@ __all__ = [
     "save_training_resume",
     "state_dict_fingerprint",
     "validate_artifact_metadata",
+    "validate_base_student_checkpoint",
     "validate_canonical_labeled_indices_pt",
     "validate_canonical_labeled_split_fingerprint",
     "validate_labeled_indices_pt",

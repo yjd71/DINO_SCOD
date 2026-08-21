@@ -50,7 +50,7 @@ def _positive_int(value: str) -> int:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train RSBL with PC-HBM-Lite"
+        description="Train the Base Student with labeled-only PC-HBM-Lite memory"
     )
     parser.add_argument(
         "--training-design",
@@ -61,7 +61,7 @@ def parse_args() -> argparse.Namespace:
         "--output-dir",
         "--base-model-path",
         dest="output_dir",
-        default="./results/base_pc_hbm_lite",
+        default="./results/pc_hbm_student_joint/base",
     )
     initialization = parser.add_mutually_exclusive_group()
     initialization.add_argument(

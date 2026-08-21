@@ -1,6 +1,6 @@
-"""Teacher-only semi-supervised model for PC-HBM-Lite."""
-
 from __future__ import annotations
+
+from copy import deepcopy
 
 import torch
 import torch.nn as nn
@@ -11,30 +11,27 @@ from utils.checkpoint_pc_hbm import load_decoder_compatible
 
 
 class TSModel(nn.Module):
-    """Frozen Lite Teacher plus a raw legacy Decoder Student."""
+    """Student-owned PC-HBM model with an EMA segmentation Teacher."""
 
-    VALID_TRAINING_DESIGNS = frozenset({"teacher_only"})
+    VALID_TRAINING_DESIGNS = frozenset({"student_joint"})
 
     def __init__(
         self,
-        teacher_pth=None,
-        student_pth=None,
+        base_student_pth=None,
         pc_cfg=None,
-        training_design="teacher_only",
+        training_design="student_joint",
+        allow_student_joint_defaults=False,
     ):
         super().__init__()
-        if training_design != "teacher_only":
-            raise ValueError("PC-HBM-Lite TS supports only teacher_only")
+        if training_design != "student_joint":
+            raise ValueError("PC-HBM-Lite TS supports only student_joint")
         if pc_cfg is None:
-            raise ValueError("pc_cfg is required for the Lite Teacher")
+            raise ValueError("pc_cfg is required for student_joint TS")
 
-        self.training_design = "teacher_only"
+        self.training_design = "student_joint"
         self.pc_cfg = pc_cfg
         self.dino = torch.hub.load(
-            "./dinov2",
-            "dinov2_vitb14",
-            source="local",
-            pretrained=False,
+            "./dinov2", "dinov2_vitb14", source="local", pretrained=False
         )
         self.dino.load_state_dict(
             torch.load(
@@ -49,18 +46,24 @@ class TSModel(nn.Module):
             "in_dim": int(pc_cfg.encoder_dim),
             "out_dim": int(pc_cfg.decoder_dim),
         }
-        self.teacher = Decoder(pc_cfg=pc_cfg, **decoder_kwargs)
-        self.student = Decoder(pc_cfg=None, **decoder_kwargs)
-        self.load_teacher(teacher_pth)
-        if student_pth is None:
-            self._initialize_raw_student_from_teacher()
-        else:
-            self.load_student(student_pth)
+        self.student = Decoder(pc_cfg=pc_cfg, **decoder_kwargs)
+        if base_student_pth is not None:
+            self.load_base_student(
+                base_student_pth,
+                allow_student_joint_defaults=allow_student_joint_defaults,
+            )
+        self.teacher = Decoder(pc_cfg=None, **decoder_kwargs)
+        self._initialize_teacher_from_student()
+        self.teacher.requires_grad_(False).eval()
+        self.pc_hbm_readonly = deepcopy(self.student.pc_hbm)
+        self.pc_hbm_readonly.requires_grad_(False).eval()
+        self.sync_readonly_pc()
 
     def train(self, mode=True):
         super().train(mode)
         self.dino.eval()
         self.teacher.eval()
+        self.pc_hbm_readonly.eval()
         return self
 
     @torch.no_grad()
@@ -105,74 +108,100 @@ class TSModel(nn.Module):
             pc_mode="teacher_pseudo",
             epoch=epoch,
             return_aux=True,
+            pc_engine_override=self.pc_hbm_readonly,
         )
         if aux.get("pc_active") is not True:
-            raise RuntimeError(
-                "Teacher PC-HBM-Lite path is inactive: "
-                f"{aux.get('fallback_reason')}"
-            )
+            raise RuntimeError("Teacher PC-HBM-Lite path is inactive")
+        if aux.get("pc_engine_source") != "external_readonly":
+            raise RuntimeError("Teacher must use the readonly external PC-HBM engine")
         if not torch.is_tensor(aux.get("p_final")):
             raise RuntimeError("Teacher did not return p_final")
-        distill = aux.get("distill_features")
-        if not isinstance(distill, dict) or not torch.is_tensor(
-            distill.get("p3_corr")
-        ):
-            raise RuntimeError("Teacher did not return corrected P3 features")
         return aux
 
-    def student_labeled(self, features):
-        return self.student(features, pc_mode="off", return_aux=True)
-
-    def student_unlabeled(self, features):
-        return self.student(features, pc_mode="off", return_aux=True)
+    def student_joint(
+        self,
+        *,
+        labeled_features,
+        unlabeled_features,
+        memory,
+        epoch,
+        labeled_image_ids,
+    ):
+        labeled = self.student(
+            labeled_features,
+            memory=memory,
+            pc_mode="full",
+            epoch=epoch,
+            return_aux=True,
+            query_image_ids=labeled_image_ids,
+        )
+        unlabeled = self.student(
+            unlabeled_features,
+            memory=memory,
+            pc_mode="full",
+            epoch=epoch,
+            return_aux=True,
+            pc_engine_override=self.pc_hbm_readonly,
+        )
+        return {"labeled": labeled, "unlabeled": unlabeled}
 
     def forward(
         self,
         *,
         branch,
-        features,
+        labeled_features=None,
+        unlabeled_features=None,
+        memory=None,
+        epoch=None,
+        labeled_image_ids=None,
     ):
-        if features is None:
-            raise ValueError(
-                "Precomputed DINO features are required for Student dispatch"
-            )
-        if branch == "student_labeled":
-            return self.student_labeled(features)
-        if branch == "student_unlabeled":
-            return self.student_unlabeled(features)
-        raise ValueError(f"Unsupported TS forward branch: {branch!r}")
-
-    def inference(self, x, memory=None, epoch=None):
-        features = self.extract_features(x)
-        return self.student(features, pc_mode="off")[3]
-
-    def load_teacher(self, path):
-        if path is None:
-            raise ValueError("Teacher checkpoint path is required")
-        load_decoder_compatible(
-            self.teacher,
-            path,
-            require_pc_complete=True,
-            expected_pc_cfg=self.pc_cfg,
+        if branch != "student_joint":
+            raise ValueError(f"Unsupported TS forward branch: {branch!r}")
+        if labeled_features is None or unlabeled_features is None:
+            raise ValueError("student_joint requires labeled and unlabeled DINO features")
+        if memory is None:
+            raise ValueError("student_joint requires finalized labeled Student memory")
+        if labeled_image_ids is None:
+            raise ValueError("student_joint requires stable labeled image IDs")
+        return self.student_joint(
+            labeled_features=labeled_features,
+            unlabeled_features=unlabeled_features,
+            memory=memory,
+            epoch=epoch,
+            labeled_image_ids=labeled_image_ids,
         )
-        self.teacher.requires_grad_(False).eval()
 
-    def load_student(self, path):
-        if path is None:
-            raise ValueError("Student checkpoint path is required")
+    def inference(self, x, memory=None, epoch=None, disable_pc=False):
+        features = self.extract_features(x)
+        if disable_pc:
+            return self.student(features, pc_mode="off")[3]
+        if memory is None:
+            raise RuntimeError("Student inference requires finalized PC-HBM memory")
+        _, aux = self.student(
+            features,
+            memory=memory,
+            pc_mode="full",
+            epoch=epoch,
+            return_aux=True,
+        )
+        return aux["z_final"]
+
+    def load_base_student(self, path, *, allow_student_joint_defaults=False):
         load_decoder_compatible(
             self.student,
             path,
-            require_pc_complete=False,
+            require_pc_complete=True,
+            expected_pc_cfg=self.pc_cfg,
+            allow_student_joint_defaults=allow_student_joint_defaults,
         )
 
-    def _initialize_raw_student_from_teacher(self):
-        raw_state = {
+    def _initialize_teacher_from_student(self):
+        teacher_state = {
             name: value
-            for name, value in self.teacher.state_dict().items()
+            for name, value in self.student.state_dict().items()
             if not name.startswith("pc_hbm.")
         }
-        self.student.load_state_dict(raw_state, strict=True)
+        self.teacher.load_state_dict(teacher_state, strict=True)
 
     @torch.no_grad()
     def update_teacher(self, momentum=0.995):
@@ -183,3 +212,41 @@ class TSModel(nn.Module):
             shared_only=True,
             exclude_prefixes=("pc_hbm.",),
         )
+        self.teacher.requires_grad_(False).eval()
+
+    @torch.no_grad()
+    def sync_readonly_pc(self):
+        self.pc_hbm_readonly.load_state_dict(
+            self.student.pc_hbm.state_dict(), strict=True
+        )
+        self.pc_hbm_readonly.requires_grad_(False).eval()
+        self.assert_readonly_pc_synced()
+
+    @torch.no_grad()
+    def assert_readonly_pc_synced(self):
+        trainable = self.student.pc_hbm.state_dict()
+        readonly = self.pc_hbm_readonly.state_dict()
+        if trainable.keys() != readonly.keys():
+            raise RuntimeError("Trainable and readonly PC-HBM state schemas differ")
+        mismatched = [
+            name for name in trainable if not torch.equal(trainable[name], readonly[name])
+        ]
+        if mismatched:
+            raise RuntimeError(
+                f"Readonly PC-HBM is not synchronized: {mismatched[:5]}"
+            )
+        return True
+
+    @torch.no_grad()
+    def readonly_pc_sync_max_abs_diff(self) -> float:
+        maximum = 0.0
+        readonly = self.pc_hbm_readonly.state_dict()
+        for name, value in self.student.pc_hbm.state_dict().items():
+            if value.numel() == 0:
+                continue
+            difference = (value.detach().float() - readonly[name].detach().float()).abs()
+            maximum = max(maximum, float(difference.max().item()))
+        return maximum
+
+
+__all__ = ["TSModel"]

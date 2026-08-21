@@ -254,7 +254,6 @@ class DinoPCHBMEngine(nn.Module):
         memory,
         mode: str,
         *,
-        injection_scale: float = 1.0,
         query_image_ids: Optional[Sequence[str]] = None,
     ) -> dict[str, object]:
         if mode not in self.VALID_MODES:
@@ -307,17 +306,13 @@ class DinoPCHBMEngine(nn.Module):
         if mode == "verify_only":
             p3_corr = p3
             p3_delta = p3.new_zeros((batch_ids.numel(), p3.size(1)))
-            effective_scale = 0.0
         else:
-            effective_scale = float(injection_scale)
             p3_corr, p3_delta = self.p3_residual(
                 p3,
                 batch_ids,
                 flat_indices,
                 verified["correction"],
-                verified["gate"],
                 verified["query_valid"],
-                injection_scale=effective_scale,
             )
 
         height, width = p3.shape[-2:]

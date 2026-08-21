@@ -1,4 +1,4 @@
-"""Single gated P3 residual for PC-HBM-Lite."""
+"""Single selected-position P3 residual for PC-HBM-Lite."""
 
 from .p3_gated_residual import P3GatedResidual
 

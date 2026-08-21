@@ -305,7 +305,6 @@ def test_explicit_v2_to_v3_migration_keeps_only_stable_verifier_state(
     for removed_name in (
         "verification_temperature",
         "lambda_candidate_verify",
-        "lambda_pair",
         "feature_distill_p3_weight",
     ):
         assert not hasattr(migrated_cfg, removed_name)

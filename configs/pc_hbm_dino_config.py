@@ -93,6 +93,7 @@ class DinoPCHBMConfig:
     # Labeled-only CPU pair memory with configurable floating storage.
     memory_dim: int = 128
     memory_source: str = "labeled_only"
+    memory_producer_role: str = "labeled_student"
     use_unlabeled_memory_update: bool = False
     memory_storage_dtype: str = "float16"
     memory_device: str = "cpu"
@@ -139,10 +140,15 @@ class DinoPCHBMConfig:
     verify_start_epoch: int = 6
     full_pc_start_epoch: int = 11
     teacher_only_full_start_epoch: int = 6
+    # Deprecated checkpoint-compatibility field. The residual no longer ramps.
     pc_injection_ramp_epochs: int = 3
 
     # Unlabeled objective.
     lambda_u: float = 1.0
+    lambda_pair: float = 1.0
+    ts_training_design: str = "student_joint"
+    ts_pc_mode: str = "full"
+    memory_refresh_interval_epochs: int = 1
 
     # Optimization.
     use_amp: bool = True
@@ -157,6 +163,19 @@ class DinoPCHBMConfig:
     warn_delta_large_threshold: float = 1.0
 
     def __post_init__(self) -> None:
+        self.memory_producer_role = _as_nonempty_str(
+            "memory_producer_role", self.memory_producer_role
+        ).lower()
+        if self.memory_producer_role != "labeled_student":
+            raise ValueError("memory_producer_role must be 'labeled_student'")
+        self.ts_training_design = _as_nonempty_str(
+            "ts_training_design", self.ts_training_design
+        ).lower()
+        if self.ts_training_design != "student_joint":
+            raise ValueError("ts_training_design must be 'student_joint'")
+        self.ts_pc_mode = _as_nonempty_str("ts_pc_mode", self.ts_pc_mode).lower()
+        if self.ts_pc_mode != "full":
+            raise ValueError("ts_pc_mode must be 'full'")
         self.child_verification_mode = _as_nonempty_str(
             "child_verification_mode", self.child_verification_mode
         ).lower()
@@ -212,6 +231,7 @@ class DinoPCHBMConfig:
             "teacher_only_full_start_epoch",
             "pc_injection_ramp_epochs",
             "diagnostic_window_epochs",
+            "memory_refresh_interval_epochs",
         ):
             setattr(
                 self,
@@ -464,6 +484,9 @@ class DinoPCHBMConfig:
         self.lambda_u = _as_float(
             "lambda_u", self.lambda_u, minimum=0.0
         )
+        self.lambda_pair = _as_float(
+            "lambda_pair", self.lambda_pair, minimum=0.0
+        )
         self.grad_clip_norm = _as_float(
             "grad_clip_norm",
             self.grad_clip_norm,
@@ -506,6 +529,8 @@ class DinoPCHBMConfig:
             self.verify_start_epoch = 1
             self.full_pc_start_epoch = int(self.teacher_only_full_start_epoch)
             return
+        if design == "student_joint":
+            return
         raise ValueError(f"Unsupported PC-HBM-Lite training design: {design}")
 
     def pc_mode_for_epoch(self, epoch: int) -> str:
@@ -517,15 +542,6 @@ class DinoPCHBMConfig:
         if current < self.full_pc_start_epoch:
             return "verify_only"
         return "full"
-
-    def injection_scale(self, epoch: int) -> float:
-        """Ramp the only P3 residual over the first three full-mode epochs."""
-
-        current = int(epoch)
-        if current < self.full_pc_start_epoch:
-            return 0.0
-        progress = current - self.full_pc_start_epoch + 1
-        return min(1.0, max(0.0, progress / self.pc_injection_ramp_epochs))
 
     def expected_memory_meta(
         self,
@@ -548,6 +564,7 @@ class DinoPCHBMConfig:
             "region_names": tuple(self.region_names),
             "storage_dtype": self.memory_storage_dtype,
             "source": self.memory_source,
+            "producer_role": self.memory_producer_role,
             "route_environment_min_mass": self.route_environment_min_mass,
             "fg_boundary_kernel": self.fg_boundary_kernel,
             "bg_near_kernel": self.bg_near_kernel,
