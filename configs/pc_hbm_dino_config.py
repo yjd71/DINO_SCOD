@@ -103,7 +103,7 @@ class DinoPCHBMConfig:
     exclude_self_match: bool = True
 
     # Parameter-free dual-context routing.
-    route_top_img_k: int = 12
+    route_top_img_k: int = 8
     route_global_weight: float = 0.5
     route_environment_weight: float = 0.5
     route_environment_min_mass: float = 1.0e-3
