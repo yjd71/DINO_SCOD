@@ -1,4 +1,4 @@
-"""Cosine-only Parent/Child verification and binary region aggregation."""
+"""Cosine-only Parent/Child verification and dominant-region context selection."""
 
 from __future__ import annotations
 
@@ -311,9 +311,12 @@ class PairVerifier(nn.Module):
             contexts,
             torch.zeros_like(contexts),
         )
-        memory_context = (
-            region_probability.unsqueeze(-1) * contexts
-        ).sum(dim=1)
+        # Read only the dominant region; argmax resolves ties to foreground (0).
+        # Keep the full region probabilities for matching loss and confidence.
+        selected_region = region_probability.argmax(dim=-1)
+        memory_context = contexts.gather(
+            1, selected_region[:, None, None].expand(-1, 1, self.dim)
+        ).squeeze(1)
         memory_context = torch.where(
             query_valid[:, None],
             memory_context,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 import torch
 import torch.nn.functional as F
 
@@ -48,9 +49,7 @@ def test_pair_verifier_has_one_scalar_and_fp32_binary_evidence() -> None:
     assert torch.count_nonzero(result["candidate_entropy"]) == 0
     assert result["query_valid"].tolist() == [True]
     assert torch.isfinite(result["correction"]).all()
-    expected_context = (
-        result["region_prob"].unsqueeze(-1) * result["region_context"]
-    ).sum(dim=1)
+    expected_context = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
     torch.testing.assert_close(result["memory_context"], expected_context)
     torch.testing.assert_close(
         result["correction"],
@@ -74,6 +73,84 @@ def test_pair_verifier_has_one_scalar_and_fp32_binary_evidence() -> None:
     assert torch.equal(result["child_abs_cosine"], result["child_cosine"])
     assert torch.count_nonzero(result["child_relation_cosine"]) == 0
     assert torch.count_nonzero(result["child_verify_logits"]) == 0
+
+
+@pytest.mark.parametrize("mode", ["weighted_sum", "parent_conditioned"])
+def test_memory_context_selects_foreground_background_and_foreground_ties(
+    mode: str,
+) -> None:
+    verifier = PairVerifier(
+        dim=4,
+        tau_parent=1.0,
+        tau_child=1.0,
+        child_verification_mode=mode,
+    )
+    parent = torch.eye(4)[torch.tensor([[0, 2], [1, 3]])]
+    parent = parent.unsqueeze(0).repeat(3, 1, 1, 1)
+    queries = torch.tensor(
+        [[1.0, 0.0, 1.0, 0.0], [0.0, 1.0, 0.0, 1.0], [1.0, 1.0, 1.0, 1.0]]
+    )
+    result = verifier(
+        queries,
+        queries.clone(),
+        {
+            "parent_keys": parent,
+            "paired_p2_keys": parent.clone(),
+            "valid": torch.ones(3, 2, 2, dtype=torch.bool),
+        },
+        torch.ones(3, 1),
+    )
+
+    assert 0.5 < result["region_prob"][0, 0] < 1.0
+    assert 0.5 < result["region_prob"][1, 1] < 1.0
+    torch.testing.assert_close(result["region_prob"][2], torch.tensor([0.5, 0.5]))
+    # Equal candidate scores preserve each region's mean; no probability scaling
+    # or contribution from the other region is allowed in the injected context.
+    expected = torch.tensor(
+        [[0.5, 0.0, 0.5, 0.0], [0.0, 0.5, 0.0, 0.5], [0.5, 0.0, 0.5, 0.0]]
+    )
+    torch.testing.assert_close(result["memory_context"], expected)
+    torch.testing.assert_close(result["correction"], expected)
+
+
+@pytest.mark.parametrize("mode", ["weighted_sum", "parent_conditioned"])
+def test_memory_context_keeps_candidate_gradients_only_in_selected_region(
+    mode: str,
+) -> None:
+    verifier = PairVerifier(
+        dim=4,
+        tau_parent=1.0,
+        tau_child=1.0,
+        child_verification_mode=mode,
+    )
+    parent = torch.eye(4)[torch.tensor([[0, 2], [1, 3]])]
+    parent = parent.unsqueeze(0).requires_grad_()
+    q3 = torch.tensor([[1.0, 0.0, 0.5, 0.0]], requires_grad=True)
+    q_child = q3.detach().clone().requires_grad_()
+    result = verifier(
+        q3,
+        q_child,
+        {
+            "parent_keys": parent,
+            "paired_p2_keys": parent.detach().clone(),
+            "valid": torch.ones(1, 2, 2, dtype=torch.bool),
+        },
+        torch.ones(1, 1),
+    )
+    assert result["region_prob"][0, 0] > result["region_prob"][0, 1]
+    result["pair_scores"].retain_grad()
+
+    result["correction"][0, 0].backward()
+
+    score_grad = result["pair_scores"].grad
+    assert score_grad is not None and torch.isfinite(score_grad).all()
+    assert torch.count_nonzero(score_grad[0, 0]) == 2
+    assert torch.count_nonzero(score_grad[0, 1]) == 0
+    assert parent.grad is not None and torch.isfinite(parent.grad).all()
+    assert torch.count_nonzero(parent.grad[0, 0]) > 0
+    assert torch.count_nonzero(parent.grad[0, 1]) == 0
+    assert q3.grad is not None and torch.count_nonzero(q3.grad) > 0
+    assert q_child.grad is not None and torch.count_nonzero(q_child.grad) > 0
 
 
 def test_weighted_sum_pair_scores_are_strict_legacy_parity() -> None:
@@ -174,14 +251,16 @@ def test_pair_verifier_confidence_uses_probability_weighted_region_entropy() -> 
     assert bool((result["memory_confidence"] <= 1).all())
 
 
-def test_pair_verifier_fully_invalid_query_is_exact_zero_without_nan() -> None:
+def test_pair_verifier_missing_either_region_is_exact_zero_without_nan() -> None:
     verifier = PairVerifier(dim=4)
-    valid = torch.zeros(2, 2, 4, dtype=torch.bool)
+    valid = torch.zeros(3, 2, 4, dtype=torch.bool)
+    valid[1, 0] = True
+    valid[2, 1] = True
     result = verifier(
-        q3=torch.randn(2, 4),
-        q_child=torch.randn(2, 4),
+        q3=torch.randn(3, 4),
+        q_child=torch.randn(3, 4),
         retrieval=_retrieval(valid),
-        query_score=torch.ones(2, 1),
+        query_score=torch.ones(3, 1),
     )
 
     assert not result["query_valid"].any()

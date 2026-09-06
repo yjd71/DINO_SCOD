@@ -7,7 +7,8 @@ global/environment route
   -> fg_boundary and bg_near balanced Top-K
   -> Parent-conditioned fixed P2 Child matching
   -> binary region evidence
-  -> one gated P3 residual
+  -> dominant foreground/background region context
+  -> one projected P3 residual
   -> unchanged legacy Decoder
 ```
 
@@ -157,8 +158,9 @@ the match is `0.5*c_abs`. When `v` is zero, the verified score is selected from
 the original Parent score, preserving bitwise equality.
 
 The matcher has 16,385 parameters (`128x128 + raw_eta`). The legacy
-`weighted_sum` verifier has one parameter and retains its original formula,
-operation order, masks, and output semantics. `child_match_logits` and
+`weighted_sum` verifier has one parameter and retains its original score formula,
+operation order, and masks. Both modes use the dominant-region context selection
+described below. `child_match_logits` and
 `child_match_strength` are the canonical V3 fields;
 `child_verify_logits` and `verification_strength` remain deprecated aliases so
 existing downstream consumers do not need to change. Existing
@@ -204,6 +206,34 @@ still contains these obsolete objective controls rather than silently changing
 their training semantics. V2 Decoder initialization drops them through the
 explicit migration path above.
 
+## Memory context selection and injection
+
+For each boundary query, the final verified region probabilities decide whether
+the retrieved evidence favors foreground (`fg_boundary`, index 0) or background
+(`bg_near`, index 1). Candidate Parent keys are still softmax-weighted within
+each region, but only the winning region's context is written back:
+
+```text
+alpha[q,r,:] = masked_softmax(s_verified[q,r,:])
+context[q,r] = sum_j alpha[q,r,j] * parent_key[q,r,j]
+p[q,:] = softmax_r(log_mean_exp_j(s_verified[q,r,j]))
+r_star[q] = argmax_r p[q,r]
+memory_context[q] = context[q,r_star[q]]
+P3_corrected[q] = P3[q] + query_valid[q] * (W_out memory_context[q] + b_out)
+```
+
+The selected context is used at full strength: it is neither mixed with the
+other region nor multiplied by the winning region probability. Exact ties
+select foreground deterministically. Both regions must have at least one valid
+candidate; otherwise the context and write-back are zero. Non-query P3 tokens
+are unchanged. The output projection's weight and bias are zero-initialized.
+
+The full region probabilities remain available for the matching objective and
+memory confidence. Region selection is a hard `argmax`; the context path carries
+gradients through the selected region's candidate weights and values, while
+region classification remains supervised through the region logits. Injection
+does not multiply the context by the diagnostic confidence gate or a ramp.
+
 ## Modes and training
 
 Decoder modes are only:
@@ -211,12 +241,12 @@ Decoder modes are only:
 - `off`: exact legacy path.
 - `verify_only`: run retrieval and pair verification; P3 remains bitwise
   unchanged.
-- `full`: apply the single gated P3 residual.
-- `teacher_pseudo`: same correction as terminal `full`, with scale fixed to 1.
+- `full`: apply the projected residual from the selected region context.
+- `teacher_pseudo`: apply the same selected-context correction as `full`.
 
 Base `two_stage` uses epochs 1-5 `off`, 6-10 `verify_only`, and 11 onward
 `full`. Base `teacher_only` uses epochs 1-5 `verify_only` and 6 onward `full`.
-The residual scale is `1/3`, `2/3`, then `1` over the first three full epochs.
+There is no residual scale ramp when entering `full`.
 
 Formal semi-supervised training is Teacher-only:
 
