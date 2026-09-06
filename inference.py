@@ -68,6 +68,15 @@ def inference(
         raise ValueError("batch_size must be a positive integer")
     if num_workers < 0:
         raise ValueError("num_workers must be a non-negative integer")
+    model_pc_cfg = getattr(model, "pc_cfg", None)
+    test_size = int(
+        model_pc_cfg.input_size if model_pc_cfg is not None else cfg.test_size
+    )
+    if test_size != cfg.test_size:
+        print(
+            f"[inference] Using model input size {test_size}x{test_size} "
+            f"instead of configured test_size={cfg.test_size}."
+        )
     effective_disable_pc = bool(disable_pc or memory is None)
     device = torch.device(cfg.device)
     cuda_device = device.type == "cuda"
@@ -82,7 +91,7 @@ def inference(
             test_dataset = TestDataset(
                 image_root=getattr(cfg, f"test_{dataset}_imgs"),
                 gt_root=getattr(cfg, f"test_{dataset}_masks"),
-                test_size=cfg.test_size,
+                test_size=test_size,
             )
             loader = DataLoader(
                 test_dataset,

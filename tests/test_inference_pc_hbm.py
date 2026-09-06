@@ -85,6 +85,48 @@ def test_missing_memory_automatically_uses_pc_off_mode(monkeypatch, tmp_path):
     assert model.calls[-1] == (None, 30, True)
 
 
+@pytest.mark.parametrize(
+    "with_memory,disable_pc", [(False, False), (True, False), (False, True)]
+)
+def test_inference_resizes_to_checkpoint_input_and_preserves_output_size(
+    tmp_path, with_memory, disable_pc
+):
+    image_root = tmp_path / "images"
+    mask_root = tmp_path / "masks"
+    image_root.mkdir()
+    mask_root.mkdir()
+    assert inference.cv2.imwrite(
+        str(image_root / "sample.jpg"), np.zeros((5, 7, 3), dtype=np.uint8)
+    )
+    assert inference.cv2.imwrite(
+        str(mask_root / "sample.png"), np.zeros((5, 7), dtype=np.uint8)
+    )
+
+    class ShapeCheckingModel(FakeModel):
+        pc_cfg = DinoPCHBMConfig(input_size=518, token_size=37, output_size=129)
+
+        def inference(self, image, memory=None, epoch=None, disable_pc=False):
+            assert image.shape[-2:] == (518, 518)
+            return super().inference(image, memory, epoch, disable_pc)
+
+    cfg = _cfg()
+    cfg.test_size = 392
+    cfg.test_CAMO_imgs = str(image_root)
+    cfg.test_CAMO_masks = str(mask_root)
+    model = ShapeCheckingModel()
+    memory = object() if with_memory else None
+    pred_root = tmp_path / "predictions"
+    inference.inference(
+        ["CAMO"], model, cfg, str(pred_root), memory=memory, disable_pc=disable_pc
+    )
+
+    assert model.calls == [(memory, 30, disable_pc or not with_memory)]
+    prediction = inference.cv2.imread(
+        str(pred_root / "CAMO" / "sample.png"), inference.cv2.IMREAD_GRAYSCALE
+    )
+    assert prediction is not None and prediction.shape == (5, 7)
+
+
 def test_inference_cli_contract_rejects_ambiguous_memory_modes():
     assert inference.validate_inference_args(
         SimpleNamespace(disable_pc=False, memory_checkpoint=None)

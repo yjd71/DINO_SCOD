@@ -1,0 +1,3 @@
+# Additional evaluation dependency for the existing project environment.
+# The import name is py_sod_metrics; the PyPI distribution is pysodmetrics.
+pysodmetrics==1.6.2

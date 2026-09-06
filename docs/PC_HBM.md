@@ -260,6 +260,35 @@ Formal semi-supervised training is Teacher-only:
   The former `feature_distill_p3_weight` control has been removed.
 - EMA updates only names shared by the raw Student and legacy Teacher Decoder.
 
+## Inference input size and evaluation dependency
+
+Inference uses the loaded model's `pc_cfg.input_size` to resize test images,
+including when Memory is omitted or `--disable-pc` is set. For example, a
+`518/37/129` checkpoint receives `518x518` images even if the dataset config
+still has `test_size=392`. Saved masks are resized back to each original GT
+image's dimensions. Checkpoint shape validation remains strict.
+
+Install the additional metric dependency in the same Python environment used
+to run evaluation:
+
+```bash
+python -m pip install -r requirements-eval.txt
+```
+
+The PyPI distribution is `pysodmetrics`; its Python import is `py_sod_metrics`.
+The pinned version matches the locally validated evaluation environment.
+
+Run evaluation only after inference succeeds, for example:
+
+```bash
+python inference.py --decoder-checkpoint path/to/ts_student.pth --pred-root path/to/predictions && \
+python evaluate.py --pred-path path/to/predictions
+```
+
+Omitting `--memory-checkpoint` explicitly runs the Student with PC-HBM off.
+To evaluate prototype interaction, supply Memory matching the Student
+checkpoint's configuration, labeled split, and producer fingerprint.
+
 ## Commands
 
 ```powershell
